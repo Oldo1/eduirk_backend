@@ -1,0 +1,32 @@
+# Основной фреймворк
+fastapi
+uvicorn[standard]
+
+# База данных
+sqlalchemy
+psycopg2-binary                  # для PostgreSQL
+
+# Аутентификация
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+
+# Pydantic
+pydantic
+pydantic[email]
+
+# Генерация грамот (PDF)
+reportlab
+Pillow
+
+# RAG-система (чат-помощник)
+langchain
+langchain-chroma
+langchain-huggingface
+gigachat
+sentence-transformers
+chromadb
+
+# Дополнительно (рекомендуется)
+python-dotenv                    # для .env файла
+httpx                            # для HTTP-запросов

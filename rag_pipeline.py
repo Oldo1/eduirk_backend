@@ -1,0 +1,433 @@
+"""
+rag_pipeline.py — ядро RAG-системы с reranker'ом и памятью диалога
+
+Схема работы:
+    Вопрос пользователя
+          │
+          ▼
+    ConversationMemory       ← история диалога (последние N обменов)
+    _rewrite_question()      ← GigaChat делает вопрос самодостаточным
+          │
+          ▼
+    Chroma MMR-поиск         → fetch_k кандидатов
+          │
+          ▼
+    CrossEncoder reranker    → top_k лучших чанков
+          │
+          ▼
+    GigaChat SDK (напрямую)  → ответ с учётом истории  ← исправляет ASCII-баг
+          │
+          ▼
+    ConversationMemory.save()
+
+Установка:
+    pip install gigachat langchain langchain-chroma langchain-huggingface
+                sentence-transformers chromadb
+"""
+
+from __future__ import annotations
+
+import os
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
+
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+from sentence_transformers import CrossEncoder
+
+# GigaChat SDK — используем напрямую, минуя LangChain-обёртку
+# (LangChain-обёртка ломает кириллицу при invoke с message-списком)
+from gigachat import GigaChat
+from gigachat.models import Chat, Messages, MessagesRole
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Конфигурация
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class RAGConfig:
+    # ── GigaChat ──────────────────────────────────────────────────────────────
+    credentials: str = field(
+        default_factory=lambda: os.environ.get("GIGACHAT_CREDENTIALS", "")
+    )
+    scope: str             = "GIGACHAT_API_PERS"   # GIGACHAT_API_CORP — для юрлица
+    model: str             = "GigaChat-Pro"        # GigaChat | GigaChat-Pro | GigaChat-Max
+    verify_ssl_certs: bool = False                 # True — если установлен сертификат Минцифры
+    max_tokens: int        = 1000
+    temperature: float     = 0.2
+
+    # ── Векторная база ────────────────────────────────────────────────────────
+    persist_dir: str     = "./chroma_gigachat"
+    collection_name: str = "eduirk"
+
+    # ── Чанкинг ───────────────────────────────────────────────────────────────
+    chunk_size: int    = 300
+    chunk_overlap: int = 50
+
+    # ── Поиск + reranker ──────────────────────────────────────────────────────
+    fetch_k: int = 30   # кандидатов из Chroma
+    top_k: int   = 5    # финальных чанков после rerank
+
+    # ── Reranker ──────────────────────────────────────────────────────────────
+    reranker_model:     str   = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
+    reranker_threshold: float = 0.0   # чанки со скором ниже этого значения отбрасываются
+    # Альтернативы:
+    #   "cross-encoder/ms-marco-MiniLM-L-6-v2"  — только английский, быстрее
+    #   "DiTy/cross-encoder-russian-msmarco"      — лучший для русского, ~500 МБ
+
+    # ── Память ────────────────────────────────────────────────────────────────
+    memory_turns: int = 5   # сколько последних обменов помнить
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Память диалога
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConversationMemory:
+    def __init__(self, max_turns: int = 5):
+        self._max_turns = max_turns
+        self._history: deque[dict] = deque(maxlen=max_turns)
+
+    def save(self, question: str, answer: str) -> None:
+        self._history.append({"question": question, "answer": answer})
+
+    def clear(self) -> None:
+        self._history.clear()
+
+    def is_empty(self) -> bool:
+        return len(self._history) == 0
+
+    def as_sdk_messages(self) -> list[Messages]:
+        """История в формате GigaChat SDK Messages."""
+        msgs = []
+        for turn in self._history:
+            msgs.append(Messages(role=MessagesRole.USER,      content=turn["question"]))
+            msgs.append(Messages(role=MessagesRole.ASSISTANT, content=turn["answer"]))
+        return msgs
+
+    def as_text(self) -> str:
+        if self.is_empty():
+            return ""
+        lines = []
+        for turn in self._history:
+            lines.append(f"Пользователь: {turn['question']}")
+            lines.append(f"Ассистент: {turn['answer']}")
+        return "\n".join(lines)
+
+    def __len__(self) -> int:
+        return len(self._history)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CrossEncoder Reranker
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CrossEncoderReranker:
+    def __init__(self, model_name: str, top_k: int, threshold: float = 0.0):
+        print(f"[reranker] Загрузка модели: {model_name}")
+        self._model     = CrossEncoder(model_name, max_length=512)
+        self._top_k     = top_k
+        self._threshold = threshold
+        print(f"[reranker] Готово. top-{top_k}, порог скора: {threshold}")
+
+    def rerank(self, query: str, docs: list[Document]) -> list[Document]:
+        if not docs:
+            return docs
+
+        pairs  = [(query, doc.page_content) for doc in docs]
+        scores = self._model.predict(pairs)
+
+        scored_docs = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+
+        # Отбрасываем чанки ниже порога
+        filtered = [(score, doc) for score, doc in scored_docs if score >= self._threshold]
+
+        # Если после фильтрации ничего не осталось — берём хотя бы лучший чанк
+        if not filtered:
+            filtered = scored_docs[:1]
+
+        top_docs = [doc for _, doc in filtered[: self._top_k]]
+
+        print("[reranker] Топ результаты:")
+        for score, doc in scored_docs[: self._top_k]:
+            mark  = "✓" if score >= self._threshold else "✗"
+            title = doc.metadata.get("title", "")[:45]
+            print(f"  {mark} {score:+.3f}  {title}")
+
+        return top_docs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RAGSystem
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RAGSystem:
+    def __init__(self, cfg: RAGConfig):
+        self.cfg    = cfg
+        self.memory = ConversationMemory(max_turns=cfg.memory_turns)
+
+        self._vectorstore:   Optional[Chroma]               = None
+        self._reranker:      Optional[CrossEncoderReranker] = None
+        self._base_retriever = None
+
+        # Валидация и очистка ключа
+        self._gc_kwargs = dict(
+            credentials=self._validate_credentials(cfg.credentials),
+            scope=cfg.scope,
+            model=cfg.model,
+            verify_ssl_certs=cfg.verify_ssl_certs,
+        )
+
+    # ── Валидация ключа ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_credentials(raw: str) -> str:
+        """
+        Проверяет ключ GigaChat и возвращает очищенную строку.
+        Выбрасывает понятную ошибку если ключ некорректный.
+        """
+        import base64
+
+        # Убираем пробелы, переносы строк, BOM и невидимые символы
+        creds = raw.strip().strip('\ufeff').replace('\n', '').replace('\r', '').replace(' ', '')
+
+        if not creds:
+            raise ValueError(
+                "\n[ключ] GIGACHAT_CREDENTIALS пустой!\n"
+                "  Укажите его в cfg = RAGConfig(credentials='...')\n"
+                "  Где взять: developers.sber.ru/studio → Ключи и токены → Авторизационные данные"
+            )
+
+        # Проверяем на не-ASCII символы — частая причина ошибки
+        try:
+            creds.encode('ascii')
+        except UnicodeEncodeError as e:
+            bad_pos   = e.start
+            bad_char  = creds[bad_pos]
+            bad_ord   = ord(bad_char)
+            snippet   = creds[max(0, bad_pos-3) : bad_pos+4]
+            raise ValueError(
+                f"\n[ключ] В ключе обнаружен не-ASCII символ!\n"
+                f"  Позиция {bad_pos}: символ '{bad_char}' (код U+{bad_ord:04X})\n"
+                f"  Фрагмент вокруг: «{snippet}»\n\n"
+                f"  Возможные причины:\n"
+                f"  1. При копировании захватили лишний текст с кириллицей\n"
+                f"  2. Скопировали Client Secret вместо Authorization Data\n"
+                f"  3. Ключ скопирован с переносом строки внутри\n\n"
+                f"  Где взять правильный ключ:\n"
+                f"  developers.sber.ru/studio → ваш проект\n"
+                f"  → вкладка «Ключи и токены»\n"
+                f"  → кнопка «Сгенерировать новый Client Secret»\n"
+                f"  → копируйте поле «Авторизационные данные» (длинная строка на ==)\n"
+                f"  Правильный ключ содержит ТОЛЬКО латиницу, цифры, +, /, ="
+            ) from e
+
+        # Проверяем что это валидный base64
+        try:
+            decoded = base64.b64decode(creds + '==')  # padding для надёжности
+            if len(decoded) < 20:
+                raise ValueError("Слишком короткий")
+        except Exception:
+            raise ValueError(
+                f"\n[ключ] Ключ не является валидным base64!\n"
+                f"  Текущее значение ({len(creds)} символов): {creds[:30]}...\n\n"
+                f"  Правильный ключ выглядит примерно так:\n"
+                f"  MDE5YTRkNDct...YTYxOA==\n"
+                f"  (длинная строка ~88 символов, заканчивается на '==')\n\n"
+                f"  Где взять: developers.sber.ru/studio\n"
+                f"  → Ключи и токены → Авторизационные данные"
+            )
+
+        return creds
+
+    # ── Загрузка индекса с диска ──────────────────────────────────────────────
+
+    def load_index(self, embeddings) -> None:
+        self._vectorstore = Chroma(
+            collection_name=self.cfg.collection_name,
+            persist_directory=self.cfg.persist_dir,
+            embedding_function=embeddings,
+        )
+        self._setup()
+        count = self._vectorstore._collection.count()
+        print(f"[rag] Индекс загружен. Векторов в базе: {count}")
+
+    def set_vectorstore(self, vectorstore: Chroma) -> None:
+        self._vectorstore = vectorstore
+        self._setup()
+
+    def _setup(self) -> None:
+        self._reranker = CrossEncoderReranker(
+            model_name=self.cfg.reranker_model,
+            top_k=self.cfg.top_k,
+            threshold=self.cfg.reranker_threshold,
+        )
+        self._base_retriever = self._vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={
+                "k":           self.cfg.fetch_k,
+                "fetch_k":     self.cfg.fetch_k * 2,
+                "lambda_mult": 0.7,
+            },
+        )
+
+    # ── Вызов GigaChat SDK (решает ASCII-баг LangChain-обёртки) ──────────────
+
+    def _call_gigachat(self, messages: list[Messages]) -> str:
+        """
+        Прямой вызов GigaChat SDK.
+        Избегает бага LangChain-обёртки с кириллицей в invoke(messages).
+        """
+        payload = Chat(
+            messages=messages,
+            max_tokens=self.cfg.max_tokens,
+            temperature=self.cfg.temperature,
+        )
+        with GigaChat(**self._gc_kwargs) as client:
+            response = client.chat(payload)
+        return response.choices[0].message.content
+
+    # ── Шаг 1: перефразировать вопрос с учётом истории ───────────────────────
+
+    def _rewrite_question(self, question: str) -> str:
+        if self.memory.is_empty():
+            return question
+
+        # Быстрая эвристика: если в вопросе нет явных анафорических маркеров —
+        # не тратим токены на LLM-вызов, возвращаем вопрос как есть
+        ANAPHORA_MARKERS = [
+            "он ", "она ", "они ", "оно ", "его ", "её ", "их ",
+            "им ", "ему ", "ней ", "них ", "ним ",
+            "этот ", "эта ", "это ", "эти ",
+            "тот ", "та ", "те ", "том ",
+            "там ", "тогда ", "тут ",
+            "про него", "про неё", "про них", "про это",
+            "о нём", "о ней", "о них",
+            "подробнее", "ещё про", "а ещё", "а как насчёт",
+            "расскажи ещё", "что ещё",
+        ]
+        q_lower = question.lower()
+        has_anaphora = any(marker in q_lower for marker in ANAPHORA_MARKERS)
+
+        if not has_anaphora:
+            return question   # вопрос самодостаточен — не трогаем
+
+        messages = [
+            Messages(
+                role=MessagesRole.SYSTEM,
+                content=(
+                    "Пользователь задал вопрос, который содержит местоимение или ссылку "
+                    "на предыдущее сообщение. Подставь из истории то, на что указывает "
+                    "местоимение, и верни переформулированный вопрос.\n"
+                    "Верни ТОЛЬКО итоговый вопрос — без пояснений, без кавычек."
+                ),
+            ),
+            Messages(
+                role=MessagesRole.USER,
+                content=(
+                    f"История диалога:\n{self.memory.as_text()}\n\n"
+                    f"Вопрос с местоимением: {question}\n\n"
+                    "Переформулированный вопрос:"
+                ),
+            ),
+        ]
+
+        rewritten = self._call_gigachat(messages).strip()
+
+        if rewritten and rewritten != question:
+            print(f"[memory] Вопрос переформулирован: «{rewritten}»")
+
+        return rewritten or question
+
+    # ── Шаг 2: поиск + rerank ────────────────────────────────────────────────
+
+    def _retrieve_and_rerank(self, query: str) -> list[Document]:
+        candidates = self._base_retriever.invoke(query)
+        return self._reranker.rerank(query, candidates)
+
+    # ── Шаг 3: форматировать чанки ───────────────────────────────────────────
+
+    @staticmethod
+    def _format_docs(docs: list[Document]) -> str:
+        parts = []
+        for doc in docs:
+            src    = doc.metadata.get("source", "")
+            title  = doc.metadata.get("title", "")
+            header = f"[{title} | {src}]" if (title or src) else ""
+            parts.append(f"{header}\n{doc.page_content}".strip())
+        return "\n\n---\n\n".join(parts)
+
+    # ── Шаг 4: генерировать ответ с историей ─────────────────────────────────
+
+    def _generate_answer(self, question: str, context: str) -> str:
+        system_content = (
+            "Ты — помощник МКУ «ИМЦРО» (Муниципальное казённое учреждение "
+            "развития образования города Иркутска).\n\n"
+            "Отвечай ТОЛЬКО на основе предоставленного текста. Не придумывай факты.\n"
+            "Если ответа в тексте нет — честно скажи об этом и предложи позвонить в учреждение.\n"
+            "Учитывай историю диалога — не повторяй то, что уже было сказано.\n"
+            "Отвечай на русском языке, кратко и по делу.\n"
+            "Если есть даты, телефоны, ссылки — обязательно укажи их.\n\n"
+            f"ТЕКСТ ИЗ БАЗЫ ЗНАНИЙ:\n{context}"
+        )
+
+        messages = (
+            [Messages(role=MessagesRole.SYSTEM, content=system_content)]
+            + self.memory.as_sdk_messages()
+            + [Messages(role=MessagesRole.USER, content=question)]
+        )
+
+        return self._call_gigachat(messages)
+
+    # ── Основной метод ────────────────────────────────────────────────────────
+
+    def ask(self, question: str) -> dict:
+        """
+        Возвращает:
+            {
+                "answer":             str,
+                "rewritten_question": str,
+                "sources":            [{"title": str, "source": str}, ...]
+            }
+        """
+        if self._base_retriever is None:
+            raise RuntimeError("Сначала вызовите load_index() или set_vectorstore().")
+
+        rewritten = self._rewrite_question(question)
+        top_docs  = self._retrieve_and_rerank(rewritten)
+        context   = self._format_docs(top_docs)
+        answer    = self._generate_answer(rewritten, context)
+
+        self.memory.save(question, answer)
+
+        seen, sources = set(), []
+        for doc in top_docs:
+            url = doc.metadata.get("source", "")
+            if url and url not in seen:
+                seen.add(url)
+                sources.append({
+                    "title":  doc.metadata.get("title", ""),
+                    "source": url,
+                })
+
+        return {
+            "answer":             answer,
+            "rewritten_question": rewritten,
+            "sources":            sources,
+        }
+
+    # ── Утилиты ───────────────────────────────────────────────────────────────
+
+    def clear_memory(self) -> None:
+        self.memory.clear()
+        print("[memory] История диалога очищена.")
+
+    def print_history(self) -> None:
+        if self.memory.is_empty():
+            print("[memory] История пуста.")
+            return
+        print(f"[memory] История ({len(self.memory)} обменов):")
+        print(self.memory.as_text())
