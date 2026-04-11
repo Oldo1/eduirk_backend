@@ -17,6 +17,7 @@ from schemas import UserCreate, UserResponse, Token
 from routers.assistant import router as assistant_router, init_rag
 from routers.certificates import router as certificates_router
 from routers.users import router as users_router
+from utils.schema_patch import ensure_certificate_layout_columns
 
 # ====================== LIFESPAN ======================
 @asynccontextmanager
@@ -40,6 +41,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ====================== СОЗДАНИЕ ТАБЛИЦ ======================
 Base.metadata.create_all(bind=engine)
+ensure_certificate_layout_columns(engine)
 
 # ====================== РОУТЕРЫ ======================
 app.include_router(assistant_router)

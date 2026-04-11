@@ -18,6 +18,8 @@ pydantic[email]
 # Генерация грамот (PDF)
 reportlab
 Pillow
+pandas
+openpyxl
 
 # RAG-система (чат-помощник)
 langchain
