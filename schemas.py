@@ -131,6 +131,98 @@ class GeneratedCertificateResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ====================== АТОМАРНОЕ ОБНОВЛЕНИЕ ШАБЛОНА ======================
+class TemplateTextElementInput(BaseModel):
+    """Элемент текста для атомарного обновления шаблона."""
+    text: str
+    is_variable: bool = False
+    x_mm: float
+    y_mm: float
+    font_size: int = 24
+    align: str = "center"
+    max_width_mm: Optional[float] = Field(None, ge=0, le=300)
+    max_height_mm: Optional[float] = Field(None, ge=0, le=400)
+
+
+class TemplateSignerInput(BaseModel):
+    """Подписант для атомарного обновления шаблона."""
+    order: int = 1
+    position: str
+    full_name: str
+    facsimile_url: Optional[str] = None
+    offset_y_mm: float = Field(0.0, ge=-200, le=300)
+    facsimile_offset_x_mm: float = Field(0.0, ge=-150, le=150)
+    facsimile_offset_y_mm: float = Field(0.0, ge=-150, le=150)
+    facsimile_scale: float = Field(1.0, ge=0.1, le=5.0)
+
+
+class TemplateFullUpdateRequest(BaseModel):
+    """
+    Атомарное обновление шаблона: метаданные + все элементы + все подписанты.
+    Старые элементы и подписанты удаляются и заменяются новыми.
+    """
+    name: str = Field(..., max_length=200)
+    background_url: Optional[str] = None
+    signers_y_mm: float = Field(248.0, ge=0, le=400)
+    signers_block_x_mm: float = Field(105.0, ge=0, le=300)
+    signers_row_height_mm: float = Field(32.0, ge=5, le=300)
+    signers_band_width_mm: float = Field(168.0, ge=10, le=400)
+    signers_font_size: float = Field(10.0, ge=1, le=72)
+    signers_text_color: str = Field("#1e293b", max_length=16)
+    signers_font_weight: str = Field("400", max_length=8)
+    margin_left_mm: float = Field(12.0, ge=0, le=200)
+    margin_right_mm: float = Field(12.0, ge=0, le=200)
+    margin_top_mm: float = Field(12.0, ge=0, le=200)
+    margin_bottom_mm: float = Field(12.0, ge=0, le=200)
+    elements: List[TemplateTextElementInput] = Field(default_factory=list)
+    signers: List[TemplateSignerInput] = Field(default_factory=list, max_length=3)
+
+
+class TemplateFullResponse(BaseModel):
+    """Ответ на атомарное обновление: шаблон + элементы + подписанты."""
+    template: CertificateTemplateResponse
+    elements: List[TemplateTextElementResponse]
+    signers: List[TemplateSignerResponse]
+
+
+# ====================== РУЧНАЯ ВЫДАЧА ======================
+class ManualCertificateRequest(BaseModel):
+    """
+    Ручная выдача одного сертификата: все переменные задаются вручную.
+    Обязательные быстрые поля (ФИО, Мероприятие, Дата) + произвольные доп. переменные.
+    """
+    template_id: Optional[int] = None
+    template_name: Optional[str] = Field(None, max_length=200)
+
+    # Быстрые поля (удобство UX)
+    fio: str = Field(..., min_length=1, max_length=300, description="ФИО получателя")
+    event_name: str = Field(..., min_length=1, max_length=300, description="Название мероприятия")
+    date: Optional[str] = Field(None, max_length=100, description="Дата (необязательно)")
+
+    # Произвольные дополнительные переменные {Ключ: Значение}
+    extra_variables: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Дополнительные переменные для подстановки в шаблон",
+    )
+
+    @model_validator(mode="after")
+    def _validate_manual(self):
+        has_id = self.template_id is not None
+        has_name = bool((self.template_name or "").strip())
+        if has_id and has_name:
+            raise ValueError("Укажите только template_id или только template_name")
+        if not has_id and not has_name:
+            raise ValueError("Нужен template_id или template_name")
+        if len(self.extra_variables) > 50:
+            raise ValueError("Не более 50 дополнительных переменных")
+        for k, v in self.extra_variables.items():
+            if len(str(k)) > 100:
+                raise ValueError(f"Имя переменной слишком длинное: «{k[:30]}…»")
+            if len(str(v)) > 800:
+                raise ValueError(f"Значение переменной «{k}» слишком длинное (макс. 800 символов)")
+        return self
+
+
 # ====================== ПОДПИСАНТЫ ======================
 class TemplateSignerCreate(BaseModel):
     order: int = 1
