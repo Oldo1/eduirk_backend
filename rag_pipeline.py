@@ -72,11 +72,11 @@ class RAGConfig:
     top_k: int   = 5    # финальных чанков после rerank
 
     # ── Reranker ──────────────────────────────────────────────────────────────
-    reranker_model:     str   = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
+    # DiTy — кросс-энкодер, обученный на русском MS MARCO.
+    # Предыдущий cross-encoder/msmarco-MiniLM-L6-en-de-v1 — только EN/DE,
+    # на русских запросах давал почти случайные оценки.
+    reranker_model:     str   = "DiTy/cross-encoder-russian-msmarco"
     reranker_threshold: float = 0.0   # чанки со скором ниже этого значения отбрасываются
-    # Альтернативы:
-    #   "cross-encoder/ms-marco-MiniLM-L-6-v2"  — только английский, быстрее
-    #   "DiTy/cross-encoder-russian-msmarco"      — лучший для русского, ~500 МБ
 
     # ── Память ────────────────────────────────────────────────────────────────
     memory_turns: int = 5   # сколько последних обменов помнить
@@ -354,9 +354,22 @@ class RAGSystem:
     def _format_docs(docs: list[Document]) -> str:
         parts = []
         for doc in docs:
-            src    = doc.metadata.get("source", "")
-            title  = doc.metadata.get("title", "")
-            header = f"[{title} | {src}]" if (title or src) else ""
+            src        = doc.metadata.get("source", "")
+            title      = doc.metadata.get("title", "")
+            breadcrumb = doc.metadata.get("breadcrumb", "")
+            # Для навигационных чанков реальный URL живёт в page_url,
+            # а в source хранится псевдо-ключ __nav__.
+            if src.startswith("__"):
+                src = doc.metadata.get("page_url", "")
+
+            header_parts = []
+            if title:
+                header_parts.append(title)
+            if src:
+                header_parts.append(f"URL: {src}")
+            if breadcrumb:
+                header_parts.append(f"Путь: {breadcrumb}")
+            header = f"[{' | '.join(header_parts)}]" if header_parts else ""
             parts.append(f"{header}\n{doc.page_content}".strip())
         return "\n\n---\n\n".join(parts)
 
@@ -370,7 +383,10 @@ class RAGSystem:
             "Если ответа в тексте нет — честно скажи об этом и предложи позвонить в учреждение.\n"
             "Учитывай историю диалога — не повторяй то, что уже было сказано.\n"
             "Отвечай на русском языке, кратко и по делу.\n"
-            "Если есть даты, телефоны, ссылки — обязательно укажи их.\n\n"
+            "Если есть даты, телефоны, ссылки — обязательно укажи их.\n"
+            "Если пользователь спрашивает как найти или перейти на страницу — "
+            "укажи прямую ссылку (URL) из текста базы знаний и опиши путь навигации "
+            "(хлебные крошки), если они есть.\n\n"
             f"ТЕКСТ ИЗ БАЗЫ ЗНАНИЙ:\n{context}"
         )
 
@@ -398,6 +414,14 @@ class RAGSystem:
 
         rewritten = self._rewrite_question(question)
         top_docs  = self._retrieve_and_rerank(rewritten)
+
+        print(f"[rag] Запрос: {rewritten!r}")
+        print(f"[rag] В контекст попали {len(top_docs)} чанков:")
+        for i, doc in enumerate(top_docs, 1):
+            src   = doc.metadata.get("source", "")[:90]
+            title = doc.metadata.get("title", "")[:60]
+            print(f"  {i}. [{title}] {src}")
+
         context   = self._format_docs(top_docs)
         answer    = self._generate_answer(rewritten, context)
 
@@ -406,6 +430,8 @@ class RAGSystem:
         seen, sources = set(), []
         for doc in top_docs:
             url = doc.metadata.get("source", "")
+            if url.startswith("__"):
+                url = doc.metadata.get("page_url", "")
             if url and url not in seen:
                 seen.add(url)
                 sources.append({

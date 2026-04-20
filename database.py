@@ -1,6 +1,6 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from dotenv import load_dotenv
 import os
 
@@ -9,7 +9,7 @@ load_dotenv()
 
 # === ИЗМЕНИ ЭТИ ДАННЫЕ НА СВОИ ===
 DB_USER = os.getenv("DB_USER", "postgres")           # твой логин
-DB_PASSWORD = os.getenv("DB_PASSWORD", "admin")  # твой пароль
+DB_PASSWORD = os.getenv("DB_PASSWORD", "root")  # твой пароль
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "eduirk_db")          # название твоей базы

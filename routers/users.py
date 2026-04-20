@@ -5,6 +5,7 @@ from typing import List
 from database import get_db
 from models import User, UserRole
 from schemas import UserCreate, UserResponse
+from auth import hash_password
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -39,9 +40,9 @@ def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
 
     new_user = User(
         email=user_data.email,
-        password_hash=user_data.password,   # В реальном проекте здесь должен быть hash_password()
-        username=user_data.email.split('@')[0],  # временно
-        is_active=True
+        password_hash=hash_password(user_data.password),
+        username=user_data.email.split('@')[0],
+        is_active=True,
     )
     db.add(new_user)
     db.commit()
@@ -62,7 +63,7 @@ def update_user(
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
     user.email = user_data.email
-    user.password_hash = user_data.password  # В будущем — хэширование
+    user.password_hash = hash_password(user_data.password)
     user.username = user_data.email.split('@')[0]
 
     db.commit()

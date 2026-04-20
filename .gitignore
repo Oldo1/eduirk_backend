@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Виртуальные окружения
+.venv/
+.venv-*/
+venv/
+env/
+
+# Секреты и локальная конфигурация
+.env
+.env.local
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Кэши OCR и индексов
+ocr_cache/
+chroma_gigachat/
+s3_extracted/
+
+# Логи и состояние
+*.log
+update_state.json
+
+# OS
+.DS_Store
+Thumbs.db

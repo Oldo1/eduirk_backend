@@ -129,7 +129,7 @@ async def upload_facsimile(file: UploadFile = File(...)):
 # ====================== ШАБЛОНЫ ======================
 @router.post("/templates", response_model=CertificateTemplateResponse)
 def create_template(data: CertificateTemplateCreate, db: Session = Depends(get_db)):
-    template = CertificateTemplate(**data.dict())
+    template = CertificateTemplate(**data.model_dump())
     db.add(template)
     db.commit()
     db.refresh(template)
@@ -280,7 +280,7 @@ def add_text_element(template_id: int, element: TemplateTextElementCreate, db: S
     if not db.query(CertificateTemplate).filter_by(id=template_id).first():
         raise HTTPException(404, "Шаблон не найден")
     
-    el = TemplateTextElement(template_id=template_id, **element.dict())
+    el = TemplateTextElement(template_id=template_id, **element.model_dump())
     db.add(el)
     db.commit()
     db.refresh(el)
@@ -298,7 +298,7 @@ def add_signer(template_id: int, signer: TemplateSignerCreate, db: Session = Dep
     if not db.query(CertificateTemplate).filter_by(id=template_id).first():
         raise HTTPException(404, "Шаблон не найден")
     
-    signer_obj = TemplateSigner(template_id=template_id, **signer.dict())
+    signer_obj = TemplateSigner(template_id=template_id, **signer.model_dump())
     db.add(signer_obj)
     db.commit()
     db.refresh(signer_obj)

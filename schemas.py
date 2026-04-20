@@ -131,6 +131,34 @@ class GeneratedCertificateResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ====================== ПОДПИСАНТЫ ======================
+class TemplateSignerCreate(BaseModel):
+    order: int = 1
+    position: str
+    full_name: str
+    facsimile_url: Optional[str] = None
+    offset_y_mm: float = Field(0.0, ge=-120, le=160, description="Доп. сдвиг строки вниз, мм")
+    facsimile_offset_x_mm: float = Field(0.0, ge=-80, le=80, description="Сдвиг факсимиле вправо, мм")
+    facsimile_offset_y_mm: float = Field(0.0, ge=-80, le=80, description="Сдвиг факсимиле вниз по листу, мм")
+    facsimile_scale: float = Field(1.0, ge=0.2, le=3.0, description="Множитель размера вписанного изображения")
+
+
+class TemplateSignerResponse(BaseModel):
+    id: int
+    template_id: int
+    order: int
+    position: str
+    full_name: str
+    facsimile_url: Optional[str]
+    offset_y_mm: float
+    facsimile_offset_x_mm: float
+    facsimile_offset_y_mm: float
+    facsimile_scale: float
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 # ====================== АТОМАРНОЕ ОБНОВЛЕНИЕ ШАБЛОНА ======================
 class TemplateTextElementInput(BaseModel):
     """Элемент текста для атомарного обновления шаблона."""
@@ -221,31 +249,3 @@ class ManualCertificateRequest(BaseModel):
             if len(str(v)) > 800:
                 raise ValueError(f"Значение переменной «{k}» слишком длинное (макс. 800 символов)")
         return self
-
-
-# ====================== ПОДПИСАНТЫ ======================
-class TemplateSignerCreate(BaseModel):
-    order: int = 1
-    position: str
-    full_name: str
-    facsimile_url: Optional[str] = None
-    offset_y_mm: float = Field(0.0, ge=-120, le=160, description="Доп. сдвиг строки вниз, мм")
-    facsimile_offset_x_mm: float = Field(0.0, ge=-80, le=80, description="Сдвиг факсимиле вправо, мм")
-    facsimile_offset_y_mm: float = Field(0.0, ge=-80, le=80, description="Сдвиг факсимиле вниз по листу, мм")
-    facsimile_scale: float = Field(1.0, ge=0.2, le=3.0, description="Множитель размера вписанного изображения")
-
-
-class TemplateSignerResponse(BaseModel):
-    id: int
-    template_id: int
-    order: int
-    position: str
-    full_name: str
-    facsimile_url: Optional[str]
-    offset_y_mm: float
-    facsimile_offset_x_mm: float
-    facsimile_offset_y_mm: float
-    facsimile_scale: float
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
