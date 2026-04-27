@@ -1,0 +1,47 @@
+# ====================================
+# Зависимости для Docker (production-like)
+# ====================================
+
+# Основной фреймворк
+fastapi
+uvicorn[standard]
+
+# База данных
+sqlalchemy
+psycopg2-binary
+alembic
+
+# Аутентификация
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+
+# Pydantic
+pydantic
+pydantic[email]
+
+# Генерация грамот (PDF) + обработка изображений
+reportlab
+Pillow
+pandas
+openpyxl
+pytrovich
+
+# RAG-система (чат-помощник)
+langchain
+langchain-chroma
+langchain-huggingface
+gigachat
+sentence-transformers
+chromadb
+
+# Дополнительно
+python-dotenv
+httpx
+requests
+beautifulsoup4
+boto3
+pypdf
+python-docx
+pytesseract
+pdf2image
