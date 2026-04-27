@@ -6,6 +6,7 @@ from io import BytesIO
 import os
 import shutil
 import zipfile
+import re
 from datetime import datetime
 from database import get_db
 from models import (
@@ -19,14 +20,17 @@ from schemas import (
     TemplateSignerCreate, TemplateSignerResponse,
     ManualCertificateRequest,
     TemplateFullUpdateRequest, TemplateFullResponse,
+    TemplateVariablesResponse, ExcelInspectResponse,
 )
 from utils.pdf_generator import generate_certificate_pdf
 from utils.excel_batch import (
     read_fio_list_from_excel,
+    read_rows_from_excel,
     assign_unique_pdf_names,
     sanitize_zip_entry_basename,
 )
-from utils.certificate_text import merge_legacy_variables
+from utils.certificate_text import extract_placeholders, merge_legacy_variables
+from utils.name_declension import prepare_certificate_variables
 from reportlab.lib.utils import ImageReader
 
 router = APIRouter(prefix="/certificates", tags=["certificates"])
@@ -93,6 +97,35 @@ def _is_likely_xlsx(content: bytes) -> bool:
     return len(content) >= 4 and content[:2] == b"PK"
 
 
+def _template_variables_from_elements(elements: List[TemplateTextElement]) -> List[str]:
+    variables: List[str] = []
+    seen: set[str] = set()
+    for el in elements:
+        for key in extract_placeholders(el.text or ""):
+            normalized = "".join(str(key).strip().lower().split())
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                variables.append(key)
+    return variables
+
+
+def _normalized_key(value: str) -> str:
+    return "".join(str(value).strip().lower().split())
+
+
+def _safe_upload_name(filename: str) -> str:
+    base = os.path.basename(filename or "")
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("._")
+    return safe or "upload"
+
+
+def _font_family_from_filename(filename: str) -> str:
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    stem = re.sub(r"^\d{8}_\d{6}_", "", stem)
+    family = re.sub(r"[_-]+", " ", stem).strip()
+    return family or "Custom font"
+
+
 # ====================== ЗАГРУЗКА ФАЙЛОВ ======================
 @router.post("/upload-background")
 async def upload_background(file: UploadFile = File(...)):
@@ -126,10 +159,58 @@ async def upload_facsimile(file: UploadFile = File(...)):
     return {"facsimile_url": f"/static/certificates/facsimiles/{filename}"}
 
 
+@router.post("/upload-font")
+async def upload_font(file: UploadFile = File(...)):
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    allowed_types = {
+        "font/ttf",
+        "font/otf",
+        "application/x-font-ttf",
+        "application/x-font-otf",
+        "application/octet-stream",
+    }
+    if ext not in {".ttf", ".otf"} or file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Только файлы шрифтов .ttf или .otf")
+
+    upload_dir = "static/fonts/custom"
+    os.makedirs(upload_dir, exist_ok=True)
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_upload_name(file.filename)}"
+    file_path = os.path.join(upload_dir, filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return {
+        "font_family": _font_family_from_filename(file.filename),
+        "font_url": f"/static/fonts/custom/{filename}",
+    }
+
+
+@router.get("/fonts")
+def get_fonts():
+    fonts = [
+        {"font_family": "DejaVu", "font_url": "/static/fonts/DejaVuSans.ttf"},
+        {"font_family": "Roboto", "font_url": None},
+        {"font_family": "Montserrat", "font_url": None},
+        {"font_family": "Open Sans", "font_url": None},
+        {"font_family": "Playfair Display", "font_url": None},
+        {"font_family": "Oswald", "font_url": None},
+    ]
+    upload_dir = "static/fonts/custom"
+    if os.path.isdir(upload_dir):
+        for filename in sorted(os.listdir(upload_dir)):
+            if os.path.splitext(filename)[1].lower() in {".ttf", ".otf"}:
+                fonts.append({
+                    "font_family": _font_family_from_filename(filename),
+                    "font_url": f"/static/fonts/custom/{filename}",
+                })
+    return {"fonts": fonts}
+
+
 # ====================== ШАБЛОНЫ ======================
 @router.post("/templates", response_model=CertificateTemplateResponse)
 def create_template(data: CertificateTemplateCreate, db: Session = Depends(get_db)):
-    template = CertificateTemplate(**data.model_dump())
+    template = CertificateTemplate(**data.dict())
     db.add(template)
     db.commit()
     db.refresh(template)
@@ -161,6 +242,88 @@ def delete_template(template_id: int, db: Session = Depends(get_db)):
     return {"ok": True, "message": "Шаблон удалён"}
 
 
+@router.post("/templates/full", response_model=TemplateFullResponse)
+def create_template_full(data: TemplateFullUpdateRequest, db: Session = Depends(get_db)):
+    """
+    Атомарное создание шаблона: метаданные + элементы + подписанты.
+    Используется конструктором, чтобы новый шаблон не сохранялся частично.
+    """
+    try:
+        template = CertificateTemplate(
+            name=data.name,
+            background_url=data.background_url,
+            signers_y_mm=data.signers_y_mm,
+            signers_block_x_mm=data.signers_block_x_mm,
+            signers_row_height_mm=data.signers_row_height_mm,
+            signers_band_width_mm=data.signers_band_width_mm,
+            signers_font_size=data.signers_font_size,
+            signers_text_color=data.signers_text_color,
+            signers_position_color=data.signers_position_color,
+            signers_name_color=data.signers_name_color,
+            signers_font_weight=data.signers_font_weight,
+            signers_font_family=data.signers_font_family,
+            margin_left_mm=data.margin_left_mm,
+            margin_right_mm=data.margin_right_mm,
+            margin_top_mm=data.margin_top_mm,
+            margin_bottom_mm=data.margin_bottom_mm,
+        )
+        db.add(template)
+        db.flush()
+
+        new_elements = []
+        for el in data.elements:
+            obj = TemplateTextElement(
+                template_id=template.id,
+                text=el.text,
+                is_variable=el.is_variable,
+                x_mm=el.x_mm,
+                y_mm=el.y_mm,
+                font_size=el.font_size,
+                align=el.align,
+                color=el.color,
+                font_weight=el.font_weight,
+                font_family=el.font_family,
+                max_width_mm=el.max_width_mm,
+                max_height_mm=el.max_height_mm,
+            )
+            db.add(obj)
+            new_elements.append(obj)
+
+        new_signers = []
+        for i, s in enumerate(data.signers[:3]):
+            obj = TemplateSigner(
+                template_id=template.id,
+                order=s.order if s.order else i + 1,
+                position=s.position,
+                full_name=s.full_name,
+                facsimile_url=s.facsimile_url,
+                offset_y_mm=s.offset_y_mm,
+                facsimile_offset_x_mm=s.facsimile_offset_x_mm,
+                facsimile_offset_y_mm=s.facsimile_offset_y_mm,
+                facsimile_scale=s.facsimile_scale,
+            )
+            db.add(obj)
+            new_signers.append(obj)
+
+        db.commit()
+        db.refresh(template)
+        for el in new_elements:
+            db.refresh(el)
+        for s in new_signers:
+            db.refresh(s)
+
+        return {"template": template, "elements": new_elements, "signers": new_signers}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка создания шаблона: {str(e)}",
+        ) from e
+
+
 @router.get("/templates/{template_id}/full", response_model=TemplateFullResponse)
 def get_template_full(template_id: int, db: Session = Depends(get_db)):
     """
@@ -184,6 +347,88 @@ def get_template_full(template_id: int, db: Session = Depends(get_db)):
         .all()
     )
     return {"template": template, "elements": elements, "signers": signers}
+
+
+@router.get("/templates/{template_id}/variables", response_model=TemplateVariablesResponse)
+def get_template_variables(template_id: int, db: Session = Depends(get_db)):
+    template = db.query(CertificateTemplate).filter_by(id=template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
+
+    elements = (
+        db.query(TemplateTextElement)
+        .filter_by(template_id=template_id)
+        .order_by(TemplateTextElement.y_mm.asc())
+        .all()
+    )
+    return {"template_id": template_id, "variables": _template_variables_from_elements(elements)}
+
+
+@router.post("/excel/inspect", response_model=ExcelInspectResponse)
+async def inspect_excel_variables(
+    file: UploadFile = File(..., description="Excel .xlsx с динамическими переменными"),
+    template_id: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+):
+    if file.filename and not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(
+            status_code=400,
+            detail="Ожидается файл Excel в формате .xlsx (или .xlsm)",
+        )
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    if len(raw) > _MAX_BATCH_EXCEL_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Файл слишком большой (максимум {_MAX_BATCH_EXCEL_BYTES // (1024 * 1024)} МБ)",
+        )
+    if not _is_likely_xlsx(raw):
+        raise HTTPException(
+            status_code=400,
+            detail="Файл не похож на корректный .xlsx. Сохраните таблицу в формате Excel Workbook (.xlsx).",
+        )
+
+    try:
+        excel = read_rows_from_excel(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    template_variables: List[str] = []
+    if template_id is not None:
+        template = db.query(CertificateTemplate).filter_by(id=template_id).first()
+        if not template:
+            raise HTTPException(status_code=404, detail="Шаблон не найден")
+        elements = (
+            db.query(TemplateTextElement)
+            .filter_by(template_id=template_id)
+            .order_by(TemplateTextElement.y_mm.asc())
+            .all()
+        )
+        template_variables = _template_variables_from_elements(elements)
+
+    header_map = {_normalized_key(header): header for header in excel.headers}
+    matched_columns = [
+        header_map[_normalized_key(variable)]
+        for variable in template_variables
+        if _normalized_key(variable) in header_map
+    ]
+    missing_columns = [
+        variable
+        for variable in template_variables
+        if _normalized_key(variable) not in header_map
+    ]
+
+    return {
+        "headers": excel.headers,
+        "row_count": excel.row_count,
+        "fio_column": excel.fio_column,
+        "preview_rows": excel.rows[:5],
+        "template_variables": template_variables,
+        "matched_columns": matched_columns,
+        "missing_columns": missing_columns,
+    }
 
 
 @router.put("/templates/{template_id}/full", response_model=TemplateFullResponse)
@@ -211,7 +456,10 @@ def update_template_full(
         template.signers_band_width_mm = data.signers_band_width_mm
         template.signers_font_size = data.signers_font_size
         template.signers_text_color = data.signers_text_color
+        template.signers_position_color = data.signers_position_color
+        template.signers_name_color = data.signers_name_color
         template.signers_font_weight = data.signers_font_weight
+        template.signers_font_family = data.signers_font_family
         template.margin_left_mm = data.margin_left_mm
         template.margin_right_mm = data.margin_right_mm
         template.margin_top_mm = data.margin_top_mm
@@ -232,6 +480,9 @@ def update_template_full(
                 y_mm=el.y_mm,
                 font_size=el.font_size,
                 align=el.align,
+                color=el.color,
+                font_weight=el.font_weight,
+                font_family=el.font_family,
                 max_width_mm=el.max_width_mm,
                 max_height_mm=el.max_height_mm,
             )
@@ -280,7 +531,7 @@ def add_text_element(template_id: int, element: TemplateTextElementCreate, db: S
     if not db.query(CertificateTemplate).filter_by(id=template_id).first():
         raise HTTPException(404, "Шаблон не найден")
     
-    el = TemplateTextElement(template_id=template_id, **element.model_dump())
+    el = TemplateTextElement(template_id=template_id, **element.dict())
     db.add(el)
     db.commit()
     db.refresh(el)
@@ -298,7 +549,7 @@ def add_signer(template_id: int, signer: TemplateSignerCreate, db: Session = Dep
     if not db.query(CertificateTemplate).filter_by(id=template_id).first():
         raise HTTPException(404, "Шаблон не найден")
     
-    signer_obj = TemplateSigner(template_id=template_id, **signer.model_dump())
+    signer_obj = TemplateSigner(template_id=template_id, **signer.dict())
     db.add(signer_obj)
     db.commit()
     db.refresh(signer_obj)
@@ -316,13 +567,17 @@ async def batch_generate_certificates(
     file: UploadFile = File(..., description="Excel .xlsx со столбцом «ФИО»"),
     template_id: Optional[int] = Form(None),
     template_name: Optional[str] = Form(None),
-    event_name: str = Form(""),
+    event_name: str = Form(""),            # оставлен для обратной совместимости
+    extra_variables: Optional[str] = Form(None),  # JSON: {"Ключ": "Значение"}
     archive_name: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     """
     Пакетная генерация PDF по списку ФИО из Excel. Ответ — ZIP со всеми грамотами.
+    extra_variables — JSON-словарь переменных, общих для всех грамот (не из Excel).
     """
+    import json as _json
+
     _validate_template_selector(template_id, template_name)
 
     if file.filename and not file.filename.lower().endswith((".xlsx", ".xlsm")):
@@ -346,28 +601,36 @@ async def batch_generate_certificates(
             detail="Файл не похож на корректный .xlsx. Сохраните таблицу в формате Excel Workbook (.xlsx).",
         )
 
+    # Разбираем дополнительные переменные из JSON
+    extra_vars: dict = {}
+    if extra_variables:
+        try:
+            parsed = _json.loads(extra_variables)
+            if isinstance(parsed, dict):
+                extra_vars = {str(k): str(v) for k, v in parsed.items()}
+        except Exception:
+            raise HTTPException(status_code=400, detail="extra_variables должен быть валидным JSON-объектом")
+
+    # Обратная совместимость: если передан event_name — добавляем как переменную
     event_name = (event_name or "").strip()
-    if len(event_name) > 300:
-        raise HTTPException(
-            status_code=400,
-            detail="Название мероприятия не длиннее 300 символов",
-        )
+    if event_name:
+        extra_vars.setdefault("Мероприятие", event_name)
 
     try:
-        fio_list, _column_used = read_fio_list_from_excel(raw)
+        excel = read_rows_from_excel(raw)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    if not fio_list:
+    if not excel.rows:
         raise HTTPException(
             status_code=400,
-            detail="В столбце ФИО нет ни одной заполненной строки",
+            detail="В Excel нет ни одной заполненной строки",
         )
 
-    if len(fio_list) > _MAX_BATCH_ROWS:
+    if len(excel.rows) > _MAX_BATCH_ROWS:
         raise HTTPException(
             status_code=400,
-            detail=f"Слишком много строк: {len(fio_list)}. Максимум {_MAX_BATCH_ROWS} за один запрос.",
+            detail=f"Слишком много строк: {len(excel.rows)}. Максимум {_MAX_BATCH_ROWS} за один запрос.",
         )
 
     template = _get_template_by_selector(db, template_id, template_name)
@@ -401,26 +664,27 @@ async def batch_generate_certificates(
             except Exception:
                 bg_reader = None
 
-    font_name = None
-    try:
-        from utils.pdf_generator import _canvas_font_name
+    fio_values = []
+    for index, row in enumerate(excel.rows, start=1):
+        fio = row.get(excel.fio_column or "", "").strip() if excel.fio_column else ""
+        fio_values.append(fio or f"certificate_{index}")
 
-        font_name = _canvas_font_name()
-    except Exception:
-        font_name = None
-
-    pdf_names = assign_unique_pdf_names(fio_list)
+    pdf_names = assign_unique_pdf_names(fio_values)
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_STORED) as zf:
-        for fio, entry_name in zip(fio_list, pdf_names):
+        for row, fio, entry_name in zip(excel.rows, fio_values, pdf_names):
             try:
-                variables = merge_legacy_variables({}, fio, event_name)
+                variables = merge_legacy_variables(row, fio, extra_vars.get("Мероприятие", ""))
+                # Накладываем дополнительные переменные поверх строки Excel (не перетираем Excel-данные)
+                for k, v in extra_vars.items():
+                    variables.setdefault(k, v)
+                variables = prepare_certificate_variables(elements, variables)
                 pdf_buffer = generate_certificate_pdf(
                     template=template,
                     elements=elements,
                     variables=variables,
                     signers=signers_arg,
-                    font_name=font_name,
+                    font_name=None,
                     bg_reader=bg_reader,
                 )
                 zf.writestr(entry_name, pdf_buffer.getvalue())
@@ -493,6 +757,8 @@ def manual_generate_certificate(
             variables["дата"] = date_val
             variables["date"] = date_val
 
+        variables = prepare_certificate_variables(elements, variables)
+
         signers = (
             db.query(TemplateSigner)
             .filter_by(template_id=template.id)
@@ -564,6 +830,8 @@ def generate_certificate(
         variables = dict(request.variables)
         if request.event_name and str(request.event_name).strip():
             variables.setdefault("Мероприятие", request.event_name.strip())
+
+        variables = prepare_certificate_variables(elements, variables)
 
         signers = (
             db.query(TemplateSigner)

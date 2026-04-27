@@ -1,67 +1,57 @@
+# Виртуальные окружения (могут весить десятки ГБ — особенно с CUDA)
+venv
+.venv
+.venv-*
+env
+
+# Python кэши и компилированный код
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Секреты и локальная конфигурация
+.env
+.env.local
+
+# IDE и редакторы
+.vscode
+.idea
+.claude
+*.swp
+
 # VCS
 .git
 .gitignore
 .gitattributes
 
-# IDE / OS
-.idea
-.vscode
-.claude
-.DS_Store
-Thumbs.db
-
-# Виртуальные окружения и кэши Python
-.venv
-.venv-cuda
-venv
-env
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache
-.mypy_cache
-.ruff_cache
-
-# Локальные данные — будут смонтированы как volumes,
-# в образ их класть бессмысленно
+# Кэши приложения (всё bind-mount'ится из docker-compose, в образе не нужно)
 chroma_gigachat
 ocr_cache
 s3_extracted
+update_state.json
+hf_cache
+
+# Сгенерированные файлы и user-uploads (bind-mount'ятся)
+static/certificates/generated
 static/certificates/backgrounds
 static/certificates/facsimiles
-static/certificates/generated
-update_state.json
-update_state.json.bak
 
-# Tesseract data — Surya его не использует
-tessdata
-
-# Большие локальные файлы / бинарники
-*.pdf
-*.docx
-*.doc
-*.zip
-*.tar.gz
-
-# Dev-скрипты, не нужны в продакшен-образе
-a.py
-s3_to_txt.py
-test_*.py
-tests
-scripts
-
-# Docker-артефакты не копируем в образ
-Dockerfile
-docker-compose.yml
-docker-compose.*.yml
-.dockerignore
-
-# Секреты — в compose передаём через env_file/секреты, не через COPY
-.env
-.env.*
-!.env.example
-
-# Логи
+# Локальные БД, бэкапы, логи
+dev.db
+*.sqlite
+*.sqlite3
+backups
+*.dump
 *.log
-logs
+uvicorn.*.log
+
+# Прочий мусор
+.DS_Store
+Thumbs.db
+node_modules
+*.tar.gz
+*.zip

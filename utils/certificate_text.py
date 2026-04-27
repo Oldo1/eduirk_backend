@@ -13,11 +13,50 @@ from reportlab.pdfbase import pdfmetrics
 
 # ── Плейсхолдеры вида {ФИО}, {Дата} ──────────────────────────────────
 _PLACEHOLDER_RE = re.compile(r"\{([^}]+)\}")
+_GENDER_VARIANT_RE = re.compile(r"^(?:род|пол|gender)\s*:\s*([^|{}]+)\|([^{}]+)$", re.IGNORECASE)
 
 
 def _norm_key(s: str) -> str:
     """Нормализация ключа: убираем пробелы, приводим к нижнему регистру."""
     return re.sub(r"\s+", "", s.strip().lower())
+
+
+def _is_gender_variant_key(key: str) -> bool:
+    return _GENDER_VARIANT_RE.match(key.strip()) is not None
+
+
+def _resolve_gender(variables: Dict[str, str]) -> str | None:
+    for key in ("__gender", "gender", "пол", "Пол"):
+        value = variables.get(key)
+        if value is None:
+            continue
+        normalized = str(value).strip().lower()
+        if normalized in ("female", "f", "ж", "жен", "женский", "девочка"):
+            return "female"
+        if normalized in ("male", "m", "м", "муж", "мужской", "мальчик"):
+            return "male"
+    return None
+
+
+def extract_placeholders(text: str) -> List[str]:
+    """Возвращает уникальные плейсхолдеры вида {Ключ} в порядке первого появления."""
+    if not text:
+        return []
+
+    found: List[str] = []
+    seen: set[str] = set()
+    for match in _PLACEHOLDER_RE.finditer(text):
+        key = match.group(1).strip()
+        if not key:
+            continue
+        if _is_gender_variant_key(key):
+            continue
+        normalized = _norm_key(key)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        found.append(key)
+    return found
 
 
 # ── Подстановка переменных ────────────────────────────────────────────
@@ -53,6 +92,12 @@ def apply_variables(text: str, variables: Dict[str, str]) -> str:
 
     def replace_one(m: re.Match[str]) -> str:
         inner = m.group(1).strip()
+        gender_variant = _GENDER_VARIANT_RE.match(inner)
+        if gender_variant:
+            gender = _resolve_gender(variables)
+            male_value = gender_variant.group(1).strip()
+            female_value = gender_variant.group(2).strip()
+            return female_value if gender == "female" else male_value
         if inner in exact:
             return exact[inner]
         nk = _norm_key(inner)

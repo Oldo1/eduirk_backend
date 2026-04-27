@@ -5,6 +5,7 @@ uvicorn[standard]
 # База данных
 sqlalchemy
 psycopg2-binary                  # для PostgreSQL
+alembic                          # миграции (нужны для модуля ТПМПК)
 
 # Аутентификация
 python-jose[cryptography]
@@ -20,6 +21,7 @@ reportlab
 Pillow
 pandas
 openpyxl
+pytrovich                        # склонение ФИО для грамот
 
 # RAG-система (чат-помощник)
 langchain

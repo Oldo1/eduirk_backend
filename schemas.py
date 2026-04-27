@@ -41,7 +41,10 @@ class CertificateTemplateCreate(BaseModel):
     signers_band_width_mm: float = Field(168.0, ge=25, le=210, description="Ширина полосы подписей, мм")
     signers_font_size: float = Field(10.0, ge=5, le=36, description="Базовый кегль текста подписей (макс. до auto-fit)")
     signers_text_color: str = Field("#1e293b", max_length=16)
+    signers_position_color: Optional[str] = Field(None, max_length=16, description="Цвет должности (если None — signers_text_color)")
+    signers_name_color: Optional[str] = Field(None, max_length=16, description="Цвет ФИО (если None — signers_text_color)")
     signers_font_weight: str = Field("400", max_length=8, description="400–800 (жирность, при 600+ — полужирный шрифт если есть)")
+    signers_font_family: str = Field("DejaVu", max_length=120)
     margin_left_mm: float = Field(12.0, ge=0, le=80)
     margin_right_mm: float = Field(12.0, ge=0, le=80)
     margin_top_mm: float = Field(12.0, ge=0, le=120)
@@ -58,7 +61,10 @@ class CertificateTemplateResponse(BaseModel):
     signers_band_width_mm: float
     signers_font_size: float
     signers_text_color: str
+    signers_position_color: Optional[str]
+    signers_name_color: Optional[str]
     signers_font_weight: str
+    signers_font_family: str
     margin_left_mm: float
     margin_right_mm: float
     margin_top_mm: float
@@ -76,6 +82,9 @@ class TemplateTextElementCreate(BaseModel):
     y_mm: float
     font_size: int = 24
     align: str = "center"
+    color: str = Field("#0F172A", max_length=16)
+    font_weight: str = Field("400", max_length=8)
+    font_family: str = Field("DejaVu", max_length=120)
     max_width_mm: Optional[float] = Field(None, ge=5, le=210)
     max_height_mm: Optional[float] = Field(None, ge=5, le=280)
 
@@ -88,10 +97,28 @@ class TemplateTextElementResponse(BaseModel):
     y_mm: float
     font_size: int
     align: str
+    color: str
+    font_weight: str
+    font_family: str
     max_width_mm: Optional[float]
     max_height_mm: Optional[float]
 
     model_config = {"from_attributes": True}
+
+
+class TemplateVariablesResponse(BaseModel):
+    template_id: int
+    variables: List[str]
+
+
+class ExcelInspectResponse(BaseModel):
+    headers: List[str]
+    row_count: int
+    fio_column: Optional[str]
+    preview_rows: List[Dict[str, str]]
+    template_variables: List[str]
+    matched_columns: List[str]
+    missing_columns: List[str]
 
 
 # ====================== ГЕНЕРАЦИЯ ======================
@@ -173,6 +200,9 @@ class TemplateTextElementInput(BaseModel):
     y_mm: float
     font_size: int = 24
     align: str = "center"
+    color: str = "#0F172A"
+    font_weight: str = "400"
+    font_family: str = Field("DejaVu", max_length=120)
     max_width_mm: Optional[float] = Field(None, ge=0, le=300)
     max_height_mm: Optional[float] = Field(None, ge=0, le=400)
 
@@ -202,7 +232,10 @@ class TemplateFullUpdateRequest(BaseModel):
     signers_band_width_mm: float = Field(168.0, ge=10, le=400)
     signers_font_size: float = Field(10.0, ge=1, le=72)
     signers_text_color: str = Field("#1e293b", max_length=16)
+    signers_position_color: Optional[str] = Field(None, max_length=16)
+    signers_name_color: Optional[str] = Field(None, max_length=16)
     signers_font_weight: str = Field("400", max_length=8)
+    signers_font_family: str = Field("DejaVu", max_length=120)
     margin_left_mm: float = Field(12.0, ge=0, le=200)
     margin_right_mm: float = Field(12.0, ge=0, le=200)
     margin_top_mm: float = Field(12.0, ge=0, le=200)

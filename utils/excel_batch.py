@@ -1,13 +1,13 @@
-"""Чтение списка ФИО из Excel для пакетной генерации грамот."""
+"""Excel helpers for certificate batch generation."""
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from io import BytesIO
 from typing import List, Tuple
 
 import pandas as pd
 
-# Синонимы заголовка столбца с ФИО (после нормализации)
 _FIO_HEADER_ALIASES = frozenset(
     {
         "фио",
@@ -23,18 +23,45 @@ _FIO_HEADER_ALIASES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class ExcelRowsResult:
+    headers: List[str]
+    rows: List[dict[str, str]]
+    fio_column: str | None
+    row_count: int
+
+
 def _normalize_header(value: object) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
-    s = str(value).strip().lower()
-    s = re.sub(r"\s+", "", s)
-    return s
+    return re.sub(r"\s+", "", str(value).strip().lower())
+
+
+def _clean_header(value: object, index: int) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return f"Колонка {index + 1}"
+    text = str(value).strip()
+    return text or f"Колонка {index + 1}"
+
+
+def _cell_to_text(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0"):
+        try:
+            number = float(text)
+            if number.is_integer():
+                return str(int(number))
+        except ValueError:
+            pass
+    return text
 
 
 def find_fio_column(df: pd.DataFrame) -> str:
-    """Возвращает имя столбца с ФИО или бросает ValueError."""
+    """Return the FIO column name or raise ValueError."""
     if df.empty or len(df.columns) == 0:
-        raise ValueError("Файл не содержит данных или заголовков столбцов")
+        raise ValueError("Файл не содержит данные или заголовки столбцов")
 
     for col in df.columns:
         if _normalize_header(col) in _FIO_HEADER_ALIASES:
@@ -45,37 +72,60 @@ def find_fio_column(df: pd.DataFrame) -> str:
     )
 
 
-def read_fio_list_from_excel(content: bytes) -> Tuple[List[str], str]:
-    """
-    Читает первый лист Excel, находит столбец ФИО, возвращает список непустых строк
-    и имя использованного столбца.
-    """
+def read_rows_from_excel(content: bytes) -> ExcelRowsResult:
+    """Read the first Excel sheet as dynamic row variables."""
     try:
-        df = pd.read_excel(BytesIO(content), engine="openpyxl")
+        raw_df = pd.read_excel(BytesIO(content), engine="openpyxl", dtype=object)
     except Exception as e:
         raise ValueError(
             "Не удалось прочитать Excel. Убедитесь, что файл в формате .xlsx и не повреждён."
         ) from e
 
-    col = find_fio_column(df)
-    series = df[col]
+    if raw_df.empty and len(raw_df.columns) == 0:
+        raise ValueError("Файл не содержит данные или заголовки столбцов")
 
-    result: List[str] = []
-    for raw in series:
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-            continue
-        text = str(raw).strip()
-        if not text:
-            continue
-        # дубликаты подряд можно оставить — для грамот нужны все строки;
-        # пустые уже отфильтрованы
-        result.append(text)
+    headers = [_clean_header(col, i) for i, col in enumerate(raw_df.columns)]
+    df = raw_df.copy()
+    df.columns = headers
 
-    return result, col
+    fio_column = None
+    for col in headers:
+        if _normalize_header(col) in _FIO_HEADER_ALIASES:
+            fio_column = col
+            break
+
+    rows: List[dict[str, str]] = []
+    for _, raw_row in df.iterrows():
+        row = {header: _cell_to_text(raw_row.get(header)) for header in headers}
+        if any(row.values()):
+            rows.append(row)
+
+    return ExcelRowsResult(
+        headers=headers,
+        rows=rows,
+        fio_column=fio_column,
+        row_count=len(rows),
+    )
+
+
+def read_fio_list_from_excel(content: bytes) -> Tuple[List[str], str]:
+    """Backward-compatible reader that returns only non-empty FIO values."""
+    excel = read_rows_from_excel(content)
+    if not excel.fio_column:
+        raise ValueError(
+            "Не найден столбец с ФИО. Ожидается заголовок вроде «ФИО», «FIO» или «Участник»."
+        )
+
+    names = [
+        row.get(excel.fio_column, "").strip()
+        for row in excel.rows
+        if row.get(excel.fio_column, "").strip()
+    ]
+    return names, excel.fio_column
 
 
 def sanitize_zip_entry_basename(name: str, max_len: int = 100) -> str:
-    """Безопасное имя файла для записи в ZIP (без путей)."""
+    """Safe ZIP entry basename without path separators."""
     name = name.strip().replace("\n", " ").replace("\r", " ")
     for ch in '<>:"/\\|?*\x00':
         name = name.replace(ch, "_")
@@ -86,7 +136,7 @@ def sanitize_zip_entry_basename(name: str, max_len: int = 100) -> str:
 
 
 def assign_unique_pdf_names(fio_list: List[str]) -> List[str]:
-    """Имена вида ИвановИИ.pdf, при коллизии — ИвановИИ_2.pdf."""
+    """Return unique PDF names based on FIO values."""
     counts: dict[str, int] = {}
     out: List[str] = []
     for fio in fio_list:

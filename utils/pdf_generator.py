@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from io import BytesIO
 from typing import Any, Optional, Sequence, Tuple
 
@@ -18,7 +19,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
-from utils.certificate_text import apply_variables, auto_fit_text
+from utils.certificate_text import apply_variables, auto_fit_text, wrap_text_to_width
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +34,6 @@ _SIGN_RIGHT_FRAC = 0.38
 # Допустимое отклонение пропорций изображения от A4 для «точного» покрытия (без crop)
 _A4_ASPECT = PAGE_H_MM / PAGE_W_MM  # ≈ 1.4142
 _ASPECT_TOLERANCE = 0.04            # ±4% — считаем изображение «A4-совместимым»
-_REGISTERED_FONT_NAMES = set(pdfmetrics.getRegisteredFontNames())
-
-
 def register_fonts() -> bool:
     ok = False
     regular = os.path.join("static", "fonts", "DejaVuSans.ttf")
@@ -44,35 +42,86 @@ def register_fonts() -> bool:
             pdfmetrics.registerFont(TTFont("DejaVu", regular))
             ok = True
         except Exception as e:
-            print(f"Ошибка регистрации DejaVu: {e}")
+            logger.warning("Ошибка регистрации DejaVu: %s", e)
     bold = os.path.join("static", "fonts", "DejaVuSans-Bold.ttf")
     if os.path.exists(bold):
         try:
             pdfmetrics.registerFont(TTFont("DejaVu-Bold", bold))
         except Exception as e:
-            print(f"Ошибка регистрации DejaVu-Bold: {e}")
-    global _REGISTERED_FONT_NAMES
-    _REGISTERED_FONT_NAMES = set(pdfmetrics.getRegisteredFontNames())
+            logger.warning("Ошибка регистрации DejaVu-Bold: %s", e)
     return ok
 
 
 register_fonts()
 
 
+def _font_family_from_filename(filename: str) -> str:
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    stem = re.sub(r"^\d{8}_\d{6}_", "", stem)
+    family = re.sub(r"[_-]+", " ", stem).strip()
+    return family or "Custom font"
+
+
+def _registered_custom_font_name(family: str) -> str:
+    return "CustomFont_" + re.sub(r"[^A-Za-z0-9_]+", "_", family).strip("_")
+
+
+def _find_custom_font_path(family: str) -> Optional[str]:
+    wanted = str(family or "").strip().lower()
+    if not wanted or wanted in {"dejavu", "dejavu sans", "helvetica"}:
+        return None
+    upload_dir = os.path.join("static", "fonts", "custom")
+    if not os.path.isdir(upload_dir):
+        return None
+    matches: list[str] = []
+    for filename in os.listdir(upload_dir):
+        if os.path.splitext(filename)[1].lower() not in {".ttf", ".otf"}:
+            continue
+        if _font_family_from_filename(filename).lower() == wanted:
+            matches.append(os.path.join(upload_dir, filename))
+    return sorted(matches)[-1] if matches else None
+
+
+def _register_custom_font(family: str) -> Optional[str]:
+    family = str(family or "").strip()
+    if not family:
+        return None
+    font_name = _registered_custom_font_name(family)
+    if font_name in pdfmetrics.getRegisteredFontNames():
+        return font_name
+    path = _find_custom_font_path(family)
+    if not path:
+        return None
+    try:
+        pdfmetrics.registerFont(TTFont(font_name, path))
+        return font_name
+    except Exception as e:
+        logger.warning("Ошибка регистрации пользовательского шрифта '%s': %s", family, e)
+        return None
+
+
 def _canvas_font_name() -> str:
-    if "DejaVu" in _REGISTERED_FONT_NAMES:
+    if "DejaVu" in pdfmetrics.getRegisteredFontNames():
         return "DejaVu"
     return "Helvetica"
 
 
-def _signer_font_name(weight_str: Optional[str]) -> str:
+def _get_font_for_weight(weight_str: Optional[str]) -> str:
     try:
         w = int(float(weight_str or 400))
     except (TypeError, ValueError):
         w = 400
-    if w >= 600 and "DejaVu-Bold" in _REGISTERED_FONT_NAMES:
+    if w >= 600 and "DejaVu-Bold" in pdfmetrics.getRegisteredFontNames():
         return "DejaVu-Bold"
     return _canvas_font_name()
+
+
+def _get_font_for_family_and_weight(family: Optional[str], weight_str: Optional[str]) -> str:
+    family_clean = str(family or "").strip()
+    custom_font = _register_custom_font(family_clean)
+    if custom_font:
+        return custom_font
+    return _get_font_for_weight(weight_str)
 
 
 def _parse_fill_color(hex_str: Optional[str]) -> Any:
@@ -248,11 +297,16 @@ def draw_text_elements(
         max_h_pt = float(max_h_mm) * MM_TO_PT
 
         base_size = float(el.font_size or 24)
+        
+        element_font = _get_font_for_family_and_weight(
+            getattr(el, "font_family", None),
+            getattr(el, "font_weight", "400"),
+        )
 
         try:
             size, lines = auto_fit_text(
                 text,
-                font_name,
+                element_font,
                 max_w_pt,
                 max_h_pt,
                 max_font_size=base_size,
@@ -262,7 +316,7 @@ def draw_text_elements(
             logger.error("auto_fit_text ошибка для элемента id=%s: %s", getattr(el, "id", "?"), e)
             size, lines = base_size, [text]
 
-        c.setFont(font_name, size)
+        c.setFont(element_font, size)
         # Поддержка цвета текста из элемента шаблона
         c.setFillColor(_parse_element_color(el))
         lh = size * 1.25
@@ -289,25 +343,7 @@ def _compute_signers_anchor_y_mm(
 ) -> float:
     """
     Вычисляет Y-координату (от верха листа, мм) первой строки подписантов.
-
-    Приоритет:
-    1. Если задан `signers_anchor_bottom_mm` — позиционируем от низа страницы.
-    2. Иначе — используем `signers_y_mm` (от верха).
-
-    Гарантирует, что весь блок подписантов помещается выше нижнего поля.
     """
-    anchor_bottom = getattr(template, "signers_anchor_bottom_mm", None)
-    if anchor_bottom is not None:
-        try:
-            ab = float(anchor_bottom)
-            if ab > 0:
-                # Нижний край последнего подписанта = PAGE_H_MM - mb - ab
-                # Верх первого = нижний край - (num_signers * row_h_mm)
-                bottom_edge_mm = PAGE_H_MM - mb - ab
-                return bottom_edge_mm - num_signers * row_h_mm
-        except (TypeError, ValueError):
-            pass
-
     return float(getattr(template, "signers_y_mm", 250.0) or 250.0)
 
 
@@ -350,10 +386,18 @@ def draw_signers_block(
     )
 
     base_sign_font = float(getattr(template, "signers_font_size", 10.0) or 10.0)
-    base_sign_font = max(5.0, min(36.0, base_sign_font))
+    base_sign_font = max(5.0, min(72.0, base_sign_font))
     weight_str = getattr(template, "signers_font_weight", "400")
-    signer_font = _signer_font_name(weight_str)
+    signer_font = _get_font_for_family_and_weight(
+        getattr(template, "signers_font_family", None),
+        weight_str,
+    )
     fill = _parse_fill_color(getattr(template, "signers_text_color", None))
+    # Раздельные цвета для должности и ФИО (fallback к общему цвету)
+    pos_color_raw = getattr(template, "signers_position_color", None)
+    name_color_raw = getattr(template, "signers_name_color", None)
+    fill_position = _parse_fill_color(pos_color_raw) if pos_color_raw else fill
+    fill_name = _parse_fill_color(name_color_raw) if name_color_raw else fill
 
     band_w_pt = band_mm * MM_TO_PT
     left_w = band_w_pt * _SIGN_LEFT_FRAC
@@ -380,50 +424,44 @@ def draw_signers_block(
         row_top_pt = page_h - y_top_mm * MM_TO_PT
         row_h_pt = row_h_mm * MM_TO_PT
 
-        small_font = max(5.0, min(36.0, base_sign_font, row_h_mm * 0.45))
-
         pos_text = (signer.position or "").strip()
         name_text = (signer.full_name or "").strip()
 
-        c.setFillColor(fill)
+        c.setFillColor(fill_position)
 
-        # ── Должность (левая колонка, выравнивание по правому краю) ──
+        # ── Должность (левая колонка, выравнивание по левому краю) ──
         if pos_text:
             pw_pt = left_w - 2 * pad
-            ph_pt = row_h_pt * 0.9
             try:
-                sz, lines = auto_fit_text(
-                    pos_text, signer_font, pw_pt, ph_pt,
-                    max_font_size=small_font, min_font_size=5.0,
-                )
+                lines = wrap_text_to_width(pos_text, signer_font, base_sign_font, pw_pt)
+                sz = base_sign_font
             except Exception as e:
                 logger.error("auto_fit_text (position) ошибка: %s", e)
-                sz, lines = small_font, [pos_text]
+                sz, lines = base_sign_font, [pos_text]
             c.setFont(signer_font, sz)
             lh = sz * 1.2
             y0 = row_top_pt - lh
-            x_right = x_left_edge + left_w - pad
-            for i, ln in enumerate(lines[:6]):
-                c.drawRightString(x_right, y0 - i * lh, ln)
-
-        # ── ФИО (правая колонка, выравнивание по левому краю) ──
-        if name_text:
-            rw_pt = right_w - 2 * pad
-            rh_pt = row_h_pt * 0.9
-            try:
-                sz, lines = auto_fit_text(
-                    name_text, signer_font, rw_pt, rh_pt,
-                    max_font_size=small_font, min_font_size=5.0,
-                )
-            except Exception as e:
-                logger.error("auto_fit_text (full_name) ошибка: %s", e)
-                sz, lines = small_font, [name_text]
-            c.setFont(signer_font, sz)
-            lh = sz * 1.2
-            y0 = row_top_pt - lh
-            x_start = x_left_edge + left_w + mid_w + pad
+            x_start = x_left_edge + pad
             for i, ln in enumerate(lines[:6]):
                 c.drawString(x_start, y0 - i * lh, ln)
+
+        c.setFillColor(fill_name)
+
+        # ── ФИО (правая колонка, выравнивание по правому краю) ──
+        if name_text:
+            rw_pt = right_w - 2 * pad
+            try:
+                lines = wrap_text_to_width(name_text, signer_font, base_sign_font, rw_pt)
+                sz = base_sign_font
+            except Exception as e:
+                logger.error("auto_fit_text (full_name) ошибка: %s", e)
+                sz, lines = base_sign_font, [name_text]
+            c.setFont(signer_font, sz)
+            lh = sz * 1.2
+            y0 = row_top_pt - lh
+            x_right = x_left_edge + left_w + mid_w + right_w - pad
+            for i, ln in enumerate(lines[:6]):
+                c.drawRightString(x_right, y0 - i * lh, ln)
 
         # ── Факсимиле (центральная колонка, прозрачный фон) ──
         fac_path = _resolve_static_path(getattr(signer, "facsimile_url", None))

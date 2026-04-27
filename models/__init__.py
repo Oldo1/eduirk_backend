@@ -1,8 +1,17 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Float
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.sql import func
-from database import Base
 
-# ====================== СУЩЕСТВУЮЩИЕ ТАБЛИЦЫ ======================
+from database import Base
+from models.tpmpk import (
+    TPMPKAppointment,
+    TPMPKAuditLog,
+    TPMPKScheduleTemplate,
+    TPMPKSlotLock,
+    TPMPKUser,
+    TPMPKWorkingDay,
+)
+
+
 class UserRole(Base):
     __tablename__ = "user_role"
     id = Column(Integer, primary_key=True, index=True)
@@ -21,23 +30,21 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
-# ====================== ТАБЛИЦЫ ДЛЯ ГРАМОТ ======================
 class CertificateTemplate(Base):
     __tablename__ = "certificate_templates"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(200), nullable=False)
     background_url = Column(String(500), nullable=True)
-    # Вертикальная позиция первой строки подписантов от верхнего края листа (мм)
     signers_y_mm = Column(Float, default=248.0)
-    # Центр блока подписей по горизонтали (мм от левого края), ширина полосы и шаг строк
     signers_block_x_mm = Column(Float, default=105.0)
     signers_row_height_mm = Column(Float, default=32.0)
     signers_band_width_mm = Column(Float, default=168.0)
-    # Текст подписантов (должность / ФИО): базовый кегль, цвет #RRGGBB, вес 400–800
     signers_font_size = Column(Float, default=10.0)
     signers_text_color = Column(String(16), default="#1e293b")
+    signers_position_color = Column(String(16), nullable=True)
+    signers_name_color = Column(String(16), nullable=True)
     signers_font_weight = Column(String(8), default="400")
-    # Поля грамоты (мм): внутри этой области якорятся блоки и подрезается текст
+    signers_font_family = Column(String(120), default="DejaVu")
     margin_left_mm = Column(Float, default=12.0)
     margin_right_mm = Column(Float, default=12.0)
     margin_top_mm = Column(Float, default=12.0)
@@ -56,7 +63,9 @@ class TemplateTextElement(Base):
     y_mm = Column(Float, nullable=False)
     font_size = Column(Integer, default=24)
     align = Column(String(10), default="center")
-    # Ограничение области для auto-fit текста (мм); None — оценка по позиции на листе
+    color = Column(String(16), default="#0F172A")
+    font_weight = Column(String(8), default="400")
+    font_family = Column(String(120), default="DejaVu")
     max_width_mm = Column(Float, nullable=True)
     max_height_mm = Column(Float, nullable=True)
 
@@ -72,18 +81,6 @@ class GeneratedCertificate(Base):
     generated_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
-# ====================== ЗАПИСЬ НА ПРИЁМ ======================
-class Appointment(Base):
-    __tablename__ = "appointments"
-
-    id = Column(Integer, primary_key=True, index=True)
-    full_name = Column(String(200), nullable=False)
-    appointment_date = Column(String(10), nullable=False)   # формат: YYYY-MM-DD
-    appointment_time = Column(String(5), nullable=False)    # формат: HH:MM
-    comment = Column(String(500), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
 class TemplateSigner(Base):
     __tablename__ = "template_signers"
     id = Column(Integer, primary_key=True, index=True)
@@ -92,10 +89,36 @@ class TemplateSigner(Base):
     position = Column(String(100), nullable=False)
     full_name = Column(String(200), nullable=False)
     facsimile_url = Column(String(500), nullable=True)
-    # Дополнительный сдвиг строки подписанта вниз (мм)
     offset_y_mm = Column(Float, default=0.0)
-    # Сдвиг факсимиле относительно центра ячейки: вправо / вниз по листу (мм); масштаб к базовому вписанию
     facsimile_offset_x_mm = Column(Float, default=0.0)
     facsimile_offset_y_mm = Column(Float, default=0.0)
     facsimile_scale = Column(Float, default=1.0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Appointment(Base):
+    __tablename__ = "appointments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String(200), nullable=False)
+    appointment_date = Column(String(10), nullable=False)
+    appointment_time = Column(String(5), nullable=False)
+    comment = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+__all__ = [
+    "Appointment",
+    "CertificateTemplate",
+    "GeneratedCertificate",
+    "TemplateSigner",
+    "TemplateTextElement",
+    "TPMPKAppointment",
+    "TPMPKAuditLog",
+    "TPMPKScheduleTemplate",
+    "TPMPKSlotLock",
+    "TPMPKUser",
+    "TPMPKWorkingDay",
+    "User",
+    "UserRole",
+]
