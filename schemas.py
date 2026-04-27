@@ -6,13 +6,16 @@ from typing import Optional, List, Dict
 # ====================== Аутентификация ======================
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str
+    username: str = Field(..., min_length=2, max_length=100)
+    password: str = Field(..., min_length=1)
 
 
 class UserResponse(BaseModel):
     id: int
     email: str
+    username: Optional[str] = None
     is_active: bool
+    role: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -20,6 +23,8 @@ class UserResponse(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    role: Optional[str] = None
+    user: Optional["UserResponse"] = None
 
 
 class TokenData(BaseModel):
@@ -249,3 +254,22 @@ class ManualCertificateRequest(BaseModel):
             if len(str(v)) > 800:
                 raise ValueError(f"Значение переменной «{k}» слишком длинное (макс. 800 символов)")
         return self
+
+
+# ====================== ЗАПИСЬ НА ПРИЁМ ======================
+class AppointmentCreate(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=200, description="ФИО пациента")
+    appointment_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="Дата приёма YYYY-MM-DD")
+    appointment_time: str = Field(..., pattern=r"^\d{2}:\d{2}$", description="Время приёма HH:MM")
+    comment: Optional[str] = Field(None, max_length=500)
+
+
+class AppointmentResponse(BaseModel):
+    id: int
+    full_name: str
+    appointment_date: str
+    appointment_time: str
+    comment: Optional[str]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

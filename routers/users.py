@@ -38,10 +38,16 @@ def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
             detail="Пользователь с таким email уже существует"
         )
 
+    if db.query(User).filter_by(username=user_data.username).first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Логин уже занят"
+        )
+
     new_user = User(
         email=user_data.email,
         password_hash=hash_password(user_data.password),
-        username=user_data.email.split('@')[0],
+        username=user_data.username,
         is_active=True,
     )
     db.add(new_user)
@@ -62,9 +68,15 @@ def update_user(
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
+    if user_data.username != user.username and db.query(User).filter_by(username=user_data.username).first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Логин уже занят"
+        )
+
     user.email = user_data.email
+    user.username = user_data.username
     user.password_hash = hash_password(user_data.password)
-    user.username = user_data.email.split('@')[0]
 
     db.commit()
     db.refresh(user)

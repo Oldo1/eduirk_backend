@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 import logging
 
 from database import engine, Base, get_db
-from models import User
+from models import User, UserRole
 from auth import (
     hash_password, verify_password, create_access_token,
     get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -24,6 +24,7 @@ from routers.assistant import (
 )
 from routers.certificates import router as certificates_router
 from routers.users import router as users_router
+from routers.appointments import router as appointments_router
 from utils.schema_patch import ensure_certificate_layout_columns
 
 from updater import RAGScheduler, UPDATE_INTERVAL_HOURS
@@ -88,25 +89,39 @@ ensure_certificate_layout_columns(engine)
 app.include_router(assistant_router)
 app.include_router(certificates_router)
 app.include_router(users_router)
+app.include_router(appointments_router)
 
 
 # ── Состояние фоновых задач ───────────────────────────────────────────────────
 
 _bg_task_status: dict = {
     "running":    False,
-    "mode":       None,       # "incremental" | "reindex"
+    "mode":       None,       # "incremental" | "incremental_site" | "incremental_docs" | "reindex"
     "started_at": None,
+    "progress":   None,       # {"stage", "current", "total", "detail"}
     "result":     None,
     "error":      None,
 }
 
 
-def _run_incremental_bg():
+def _make_progress_cb():
+    """Возвращает callback, пишущий прогресс в _bg_task_status['progress']."""
+    def cb(stage: str, current: int, total: int, detail: str = ""):
+        _bg_task_status["progress"] = {
+            "stage":   stage,
+            "current": current,
+            "total":   total,
+            "detail":  detail,
+        }
+    return cb
+
+
+def _run_incremental_bg(sources: list[str] | None = None):
     """Фоновая функция инкрементального обновления."""
     from updater import incremental_update
     from update_state import UpdateState
 
-    _bg_task_status.update({"running": True, "result": None, "error": None})
+    _bg_task_status.update({"running": True, "result": None, "error": None, "progress": None})
     try:
         state = UpdateState()
         stats = incremental_update(
@@ -114,6 +129,8 @@ def _run_incremental_bg():
             embeddings=EMBEDDINGS,
             state=state,
             on_update_done=reload_all_sessions,
+            sources=sources,
+            progress_cb=_make_progress_cb(),
         )
         _bg_task_status["result"] = {"mode": "incremental", "stats": stats}
         logger.info("[update] Фоновое обновление завершено")
@@ -121,7 +138,8 @@ def _run_incremental_bg():
         _bg_task_status["error"] = str(e)
         logger.error(f"[update] Фоновое обновление упало: {e}", exc_info=True)
     finally:
-        _bg_task_status["running"] = False
+        _bg_task_status["running"]  = False
+        _bg_task_status["progress"] = None
 
 
 def _run_reindex_bg():
@@ -131,9 +149,11 @@ def _run_reindex_bg():
     import routers.assistant as _assistant_module
     from routers.assistant import cfg as _cfg, EMBEDDINGS as _EMBEDDINGS, reload_all_sessions as _reload
 
-    _bg_task_status.update({"running": True, "result": None, "error": None})
+    _bg_task_status.update({"running": True, "result": None, "error": None, "progress": None})
+    progress_cb = _make_progress_cb()
     try:
         logger.info(f"[reindex] ══ Начинаю полную переиндексацию (коллекция: {_cfg.collection_name}) ══")
+        progress_cb("reindex_clear", 0, 0, "Очищаю коллекцию…")
 
         # Получаем существующий vectorstore
         vs = _assistant_module.get_vectorstore()
@@ -166,6 +186,7 @@ def _run_reindex_bg():
             embeddings=_EMBEDDINGS,
             state=state,
             on_update_done=_reload,
+            progress_cb=progress_cb,
         )
 
         total = vs._collection.count()
@@ -177,7 +198,8 @@ def _run_reindex_bg():
         _bg_task_status["error"] = str(e)
         logger.error(f"[reindex] Ошибка: {e}", exc_info=True)
     finally:
-        _bg_task_status["running"] = False
+        _bg_task_status["running"]  = False
+        _bg_task_status["progress"] = None
 
 
 # ── Служебные эндпоинты обновления ───────────────────────────────────────────
@@ -192,13 +214,11 @@ def update_status():
     }
 
 
-@app.post("/admin/update/run")
-def update_run_now(background_tasks: BackgroundTasks):
-    """
-    Инкрементальное обновление в фоне — добавляет только новые/изменённые данные.
-    Возвращает ответ сразу, обновление идёт в фоне.
-    Статус: GET /admin/update/status
-    """
+def _start_incremental(
+    background_tasks: BackgroundTasks,
+    sources:          list[str],
+    mode_label:       str,
+):
     if _bg_task_status["running"]:
         raise HTTPException(
             status_code=409,
@@ -206,17 +226,36 @@ def update_run_now(background_tasks: BackgroundTasks):
         )
 
     _bg_task_status.update({
-        "mode":       "incremental",
+        "mode":       mode_label,
         "started_at": datetime.now().isoformat(),
         "result":     None,
         "error":      None,
     })
-    background_tasks.add_task(_run_incremental_bg)
+    background_tasks.add_task(_run_incremental_bg, sources)
     return {
         "status":  "started",
-        "mode":    "incremental",
+        "mode":    mode_label,
+        "sources": sources,
         "message": "Обновление запущено в фоне. Статус: GET /admin/update/status",
     }
+
+
+@app.post("/admin/update/run")
+def update_run_now(background_tasks: BackgroundTasks):
+    """Инкрементальное обновление обоих источников (сайт + S3)."""
+    return _start_incremental(background_tasks, ["site", "s3"], "incremental")
+
+
+@app.post("/admin/update/site")
+def update_site_only(background_tasks: BackgroundTasks):
+    """Инкрементальное обновление только страниц сайта."""
+    return _start_incremental(background_tasks, ["site"], "incremental_site")
+
+
+@app.post("/admin/update/docs")
+def update_docs_only(background_tasks: BackgroundTasks):
+    """Инкрементальное обновление только документов из Yandex S3."""
+    return _start_incremental(background_tasks, ["s3"], "incremental_docs")
 
 
 @app.post("/admin/reindex")
@@ -250,19 +289,38 @@ def full_reindex(background_tasks: BackgroundTasks):
 
 # ── Аутентификация ────────────────────────────────────────────────────────────
 
+def _user_role_name(db: Session, user: User) -> str | None:
+    if user.role_id is None:
+        return None
+    role = db.query(UserRole).filter(UserRole.id == user.role_id).first()
+    return role.role_name if role else None
+
+
+def _user_response(db: Session, user: User) -> UserResponse:
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        username=user.username,
+        is_active=user.is_active,
+        role=_user_role_name(db, user),
+    )
+
+
 @app.post("/auth/register", response_model=UserResponse, status_code=201)
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.email == user_data.email).first()
-    if existing:
+    if db.query(User).filter(User.email == user_data.email).first():
         raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
+    if db.query(User).filter(User.username == user_data.username).first():
+        raise HTTPException(status_code=400, detail="Логин уже занят")
     user = User(
         email=user_data.email,
+        username=user_data.username,
         password_hash=hash_password(user_data.password),
     )
     db.add(user)
     db.commit()
     db.refresh(user)
-    return user
+    return _user_response(db, user)
 
 
 @app.post("/auth/login", response_model=Token)
@@ -270,27 +328,42 @@ def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.email == form_data.username).first()
+    identifier = form_data.username
+    user = (
+        db.query(User)
+        .filter((User.email == identifier) | (User.username == identifier))
+        .first()
+    )
     if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
             status_code=401,
-            detail="Неверный email или пароль",
+            detail="Неверный логин или пароль",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    role_name = _user_role_name(db, user)
     access_token = create_access_token(
-        data={"sub": user.email},
+        data={"sub": user.email, "role": role_name},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    return Token(access_token=access_token)
+    return Token(
+        access_token=access_token,
+        role=role_name,
+        user=_user_response(db, user),
+    )
 
 
 @app.get("/auth/me", response_model=UserResponse)
-def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+def get_me(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return _user_response(db, current_user)
 
 
 logger.info("Сервер запущен успешно")
 logger.info(f"  • Автообновление RAG:         каждые {UPDATE_INTERVAL_HOURS} ч.")
-logger.info("  • Инкрементальное обновление: POST /admin/update/run")
+logger.info("  • Инкрементальное обновление: POST /admin/update/run   (сайт + S3)")
+logger.info("  • Только сайт:                POST /admin/update/site")
+logger.info("  • Только документы:           POST /admin/update/docs")
 logger.info("  • Полная переиндексация:      POST /admin/reindex")
 logger.info("  • Статус:                     GET  /admin/update/status")

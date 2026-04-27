@@ -15,7 +15,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
-    username = Column(String(100), nullable=True)
+    username = Column(String(100), unique=True, index=True, nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -70,6 +70,18 @@ class GeneratedCertificate(Base):
     file_url = Column(String(500), nullable=False)
     generated_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     generated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ====================== ЗАПИСЬ НА ПРИЁМ ======================
+class Appointment(Base):
+    __tablename__ = "appointments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String(200), nullable=False)
+    appointment_date = Column(String(10), nullable=False)   # формат: YYYY-MM-DD
+    appointment_time = Column(String(5), nullable=False)    # формат: HH:MM
+    comment = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class TemplateSigner(Base):

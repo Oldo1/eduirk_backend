@@ -1,0 +1,67 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# IDE / OS
+.idea
+.vscode
+.claude
+.DS_Store
+Thumbs.db
+
+# Виртуальные окружения и кэши Python
+.venv
+.venv-cuda
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Локальные данные — будут смонтированы как volumes,
+# в образ их класть бессмысленно
+chroma_gigachat
+ocr_cache
+s3_extracted
+static/certificates/backgrounds
+static/certificates/facsimiles
+static/certificates/generated
+update_state.json
+update_state.json.bak
+
+# Tesseract data — Surya его не использует
+tessdata
+
+# Большие локальные файлы / бинарники
+*.pdf
+*.docx
+*.doc
+*.zip
+*.tar.gz
+
+# Dev-скрипты, не нужны в продакшен-образе
+a.py
+s3_to_txt.py
+test_*.py
+tests
+scripts
+
+# Docker-артефакты не копируем в образ
+Dockerfile
+docker-compose.yml
+docker-compose.*.yml
+.dockerignore
+
+# Секреты — в compose передаём через env_file/секреты, не через COPY
+.env
+.env.*
+!.env.example
+
+# Логи
+*.log
+logs

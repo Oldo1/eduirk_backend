@@ -107,6 +107,7 @@ def _update_from_site(
     state:         UpdateState,
     new_chunks:    list[Document],
     ids_to_delete: list[str],
+    progress_cb:   Optional[Callable] = None,
 ) -> dict:
     """
     Краулит сайт и наполняет new_chunks / ids_to_delete.
@@ -114,7 +115,9 @@ def _update_from_site(
     """
     stats = {"added": 0, "updated": 0, "removed": 0, "unchanged": 0}
 
+    if progress_cb: progress_cb("site_crawl", 0, 0, "Краулинг сайта…")
     crawled = crawl_site()
+    if progress_cb: progress_cb("site_crawl", len(crawled), len(crawled), f"Получено страниц: {len(crawled)}")
 
     new_pages:     list[tuple] = []
     changed_pages: list[tuple] = []
@@ -222,6 +225,7 @@ def _update_from_s3(
     state:         UpdateState,
     new_chunks:    list[Document],
     ids_to_delete: list[str],
+    progress_cb:   Optional[Callable] = None,
 ) -> dict:
     """
     Проверяет S3 на новые/изменённые файлы по ETag.
@@ -230,9 +234,12 @@ def _update_from_s3(
     """
     stats = {"added": 0, "skipped": 0, "failed": 0}
 
+    if progress_cb: progress_cb("s3_list", 0, 0, "Запрашиваю список S3…")
     s3_current = list_s3_documents()   # key → etag (без скачивания)
+    total = len(s3_current)
+    if progress_cb: progress_cb("s3_list", total, total, f"Всего файлов в бакете: {total}")
 
-    for key, etag in s3_current.items():
+    for idx, (key, etag) in enumerate(s3_current.items(), start=1):
         filename = Path(key).name
         old_etag = state.get_s3_etag(key)
 
@@ -240,7 +247,10 @@ def _update_from_s3(
         if old_etag == etag:
             logger.debug(f"[s3] Без изменений: {filename}")
             stats["skipped"] += 1
+            if progress_cb: progress_cb("s3", idx, total, f"Без изменений: {filename}")
             continue
+
+        if progress_cb: progress_cb("s3", idx, total, f"Обработка: {filename}")
 
         action = "Новый" if old_etag is None else "Изменился"
         logger.info(f"[s3] {action}: {filename} (etag: {etag[:8]}…)")
@@ -267,20 +277,49 @@ def _update_from_s3(
                 logger.info(f"[s3] Помечено к удалению {len(old_ids)} старых чанков: {filename}")
 
         # Создаём новые чанки
-        doc_url = public_url(key)
-        chunks  = _make_chunks(
+        doc_url  = public_url(key)
+        doc_type = Path(key).suffix.lower().lstrip(".")
+        chunks   = _make_chunks(
             source=doc_url,
             title=filename,
             text=text,
             extra_meta={
-                "s3_key":  key,
-                "doc_type": Path(key).suffix.lower().lstrip("."),
+                "s3_key":   key,
+                "doc_type": doc_type,
             },
         )
         new_chunks.extend(chunks)
+
+        # Doc-header чанк: короткое резюме документа для ретривера.
+        # Кладём имя файла и «как есть» (с подчёркиваниями — так пользователь
+        # часто его ищет), и в нормализованном виде — чтобы матчился и
+        # естественно-языковой запрос типа «мероприятие ДДТ №5 27 января 2026».
+        stem          = Path(filename).stem
+        readable_name = stem.replace("_", " ").strip()
+        header_lines  = [
+            f"Документ «{readable_name}»",
+            f"Имя файла: {filename}",
+            f"Ключ: {stem}",
+            f"Тип документа: {doc_type.upper()}",
+            f"Прямая ссылка: {doc_url}",
+            "",
+            f"Содержание (начало): {text.strip()[:1400]}",
+        ]
+        header_doc = Document(
+            page_content="\n".join(header_lines),
+            metadata={
+                "source":    doc_url,
+                "title":     filename,
+                "s3_key":    key,
+                "doc_type":  doc_type,
+                "is_header": True,
+            },
+        )
+        new_chunks.append(header_doc)
+
         state.set_s3_etag(key, etag)
         stats["added"] += 1
-        logger.info(f"[s3] Проиндексировано: {filename} ({len(chunks)} чанков)")
+        logger.info(f"[s3] Проиндексировано: {filename} ({len(chunks)} чанков + header)")
 
     logger.info(
         f"[s3] Итого: +{stats['added']} новых, "
@@ -299,11 +338,17 @@ def incremental_update(
     embeddings,
     state:          UpdateState,
     on_update_done: Optional[Callable] = None,
+    sources:        Optional[list[str]] = None,
+    progress_cb:    Optional[Callable] = None,
 ) -> dict:
     """
     Инкрементально обновляет Chroma-индекс из двух источников:
       1. Сайт mc.eduirk.ru
       2. Yandex Cloud S3
+
+    Args:
+        sources: список источников для обновления. Допустимые значения:
+                 ["site", "s3"]. По умолчанию — оба.
 
     Все удаления и добавления применяются одним батчем в конце,
     что снижает количество обращений к Chroma.
@@ -311,8 +356,9 @@ def incremental_update(
     Returns:
         Словарь со статистикой по каждому источнику.
     """
+    sources = sources or ["site", "s3"]
     logger.info("═" * 50)
-    logger.info("[update] Начинаю инкрементальное обновление")
+    logger.info(f"[update] Начинаю инкрементальное обновление (sources={sources})")
 
     all_new_chunks:    list[Document] = []
     all_ids_to_delete: list[str]      = []
@@ -325,24 +371,32 @@ def incremental_update(
     }
 
     # ── Источник 1: Сайт ──────────────────────────────────────────────────────
-    logger.info("[update] ── Источник 1: Сайт ──")
-    try:
-        stats["site"] = _update_from_site(
-            vectorstore, state, all_new_chunks, all_ids_to_delete
-        )
-    except Exception as e:
-        logger.error(f"[update] Ошибка обновления сайта: {e}", exc_info=True)
-        stats["site"] = {"error": str(e)}
+    if "site" in sources:
+        logger.info("[update] ── Источник 1: Сайт ──")
+        try:
+            stats["site"] = _update_from_site(
+                vectorstore, state, all_new_chunks, all_ids_to_delete,
+                progress_cb=progress_cb,
+            )
+        except Exception as e:
+            logger.error(f"[update] Ошибка обновления сайта: {e}", exc_info=True)
+            stats["site"] = {"error": str(e)}
+    else:
+        stats["site"] = {"skipped": True}
 
     # ── Источник 2: Yandex Cloud S3 ───────────────────────────────────────────
-    logger.info("[update] ── Источник 2: Yandex Cloud S3 ──")
-    try:
-        stats["s3"] = _update_from_s3(
-            vectorstore, state, all_new_chunks, all_ids_to_delete
-        )
-    except Exception as e:
-        logger.error(f"[update] Ошибка обновления S3: {e}", exc_info=True)
-        stats["s3"] = {"error": str(e)}
+    if "s3" in sources:
+        logger.info("[update] ── Источник 2: Yandex Cloud S3 ──")
+        try:
+            stats["s3"] = _update_from_s3(
+                vectorstore, state, all_new_chunks, all_ids_to_delete,
+                progress_cb=progress_cb,
+            )
+        except Exception as e:
+            logger.error(f"[update] Ошибка обновления S3: {e}", exc_info=True)
+            stats["s3"] = {"error": str(e)}
+    else:
+        stats["s3"] = {"skipped": True}
 
     # ── Применяем изменения к Chroma ──────────────────────────────────────────
     if not all_ids_to_delete and not all_new_chunks:
@@ -352,6 +406,8 @@ def incremental_update(
         if all_ids_to_delete:
             # Убираем дубли ID (один чанк может быть в нескольких списках)
             unique_ids = list(set(all_ids_to_delete))
+            if progress_cb:
+                progress_cb("chroma_delete", 0, len(unique_ids), f"Удаляю {len(unique_ids)} чанков…")
             vectorstore.delete(ids=unique_ids)
             stats["total_chunks_deleted"] = len(unique_ids)
             logger.info(f"[update] Удалено чанков: {len(unique_ids)}")
@@ -360,20 +416,26 @@ def incremental_update(
             # Батчим: Chroma падает на больших вставках (лимит ~5000 на батч,
             # плюс embeddings считаются синхронно — лучше мелкими порциями)
             BATCH = 500
-            total_added = 0
+            total_chunks = len(all_new_chunks)
+            total_added  = 0
             logger.info(
-                f"[update] Начинаю добавление {len(all_new_chunks)} чанков "
+                f"[update] Начинаю добавление {total_chunks} чанков "
                 f"батчами по {BATCH}..."
             )
-            for i in range(0, len(all_new_chunks), BATCH):
+            if progress_cb:
+                progress_cb("chroma_add", 0, total_chunks, f"Добавляю {total_chunks} чанков в индекс…")
+            for i in range(0, total_chunks, BATCH):
                 batch = all_new_chunks[i : i + BATCH]
                 try:
                     vectorstore.add_documents(batch)
                     total_added += len(batch)
                     logger.info(
                         f"[update]   батч {i // BATCH + 1}: "
-                        f"+{len(batch)} (всего добавлено {total_added}/{len(all_new_chunks)})"
+                        f"+{len(batch)} (всего добавлено {total_added}/{total_chunks})"
                     )
+                    if progress_cb:
+                        progress_cb("chroma_add", total_added, total_chunks,
+                                    f"Добавлено {total_added}/{total_chunks} чанков")
                 except Exception as e:
                     logger.error(
                         f"[update]   батч {i // BATCH + 1} упал: {e}",
