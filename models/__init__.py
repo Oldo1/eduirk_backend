@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.sql import func
 
 from database import Base
@@ -107,10 +107,60 @@ class Appointment(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class ArticleStatus(Base):
+    __tablename__ = "article_status"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(50), unique=True, nullable=False)
+
+
+class Category(Base):
+    __tablename__ = "category"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False)
+    slug = Column(String(200), nullable=False)
+
+
+class Tag(Base):
+    __tablename__ = "tag"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False)
+    slug = Column(String(200), nullable=False)
+
+
+class Article(Base):
+    __tablename__ = "article"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(500), nullable=False)
+    slug = Column(String(500), nullable=False)
+    content = Column(Text, nullable=True)
+    status_id = Column(Integer, ForeignKey("article_status.id"), nullable=True)
+    author_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ArticleCategory(Base):
+    __tablename__ = "article_category"
+    article_id = Column(Integer, ForeignKey("article.id"), primary_key=True)
+    category_id = Column(Integer, ForeignKey("category.id"), primary_key=True)
+
+
+class ArticleTag(Base):
+    __tablename__ = "article_tag"
+    article_id = Column(Integer, ForeignKey("article.id"), primary_key=True)
+    tag_id = Column(Integer, ForeignKey("tag.id"), primary_key=True)
+
+
 __all__ = [
     "Appointment",
+    "Article",
+    "ArticleCategory",
+    "ArticleStatus",
+    "ArticleTag",
+    "Category",
     "CertificateTemplate",
     "GeneratedCertificate",
+    "Tag",
     "TemplateSigner",
     "TemplateTextElement",
     "TPMPKAppointment",

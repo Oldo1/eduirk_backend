@@ -25,6 +25,7 @@ from routers.assistant import (
 from routers.certificates import router as certificates_router
 from routers.users import router as users_router
 from routers.appointments import router as appointments_router
+from routers.articles import router as articles_router
 from api import tpmpk_router
 from utils.schema_patch import ensure_certificate_layout_columns
 
@@ -91,6 +92,7 @@ app.include_router(assistant_router)
 app.include_router(certificates_router)
 app.include_router(users_router)
 app.include_router(appointments_router)
+app.include_router(articles_router)
 app.include_router(tpmpk_router)
 
 
