@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from datetime import datetime
 from typing import Optional, List, Dict
 
@@ -15,6 +15,22 @@ class UserResponse(BaseModel):
     id: int
     email: str
     is_active: bool
+    role: str = "user"
+    allowed_methodika_subjects: List[str] = Field(default_factory=list)
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _normalize_role(cls, value):
+        if value is None:
+            return "user"
+        if isinstance(value, str):
+            return value
+        return getattr(value, "role_name", "user")
+
+    @field_validator("allowed_methodika_subjects", mode="before")
+    @classmethod
+    def _normalize_allowed_subjects(cls, value):
+        return value or []
 
     model_config = {"from_attributes": True}
 
@@ -26,6 +42,125 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     email: str | None = None
+
+
+PUBLISHING_SCOPES = {"imcro_only", "dom_uchitelya_only", "both"}
+ARTICLE_STATUSES = {"draft", "published", "archive"}
+
+
+class ArticleBase(BaseModel):
+    title: str = Field(..., min_length=1, max_length=300)
+    slug: str = Field(..., min_length=1, max_length=160)
+    status: str = Field("draft", max_length=20)
+    excerpt: Optional[str] = Field(None, max_length=800)
+    image: Optional[str] = Field(None, max_length=500)
+    lead: Optional[str] = Field(None, max_length=800)
+    body: str = ""
+    cover_image_url: Optional[str] = Field(None, max_length=500)
+    is_pinned: bool = False
+    blocks: List[Dict] = Field(default_factory=list)
+    categories: List = Field(default_factory=list)
+    tags: List = Field(default_factory=list)
+    publishing_scope: str = "both"
+    methodika_subject: Optional[str] = Field(None, max_length=120)
+    dom_uchitelya_section: Optional[str] = Field(None, max_length=120)
+    noko_section: Optional[str] = Field(None, max_length=120)
+    published_at: Optional[datetime] = None
+
+    @field_validator("slug")
+    @classmethod
+    def _normalize_slug(cls, value: str) -> str:
+        slug = "-".join(str(value or "").strip().lower().split())
+        if not slug:
+            raise ValueError("slug is required")
+        return slug
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, value: str) -> str:
+        if value not in ARTICLE_STATUSES:
+            raise ValueError("status must be draft, published, or archive")
+        return value
+
+    @field_validator("publishing_scope")
+    @classmethod
+    def _validate_publishing_scope(cls, value: str) -> str:
+        if value not in PUBLISHING_SCOPES:
+            raise ValueError("publishing_scope must be imcro_only, dom_uchitelya_only, or both")
+        return value
+
+    @model_validator(mode="after")
+    def _sync_legacy_fields(self):
+        if self.lead is None and self.excerpt is not None:
+            self.lead = self.excerpt
+        if self.excerpt is None and self.lead is not None:
+            self.excerpt = self.lead
+        if self.cover_image_url is None and self.image is not None:
+            self.cover_image_url = self.image
+        if self.image is None and self.cover_image_url is not None:
+            self.image = self.cover_image_url
+        return self
+
+
+class ArticleCreate(ArticleBase):
+    pass
+
+
+class ArticleUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=300)
+    slug: Optional[str] = Field(None, min_length=1, max_length=160)
+    status: Optional[str] = Field(None, max_length=20)
+    excerpt: Optional[str] = Field(None, max_length=800)
+    image: Optional[str] = Field(None, max_length=500)
+    lead: Optional[str] = Field(None, max_length=800)
+    body: Optional[str] = None
+    cover_image_url: Optional[str] = Field(None, max_length=500)
+    is_pinned: Optional[bool] = None
+    blocks: Optional[List[Dict]] = None
+    categories: Optional[List] = None
+    tags: Optional[List] = None
+    publishing_scope: Optional[str] = None
+    methodika_subject: Optional[str] = Field(None, max_length=120)
+    dom_uchitelya_section: Optional[str] = Field(None, max_length=120)
+    noko_section: Optional[str] = Field(None, max_length=120)
+    published_at: Optional[datetime] = None
+
+    @field_validator("slug")
+    @classmethod
+    def _normalize_slug(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        slug = "-".join(str(value or "").strip().lower().split())
+        if not slug:
+            raise ValueError("slug is required")
+        return slug
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, value: str | None) -> str | None:
+        if value is not None and value not in ARTICLE_STATUSES:
+            raise ValueError("status must be draft, published, or archive")
+        return value
+
+    @field_validator("publishing_scope")
+    @classmethod
+    def _validate_publishing_scope(cls, value: str | None) -> str | None:
+        if value is not None and value not in PUBLISHING_SCOPES:
+            raise ValueError("publishing_scope must be imcro_only, dom_uchitelya_only, or both")
+        return value
+
+
+class ArticleResponse(ArticleBase):
+    id: int
+    author_id: Optional[int]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ArticleListResponse(BaseModel):
+    items: List[ArticleResponse]
 
 
 # ====================== ШАБЛОНЫ ======================

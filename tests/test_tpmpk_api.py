@@ -1,10 +1,12 @@
 from datetime import date, time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.tpmpk.router import router
+from api.tpmpk.router import _is_future_slot_irkutsk, router
 from api.tpmpk.schemas import (
     AppointmentCreate,
     AppointmentResponse,
@@ -22,6 +24,8 @@ def test_tpmpk_schemas_are_importable():
         start_time=time(9, 0),
         child_full_name="Test Child",
         child_age=7,
+        child_registered_irkutsk=True,
+        document_readiness="full",
         parent_phone="+71234567890",
         consent_pd=True,
         consent_special=True,
@@ -54,6 +58,8 @@ def test_zapis_requires_both_consents():
         "start_time": "09:00:00",
         "child_full_name": "Test Child",
         "child_age": 7,
+        "child_registered_irkutsk": True,
+        "document_readiness": "full",
         "parent_phone": "+71234567890",
         "consent_pd": True,
         "consent_special": False,
@@ -87,7 +93,7 @@ def test_admin_schemas_cover_step_8_payloads():
         close_time="17:00",
         lunch_start="13:00",
         lunch_end="14:00",
-        slot_minutes=30,
+        slot_minutes=45,
     )
     template_update = ScheduleTemplateBulkUpdate(
         items=[
@@ -98,7 +104,7 @@ def test_admin_schemas_cover_step_8_payloads():
                 "close_time": "17:00",
                 "lunch_start": "13:00",
                 "lunch_end": "14:00",
-                "slot_minutes": 30,
+                "slot_minutes": 45,
             }
         ]
     )
@@ -108,12 +114,42 @@ def test_admin_schemas_cover_step_8_payloads():
         start_time=time(10, 0),
         child_full_name="Phone Child",
         child_age=8,
+        child_registered_irkutsk=True,
+        document_readiness="full",
         parent_phone="+71234567890",
         is_repeat=True,
         needs_psychiatrist=False,
     )
 
-    assert day_update.slot_minutes == 30
+    assert day_update.slot_minutes == 45
     assert template_update.items[0].weekday == 0
     assert transfer.allow_partial is True
     assert manual.source == "phone"
+
+
+def test_slot_minutes_must_be_multiple_of_five():
+    with pytest.raises(ValueError, match="кратна 5"):
+        WorkingDayUpdate(slot_minutes=33)
+
+    with pytest.raises(ValueError, match="кратна 5"):
+        ScheduleTemplateBulkUpdate(
+            items=[
+                {
+                    "weekday": 0,
+                    "is_working_default": True,
+                    "open_time": "09:00",
+                    "close_time": "17:00",
+                    "lunch_start": "13:00",
+                    "lunch_end": "14:00",
+                    "slot_minutes": 33,
+                }
+            ]
+        )
+
+
+def test_public_slots_use_irkutsk_time_for_past_filtering():
+    now = datetime(2026, 4, 28, 18, 40, tzinfo=ZoneInfo("Asia/Irkutsk"))
+
+    assert _is_future_slot_irkutsk(date(2026, 4, 28), time(9, 30), now=now) is False
+    assert _is_future_slot_irkutsk(date(2026, 4, 28), time(19, 0), now=now) is True
+    assert _is_future_slot_irkutsk(date(2026, 4, 29), time(9, 0), now=now) is True

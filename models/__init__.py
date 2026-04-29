@@ -1,4 +1,5 @@
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, JSON, String
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from database import Base
@@ -27,7 +28,47 @@ class User(Base):
     username = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
+    allowed_methodika_subjects = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    role = relationship("UserRole")
+
+
+class Article(Base):
+    __tablename__ = "article"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'published', 'archive')",
+            name="article_status_chk",
+        ),
+        CheckConstraint(
+            "publishing_scope IN ('imcro_only', 'dom_uchitelya_only', 'both')",
+            name="article_publishing_scope_chk",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(300), nullable=False)
+    slug = Column(String(160), unique=True, nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="draft", index=True)
+    excerpt = Column(String(800), nullable=True)
+    image = Column(String(500), nullable=True)
+    lead = Column(String(800), nullable=True)
+    body = Column(String, nullable=False, default="")
+    cover_image_url = Column(String(500), nullable=True)
+    is_pinned = Column(Boolean, nullable=False, default=False, index=True)
+    blocks = Column(JSON, nullable=False, default=list)
+    categories = Column(JSON, nullable=False, default=list)
+    tags = Column(JSON, nullable=False, default=list)
+    publishing_scope = Column(String(20), nullable=False, default="both", index=True)
+    methodika_subject = Column(String(120), nullable=True, index=True)
+    dom_uchitelya_section = Column(String(120), nullable=True, index=True)
+    noko_section = Column(String(120), nullable=True, index=True)
+    author_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+
+    author = relationship("User", foreign_keys=[author_id])
 
 
 class CertificateTemplate(Base):
@@ -97,6 +138,7 @@ class TemplateSigner(Base):
 
 
 __all__ = [
+    "Article",
     "CertificateTemplate",
     "GeneratedCertificate",
     "TemplateSigner",

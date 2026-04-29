@@ -24,9 +24,14 @@ from auth import (
 from schemas import UserCreate, UserResponse, Token
 from models import User
 from api import tpmpk_router
+from dom_uchitelya import router as dom_uchitelya_router
 from routers.certificates import router as certificates_router
 from routers.users import router as users_router
-from utils.schema_patch import ensure_certificate_layout_columns
+from utils.schema_patch import (
+    ensure_certificate_layout_columns,
+    ensure_tpmpk_bot_question_columns,
+    ensure_tpmpk_slot_minutes_range,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +64,9 @@ SITE_SEARCH_INDEX = [
     {"title": "Для педагогов", "url": "/tpmpk/dlya-pedagogov/", "description": "Материалы для образовательных организаций."},
     {"title": "Контакты ТПМПК", "url": "/tpmpk/kontakty/", "description": "Телефон, адрес и порядок обращения."},
     {"title": "Сведения об образовательной организации", "url": "/", "description": "Основная информация об учреждении."},
-    {"title": "Дом учителя", "url": "/", "description": "Городские образовательные мероприятия и методическая поддержка."},
+    {"title": "Дом учителя", "url": "/dom-uchitelya/", "description": "Городские образовательные мероприятия и методическая поддержка."},
+    {"title": "Новости Дома учителя", "url": "/dom-uchitelya/novosti/", "description": "Собственная лента новостей Дома учителя."},
+    {"title": "Программа Дома учителя", "url": "/dom-uchitelya/programma/", "description": "Программа мероприятий Дома учителя."},
     {"title": "Методическое пространство", "url": "/", "description": "Материалы, проекты и события для педагогов."},
 ]
 
@@ -274,11 +281,14 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 Base.metadata.create_all(bind=engine)
 ensure_certificate_layout_columns(engine)
+ensure_tpmpk_bot_question_columns(engine)
+ensure_tpmpk_slot_minutes_range(engine)
 
 app.include_router(assistant_router)
 app.include_router(certificates_router)
 app.include_router(users_router)
 app.include_router(tpmpk_router)
+app.include_router(dom_uchitelya_router)
 
 
 @app.get("/api/search/")
