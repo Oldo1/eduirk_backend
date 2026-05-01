@@ -1,0 +1,57 @@
+# Виртуальные окружения (могут весить десятки ГБ — особенно с CUDA)
+venv
+.venv
+.venv-*
+env
+
+# Python кэши и компилированный код
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Секреты и локальная конфигурация
+.env
+.env.local
+
+# IDE и редакторы
+.vscode
+.idea
+.claude
+*.swp
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Кэши приложения (всё bind-mount'ится из docker-compose, в образе не нужно)
+chroma_gigachat
+ocr_cache
+s3_extracted
+update_state.json
+hf_cache
+
+# Сгенерированные файлы и user-uploads (bind-mount'ятся)
+static/certificates/generated
+static/certificates/backgrounds
+static/certificates/facsimiles
+
+# Локальные БД, бэкапы, логи
+dev.db
+*.sqlite
+*.sqlite3
+backups
+*.dump
+*.log
+uvicorn.*.log
+
+# Прочий мусор
+.DS_Store
+Thumbs.db
+node_modules
+*.tar.gz
+*.zip

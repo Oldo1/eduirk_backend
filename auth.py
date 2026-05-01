@@ -1,14 +1,17 @@
+import os
 from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 import bcrypt
+from dotenv import load_dotenv
 from database import get_db
 from models import User
 from schemas import TokenData
 
-SECRET_KEY = "your-secret-key-change-in-production"  # os.getenv("SECRET_KEY")
+load_dotenv()
+SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 

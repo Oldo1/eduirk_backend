@@ -28,8 +28,10 @@ rag_pipeline.py — ядро RAG-системы с reranker'ом и память
 from __future__ import annotations
 
 import os
+import re
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from langchain_chroma import Chroma
@@ -72,11 +74,11 @@ class RAGConfig:
     top_k: int   = 5    # финальных чанков после rerank
 
     # ── Reranker ──────────────────────────────────────────────────────────────
-    reranker_model:     str   = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
+    # DiTy — кросс-энкодер, обученный на русском MS MARCO.
+    # Предыдущий cross-encoder/msmarco-MiniLM-L6-en-de-v1 — только EN/DE,
+    # на русских запросах давал почти случайные оценки.
+    reranker_model:     str   = "DiTy/cross-encoder-russian-msmarco"
     reranker_threshold: float = 0.0   # чанки со скором ниже этого значения отбрасываются
-    # Альтернативы:
-    #   "cross-encoder/ms-marco-MiniLM-L-6-v2"  — только английский, быстрее
-    #   "DiTy/cross-encoder-russian-msmarco"      — лучший для русского, ~500 МБ
 
     # ── Память ────────────────────────────────────────────────────────────────
     memory_turns: int = 5   # сколько последних обменов помнить
@@ -126,6 +128,31 @@ class ConversationMemory:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CrossEncoderReranker:
+    """
+    CrossEncoder-ранжировщик с 4 улучшениями поверх базового rerank:
+
+    1. Title/breadcrumb добавляется в payload для CrossEncoder — модель видит
+       имя документа, а не только голый контент чанка. Резко помогает
+       вопросам, явно упоминающим имя файла.
+    2. Header-чанки (is_header=True) получают boost, когда в запросе
+       встречается имя документа (stem s3_key или title). Так короткие
+       «документ-визитки» стабильно попадают в top при вопросах «расскажи
+       про X / какой email в X / какая дата X».
+    3. Диверсификация по source — не больше MAX_PER_SOURCE чанков из одного
+       документа. Убирает дубли, которые забивали контекст.
+    4. Сигнал низкого качества: если max(scores) очень мал — логируем warning,
+       чтобы было заметно «ничего релевантного не найдено».
+    """
+
+    # Не больше N чанков из одного документа в финальном top_k
+    MAX_PER_SOURCE: int = 2
+    # Порог «низкого качества» для warning-сигнала
+    LOW_QUALITY_THRESHOLD: float = 0.1
+    # Бусты при совпадении имени документа в запросе
+    HEADER_BOOST:        float = 1.0   # header-чанк + совпадение имени
+    FILENAME_MATCH_BOOST: float = 0.3   # обычный чанк + совпадение имени
+    TITLE_MATCH_BOOST:    float = 0.2   # совпадение title (для не-S3 страниц)
+
     def __init__(self, model_name: str, top_k: int, threshold: float = 0.0):
         print(f"[reranker] Загрузка модели: {model_name}")
         self._model     = CrossEncoder(model_name, max_length=512)
@@ -133,29 +160,106 @@ class CrossEncoderReranker:
         self._threshold = threshold
         print(f"[reranker] Готово. top-{top_k}, порог скора: {threshold}")
 
+    @staticmethod
+    def _enrich_payload(doc: Document) -> str:
+        """Склеивает title + breadcrumb + content для подачи в CrossEncoder.
+        Так модель видит, из какого документа чанк, а не только голый текст."""
+        title      = (doc.metadata.get("title")      or "").strip()
+        breadcrumb = (doc.metadata.get("breadcrumb") or "").strip()
+
+        header_parts = []
+        if title:
+            header_parts.append(title)
+        if breadcrumb:
+            header_parts.append(breadcrumb)
+
+        if header_parts:
+            return f"{' | '.join(header_parts)}\n{doc.page_content}"
+        return doc.page_content
+
+    @staticmethod
+    def _normalize(s: str) -> str:
+        """Нормализует строку для сравнения: lower, подчёркивания→пробелы,
+        схлопывание пробелов. Помогает матчить «О_проведении_мероприятия» и
+        «о проведении мероприятия»."""
+        s = s.lower().replace("_", " ")
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _compute_boost(self, query_norm: str, doc: Document) -> float:
+        """Добавка к скору за совпадение имени документа/title в запросе."""
+        s3_key = doc.metadata.get("s3_key") or ""
+        title  = doc.metadata.get("title")  or ""
+
+        if s3_key:
+            stem_norm = self._normalize(Path(s3_key).stem)
+            if stem_norm and stem_norm in query_norm:
+                return self.HEADER_BOOST if doc.metadata.get("is_header") else self.FILENAME_MATCH_BOOST
+
+        if title and len(title) > 5:
+            title_norm = self._normalize(title)
+            if title_norm in query_norm:
+                return self.TITLE_MATCH_BOOST
+
+        return 0.0
+
     def rerank(self, query: str, docs: list[Document]) -> list[Document]:
         if not docs:
             return docs
 
-        pairs  = [(query, doc.page_content) for doc in docs]
-        scores = self._model.predict(pairs)
+        # 1. CrossEncoder-скор с обогащённым payload
+        pairs       = [(query, self._enrich_payload(doc)) for doc in docs]
+        base_scores = [float(s) for s in self._model.predict(pairs)]
 
-        scored_docs = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        # 2. Бусты за совпадение имени документа в запросе
+        query_norm = self._normalize(query)
+        boosted_scores = [
+            base + self._compute_boost(query_norm, doc)
+            for base, doc in zip(base_scores, docs)
+        ]
 
-        # Отбрасываем чанки ниже порога
-        filtered = [(score, doc) for score, doc in scored_docs if score >= self._threshold]
+        scored = sorted(zip(boosted_scores, docs), key=lambda x: x[0], reverse=True)
 
-        # Если после фильтрации ничего не осталось — берём хотя бы лучший чанк
+        # 3. Диверсификация: не больше MAX_PER_SOURCE чанков из одного source
+        per_source: dict[str, int] = {}
+        diversified: list[tuple[float, Document]] = []
+        for score, doc in scored:
+            key = (
+                doc.metadata.get("s3_key")
+                or doc.metadata.get("page_url")
+                or doc.metadata.get("source", "")
+            )
+            if per_source.get(key, 0) >= self.MAX_PER_SOURCE:
+                continue
+            diversified.append((score, doc))
+            per_source[key] = per_source.get(key, 0) + 1
+
+        # 4. Фильтр по порогу (с защитой от пустого результата)
+        filtered = [(s, d) for s, d in diversified if s >= self._threshold]
         if not filtered:
-            filtered = scored_docs[:1]
+            filtered = diversified[:1]
 
         top_docs = [doc for _, doc in filtered[: self._top_k]]
 
+        # Сигнал низкого качества ретривала
+        max_score = scored[0][0] if scored else 0.0
+        if max_score < self.LOW_QUALITY_THRESHOLD:
+            print(
+                f"[reranker] ⚠ Низкое качество (max score={max_score:.3f}) — "
+                "возможно, в базе нет релевантного контента"
+            )
+
+        # Лог: показываем и base, и итоговый скор (если был буст)
         print("[reranker] Топ результаты:")
-        for score, doc in scored_docs[: self._top_k]:
+        shown = diversified[: self._top_k] if diversified else scored[: self._top_k]
+        for score, doc in shown:
             mark  = "✓" if score >= self._threshold else "✗"
-            title = doc.metadata.get("title", "")[:45]
-            print(f"  {mark} {score:+.3f}  {title}")
+            title = (doc.metadata.get("title") or "")[:45]
+            idx   = docs.index(doc)
+            base  = base_scores[idx]
+            delta = score - base
+            extra = f"  (base {base:+.3f} +{delta:.2f})" if abs(delta) > 1e-6 else ""
+            tag   = " [HDR]" if doc.metadata.get("is_header") else ""
+            print(f"  {mark} {score:+.3f}  {title}{tag}{extra}")
 
         return top_docs
 
@@ -303,11 +407,17 @@ class RAGSystem:
             "им ", "ему ", "ней ", "них ", "ним ",
             "этот ", "эта ", "это ", "эти ",
             "тот ", "та ", "те ", "том ",
-            "там ", "тогда ", "тут ",
+            "там ", "тогда ", "тут ", "здесь",
             "про него", "про неё", "про них", "про это",
             "о нём", "о ней", "о них",
             "подробнее", "ещё про", "а ещё", "а как насчёт",
             "расскажи ещё", "что ещё",
+            # Ссылки на ранее упомянутый документ/файл/положение
+            "в документе", "из документа", "документа?", "документе?",
+            "в файле", "из файла", "файла?",
+            "в положении", "положения?",
+            "в тексте", "из текста",
+            "в нём", "в ней", "в них",
         ]
         q_lower = question.lower()
         has_anaphora = any(marker in q_lower for marker in ANAPHORA_MARKERS)
@@ -354,9 +464,22 @@ class RAGSystem:
     def _format_docs(docs: list[Document]) -> str:
         parts = []
         for doc in docs:
-            src    = doc.metadata.get("source", "")
-            title  = doc.metadata.get("title", "")
-            header = f"[{title} | {src}]" if (title or src) else ""
+            src        = doc.metadata.get("source", "")
+            title      = doc.metadata.get("title", "")
+            breadcrumb = doc.metadata.get("breadcrumb", "")
+            # Для навигационных чанков реальный URL живёт в page_url,
+            # а в source хранится псевдо-ключ __nav__.
+            if src.startswith("__"):
+                src = doc.metadata.get("page_url", "")
+
+            header_parts = []
+            if title:
+                header_parts.append(title)
+            if src:
+                header_parts.append(f"URL: {src}")
+            if breadcrumb:
+                header_parts.append(f"Путь: {breadcrumb}")
+            header = f"[{' | '.join(header_parts)}]" if header_parts else ""
             parts.append(f"{header}\n{doc.page_content}".strip())
         return "\n\n---\n\n".join(parts)
 
@@ -370,7 +493,10 @@ class RAGSystem:
             "Если ответа в тексте нет — честно скажи об этом и предложи позвонить в учреждение.\n"
             "Учитывай историю диалога — не повторяй то, что уже было сказано.\n"
             "Отвечай на русском языке, кратко и по делу.\n"
-            "Если есть даты, телефоны, ссылки — обязательно укажи их.\n\n"
+            "Если есть даты, телефоны, ссылки — обязательно укажи их.\n"
+            "Если пользователь спрашивает как найти или перейти на страницу — "
+            "укажи прямую ссылку (URL) из текста базы знаний и опиши путь навигации "
+            "(хлебные крошки), если они есть.\n\n"
             f"ТЕКСТ ИЗ БАЗЫ ЗНАНИЙ:\n{context}"
         )
 
@@ -398,6 +524,14 @@ class RAGSystem:
 
         rewritten = self._rewrite_question(question)
         top_docs  = self._retrieve_and_rerank(rewritten)
+
+        print(f"[rag] Запрос: {rewritten!r}")
+        print(f"[rag] В контекст попали {len(top_docs)} чанков:")
+        for i, doc in enumerate(top_docs, 1):
+            src   = doc.metadata.get("source", "")[:90]
+            title = doc.metadata.get("title", "")[:60]
+            print(f"  {i}. [{title}] {src}")
+
         context   = self._format_docs(top_docs)
         answer    = self._generate_answer(rewritten, context)
 
@@ -406,6 +540,8 @@ class RAGSystem:
         seen, sources = set(), []
         for doc in top_docs:
             url = doc.metadata.get("source", "")
+            if url.startswith("__"):
+                url = doc.metadata.get("page_url", "")
             if url and url not in seen:
                 seen.add(url)
                 sources.append({

@@ -1,7 +1,54 @@
+# Основной фреймворк
 fastapi
-uvicorn
+uvicorn[standard]
+
+# База данных
 sqlalchemy
+psycopg2-binary                  # для PostgreSQL
+alembic                          # миграции (нужны для модуля ТПМПК)
+
+# Аутентификация
 python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
+
+# Pydantic
+pydantic
 pydantic[email]
+
+# Генерация грамот (PDF)
+reportlab
+Pillow
+pandas
+openpyxl
+pytrovich                        # склонение ФИО для грамот
+
+# RAG-система (чат-помощник)
+langchain
+langchain-chroma
+langchain-huggingface
+langchain-text-splitters
+gigachat
+sentence-transformers
+chromadb
+
+# Дополнительно (рекомендуется)
+python-dotenv                    # для .env файла
+httpx                            # для HTTP-запросов
+
+# HTTP / S3 / краулер сайта
+requests
+boto3
+beautifulsoup4
+
+# Извлечение текста из документов
+pypdf
+python-docx
+pymupdf                          # fitz — рендер PDF в картинки для OCR
+mammoth                          # fallback-конвертация .doc без MS Word
+
+# OCR
+surya-ocr                        # Surya OCR (на CPU)
+
+# Auth — bcrypt напрямую (auth.py) + используется passlib[bcrypt] выше
+bcrypt

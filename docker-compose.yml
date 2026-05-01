@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-root}
+      POSTGRES_DB: ${DB_NAME:-eduirk_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Можно убрать, если БД не нужна снаружи
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-eduirk_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Внутри docker-сети БД доступна по имени сервиса, а не localhost
+      DB_HOST: db
+      DB_PORT: 5432
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      # Снаружи 8001 — потому что 8000 занят соседним контейнером (gamehub_backend).
+      # При обращении к API используй http://localhost:8001
+      - "8000:8000"
+    volumes:
+      # Persistent данные — bind-mounts, чтобы контейнер видел уже существующие
+      # локальные файлы (Chroma-БД с векторами, кэш OCR, загруженные шаблоны)
+      - ./chroma_gigachat:/app/chroma_gigachat
+      - ./ocr_cache:/app/ocr_cache
+      - ./s3_extracted:/app/s3_extracted
+      - ./static/certificates/backgrounds:/app/static/certificates/backgrounds
+      - ./static/certificates/facsimiles:/app/static/certificates/facsimiles
+      - ./static/certificates/generated:/app/static/certificates/generated
+      - ./update_state.json:/app/update_state.json
+      # Кэш HuggingFace/Surya моделей — named volume, чтобы не засорять репозиторий
+      - hf_cache:/cache/huggingface
+
+volumes:
+  pgdata:
+  hf_cache:
