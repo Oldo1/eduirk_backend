@@ -56,19 +56,30 @@ class Article(Base):
     body = Column(String, nullable=False, default="")
     cover_image_url = Column(String(500), nullable=True)
     is_pinned = Column(Boolean, nullable=False, default=False, index=True)
+    duplicate_to_main = Column(Boolean, nullable=False, default=False, index=True)
+    duplicate_to_events = Column(Boolean, nullable=False, default=False, index=True)
     blocks = Column(JSON, nullable=False, default=list)
+    attachments = Column(JSON, nullable=False, default=list)
     categories = Column(JSON, nullable=False, default=list)
     tags = Column(JSON, nullable=False, default=list)
     publishing_scope = Column(String(20), nullable=False, default="both", index=True)
     methodika_subject = Column(String(120), nullable=True, index=True)
     dom_uchitelya_section = Column(String(120), nullable=True, index=True)
     noko_section = Column(String(120), nullable=True, index=True)
+    hub_kind = Column(String(64), nullable=True, index=True)
+    hub_path = Column(String(160), nullable=True, index=True)
     author_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     published_at = Column(DateTime(timezone=True), nullable=True)
 
     author = relationship("User", foreign_keys=[author_id])
+
+    @property
+    def author_name(self):
+        if self.author is None:
+            return None
+        return getattr(self.author, "username", None) or getattr(self.author, "email", None)
 
 
 class CertificateTemplate(Base):

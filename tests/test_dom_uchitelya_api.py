@@ -76,6 +76,7 @@ def _add_article_obj(client, **kwargs):
             excerpt=kwargs.pop("excerpt", None),
             image=kwargs.pop("image", None),
             blocks=kwargs.pop("blocks", []),
+            attachments=kwargs.pop("attachments", []),
             categories=kwargs.pop("categories", []),
             tags=kwargs.pop("tags", []),
             published_at=kwargs.pop("published_at", datetime.now(timezone.utc)),
@@ -92,7 +93,16 @@ def _add_article_obj(client, **kwargs):
 def test_public_news_scope_filters(client):
     _add_article(client, "IMCRO only", "imcro_only")
     _add_article(client, "DOMU only", "dom_uchitelya_only")
-    _add_article(client, "Both feeds", "both")
+    _add_article_obj(client, title="Both feeds", slug="both-feeds", publishing_scope="both", duplicate_to_main=True)
+    _add_article_obj(
+        client,
+        title="Hub only",
+        slug="hub-only",
+        publishing_scope="imcro_only",
+        hub_kind="konkursy",
+        hub_path="kalendar",
+        duplicate_to_main=False,
+    )
 
     common = client.get("/api/news/")
     domu = client.get("/api/dom-uchitelya/news/")
@@ -131,6 +141,14 @@ def test_public_news_sorts_pinned_then_newest_and_hides_scheduled(client):
 
     assert response.status_code == 200
     assert [item["title"] for item in response.json()["items"]] == ["Older pinned", "Newest normal"]
+
+
+def test_public_events_returns_only_marked_articles(client):
+    _add_article_obj(client, title="Event article", slug="event-article", duplicate_to_events=True)
+    _add_article_obj(client, title="Regular article", slug="regular-article", duplicate_to_events=False)
+    response = client.get("/api/events/")
+    assert response.status_code == 200
+    assert [item["title"] for item in response.json()["items"]] == ["Event article"]
 
 
 def test_domu_editor_cannot_publish_imcro_only_in_domu_admin(client):
@@ -192,6 +210,9 @@ def test_admin_article_crud_accepts_block_body_taxonomy_fields(client):
                 {"id": "b1", "type": "heading", "data": {"text": "Heading", "level": 2}},
                 {"id": "b2", "type": "paragraph", "data": {"html": "<strong>Text</strong>"}},
             ],
+            "attachments": [
+                {"url": "/static/articles/attachments/file.pdf", "name": "file.pdf", "type": "PDF"},
+            ],
             "cover_image_url": "/static/articles/covers/cover.jpg",
             "is_pinned": True,
             "publishing_scope": "both",
@@ -208,8 +229,141 @@ def test_admin_article_crud_accepts_block_body_taxonomy_fields(client):
     assert payload["excerpt"] == "Short lead"
     assert json.loads(payload["body"])[0]["type"] == "heading"
     assert payload["blocks"][1]["data"]["html"] == "<strong>Text</strong>"
+    assert payload["attachments"][0]["name"] == "file.pdf"
     assert payload["cover_image_url"].endswith("cover.jpg")
     assert payload["image"] == "/static/articles/covers/cover.jpg"
     assert payload["is_pinned"] is True
     assert payload["methodika_subject"] == "Математика"
     assert payload["dom_uchitelya_section"] == "master-klassy"
+
+
+def test_admin_article_create_makes_duplicate_slug_unique(client):
+    app = client.app
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=12, email="admin@example.test", role="admin")
+
+    first = client.post(
+        "/api/admin/news/",
+        json={
+            "title": "Duplicate",
+            "slug": "duplicate",
+            "status": "draft",
+            "lead": "Lead",
+            "body": "Body",
+            "publishing_scope": "imcro_only",
+        },
+    )
+    second = client.post(
+        "/api/admin/news/",
+        json={
+            "title": "Duplicate",
+            "slug": "duplicate",
+            "status": "draft",
+            "lead": "Lead",
+            "body": "Body",
+            "publishing_scope": "imcro_only",
+        },
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["slug"] == "duplicate"
+    assert second.json()["slug"] == "duplicate-2"
+
+
+def test_pinned_limit_by_section_is_enforced(client):
+    app = client.app
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=12, email="admin@example.test", role="admin")
+    for index in range(1, 4):
+        created = client.post(
+            "/api/admin/news/",
+            json={
+                "title": f"Pinned {index}",
+                "slug": f"pinned-{index}",
+                "status": "published",
+                "lead": "Lead",
+                "body": "Body",
+                "is_pinned": True,
+                "hub_kind": "konkursy",
+                "hub_path": "kalendar",
+                "publishing_scope": "imcro_only",
+            },
+        )
+        assert created.status_code == 201
+    fourth = client.post(
+        "/api/admin/news/",
+        json={
+            "title": "Pinned 4",
+            "slug": "pinned-4",
+            "status": "published",
+            "lead": "Lead",
+            "body": "Body",
+            "is_pinned": True,
+            "hub_kind": "konkursy",
+            "hub_path": "kalendar",
+            "publishing_scope": "imcro_only",
+        },
+    )
+    assert fourth.status_code == 400
+
+
+def test_admin_article_attachment_upload_accepts_documents(client):
+    app = client.app
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=12, email="admin@example.test", role="admin")
+
+    response = client.post(
+        "/api/admin/news/upload-attachment/",
+        files={"file": ("plan.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["name"] == "plan.pdf"
+    assert payload["type"] == "PDF"
+    assert payload["url"].startswith("/static/articles/attachments/")
+
+
+def test_public_hub_endpoint_filters_by_hub_and_section(client):
+    _add_article_obj(
+        client,
+        title="Конкурсный календарь",
+        slug="konkurs-calendar",
+        publishing_scope="imcro_only",
+        hub_kind="konkursy",
+        hub_path="kalendar",
+    )
+    _add_article_obj(
+        client,
+        title="НОКО ГИА-9",
+        slug="noko-gia9",
+        publishing_scope="imcro_only",
+        noko_section="gia-9",
+    )
+    _add_article_obj(
+        client,
+        title="Методика: математика",
+        slug="metod-math",
+        publishing_scope="imcro_only",
+        methodika_subject="Математика",
+    )
+    _add_article_obj(
+        client,
+        title="Методика: совет",
+        slug="metod-sovet",
+        publishing_scope="imcro_only",
+        hub_kind="methodika",
+        hub_path="metodicheskiy-sovet",
+    )
+
+    konkursy = client.get("/api/hub/news/?hub=konkursy&section=kalendar")
+    noko = client.get("/api/hub/news/?hub=noko&section=gia-9")
+    methodika = client.get("/api/hub/news/?hub=methodika&subject=Математика")
+    methodika_section = client.get("/api/hub/news/?hub=methodika&section=metodicheskiy-sovet")
+
+    assert konkursy.status_code == 200
+    assert [item["title"] for item in konkursy.json()["items"]] == ["Конкурсный календарь"]
+    assert noko.status_code == 200
+    assert [item["title"] for item in noko.json()["items"]] == ["НОКО ГИА-9"]
+    assert methodika.status_code == 200
+    assert [item["title"] for item in methodika.json()["items"]] == ["Методика: математика"]
+    assert methodika_section.status_code == 200
+    assert [item["title"] for item in methodika_section.json()["items"]] == ["Методика: совет"]

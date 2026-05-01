@@ -58,13 +58,18 @@ class ArticleBase(BaseModel):
     body: str = ""
     cover_image_url: Optional[str] = Field(None, max_length=500)
     is_pinned: bool = False
+    duplicate_to_main: bool = False
+    duplicate_to_events: bool = False
     blocks: List[Dict] = Field(default_factory=list)
+    attachments: List[Dict] = Field(default_factory=list)
     categories: List = Field(default_factory=list)
     tags: List = Field(default_factory=list)
     publishing_scope: str = "both"
     methodika_subject: Optional[str] = Field(None, max_length=120)
     dom_uchitelya_section: Optional[str] = Field(None, max_length=120)
     noko_section: Optional[str] = Field(None, max_length=120)
+    hub_kind: Optional[str] = Field(None, max_length=64)
+    hub_path: Optional[str] = Field(None, max_length=160)
     published_at: Optional[datetime] = None
 
     @field_validator("slug")
@@ -116,13 +121,18 @@ class ArticleUpdate(BaseModel):
     body: Optional[str] = None
     cover_image_url: Optional[str] = Field(None, max_length=500)
     is_pinned: Optional[bool] = None
+    duplicate_to_main: Optional[bool] = None
+    duplicate_to_events: Optional[bool] = None
     blocks: Optional[List[Dict]] = None
+    attachments: Optional[List[Dict]] = None
     categories: Optional[List] = None
     tags: Optional[List] = None
     publishing_scope: Optional[str] = None
     methodika_subject: Optional[str] = Field(None, max_length=120)
     dom_uchitelya_section: Optional[str] = Field(None, max_length=120)
     noko_section: Optional[str] = Field(None, max_length=120)
+    hub_kind: Optional[str] = Field(None, max_length=64)
+    hub_path: Optional[str] = Field(None, max_length=160)
     published_at: Optional[datetime] = None
 
     @field_validator("slug")
@@ -153,6 +163,7 @@ class ArticleUpdate(BaseModel):
 class ArticleResponse(ArticleBase):
     id: int
     author_id: Optional[int]
+    author_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
