@@ -24,6 +24,10 @@ SITE_MAX_PAGES:    int   = int(os.environ.get("SITE_MAX_PAGES", "2000"))
 SITE_CRAWL_DELAY:  float = float(os.environ.get("SITE_CRAWL_DELAY", "0.5"))
 SITE_USER_AGENT:   str   = "RAG-Updater/1.0"
 SITE_MIN_TEXT_LEN: int   = 50    # страницы короче этого — пропускаем
+SITE_CACHE_FILE:   str   = os.environ.get(
+    "SITE_CACHE_FILE",
+    "./chroma_gigachat/site_pages_cache.json",
+)
 
 SITE_SKIP_TAGS: frozenset[str] = frozenset(
     {"script", "style", "nav", "footer", "header", "aside", "noscript"}

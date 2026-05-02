@@ -178,7 +178,10 @@ def _run_reindex_bg():
             logger.info("[reindex] update_state.json удалён")
         except FileNotFoundError:
             pass
+        except Exception as e:
+            logger.warning(f"[reindex] Не удалось удалить update_state.json: {e}")
         state = UpdateState()   # создаём пустой (файла нет — загружает пустой)
+        state.clear()           # гарантируем полный reindex даже если файл состояния остался
 
         # Полная индексация
         stats = incremental_update(
@@ -186,6 +189,7 @@ def _run_reindex_bg():
             embeddings=_EMBEDDINGS,
             state=state,
             on_update_done=_reload,
+            use_site_cache=True,
             progress_cb=progress_cb,
         )
 
