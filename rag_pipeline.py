@@ -44,6 +44,9 @@ from sentence_transformers import CrossEncoder
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 
+SITE_CONTEXT_SOURCE = "__site_context__"
+SITE_CONTEXT_PROMPT_LIMIT = 4000
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Конфигурация
@@ -59,7 +62,7 @@ class RAGConfig:
     model: str             = "GigaChat-Pro"        # GigaChat | GigaChat-Pro | GigaChat-Max
     verify_ssl_certs: bool = False                 # True — если установлен сертификат Минцифры
     max_tokens: int        = 1000
-    temperature: float     = 0.2
+    temperature: float     = 0.1
 
     # ── Векторная база ────────────────────────────────────────────────────────
     persist_dir: str     = "./chroma_gigachat"
@@ -461,18 +464,89 @@ class RAGSystem:
     # ── Шаг 3: форматировать чанки ───────────────────────────────────────────
 
     @staticmethod
-    def _format_docs(docs: list[Document]) -> str:
-        parts = []
+    def _limit_site_context(text: str) -> str:
+        text = re.sub(r"\s+", " ", text or "").strip()
+        if len(text) <= SITE_CONTEXT_PROMPT_LIMIT:
+            return text
+        return text[:SITE_CONTEXT_PROMPT_LIMIT].rsplit(" ", 1)[0].rstrip() + "..."
+
+    @classmethod
+    def _site_context_from_docs(cls, docs: list[Document]) -> str:
+        contexts: list[str] = []
+        seen: set[str] = set()
+        for doc in docs:
+            candidates = []
+            if doc.metadata.get("source") == SITE_CONTEXT_SOURCE:
+                candidates.append(doc.page_content)
+            if doc.metadata.get("site_context"):
+                candidates.append(doc.metadata["site_context"])
+
+            for candidate in candidates:
+                context = cls._limit_site_context(candidate)
+                if context and context not in seen:
+                    contexts.append(context)
+                    seen.add(context)
+
+        return cls._limit_site_context("\n\n".join(contexts))
+
+    def _load_site_context(self) -> str:
+        if self._vectorstore is None:
+            return ""
+
+        try:
+            existing = self._vectorstore.get(
+                where={"source": SITE_CONTEXT_SOURCE},
+                include=["documents", "metadatas"],
+            )
+        except TypeError:
+            existing = self._vectorstore.get(include=["documents", "metadatas"])
+        except Exception as e:
+            print(f"[site-context] Не удалось прочитать контекст сайта: {e}")
+            return ""
+
+        documents = existing.get("documents") or []
+        metadatas = existing.get("metadatas") or []
+        for text, meta in zip(documents, metadatas):
+            if (meta or {}).get("source") == SITE_CONTEXT_SOURCE:
+                return self._limit_site_context(text or "")
+        return ""
+
+    @staticmethod
+    def _format_docs(docs: list[Document], site_context: str = "") -> str:
+        site_parts = []
+        document_parts = []
+        other_parts = []
+
+        if site_context:
+            site_parts.append(
+                "[КРАТКИЙ КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ]\n"
+                f"{site_context.strip()}"
+            )
+
         for doc in docs:
             src        = doc.metadata.get("source", "")
             title      = doc.metadata.get("title", "")
             breadcrumb = doc.metadata.get("breadcrumb", "")
+            is_document = bool(doc.metadata.get("s3_key") or doc.metadata.get("doc_type"))
+
+            if src == SITE_CONTEXT_SOURCE:
+                continue
+
             # Для навигационных чанков реальный URL живёт в page_url,
             # а в source хранится псевдо-ключ __nav__.
             if src.startswith("__"):
                 src = doc.metadata.get("page_url", "")
 
+            is_site_page = (not is_document) and ("mc.eduirk.ru" in src or bool(breadcrumb))
+            if is_site_page:
+                block_label = "КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ"
+            elif is_document:
+                block_label = "СОДЕРЖИМОЕ ДОКУМЕНТА — НИЖЕ ПРИОРИТЕТОМ, ЧЕМ САЙТ"
+            else:
+                block_label = "ФРАГМЕНТ БАЗЫ ЗНАНИЙ"
+
             header_parts = []
+            header_parts.append(block_label)
             if title:
                 header_parts.append(title)
             if src:
@@ -480,19 +554,44 @@ class RAGSystem:
             if breadcrumb:
                 header_parts.append(f"Путь: {breadcrumb}")
             header = f"[{' | '.join(header_parts)}]" if header_parts else ""
-            parts.append(f"{header}\n{doc.page_content}".strip())
-        return "\n\n---\n\n".join(parts)
+            block = f"{header}\n{doc.page_content}".strip()
+
+            if is_site_page:
+                site_parts.append(block)
+            elif is_document:
+                document_parts.append(block)
+            else:
+                other_parts.append(block)
+
+        return "\n\n---\n\n".join(site_parts + document_parts + other_parts)
 
     # ── Шаг 4: генерировать ответ с историей ─────────────────────────────────
 
-    def _generate_answer(self, question: str, context: str) -> str:
+    def _generate_answer(self, question: str, context: str, site_context: str = "") -> str:
         system_content = (
             "Ты — помощник МКУ «ИМЦРО» (Муниципальное казённое учреждение "
             "развития образования города Иркутска).\n\n"
             "Отвечай ТОЛЬКО на основе предоставленного текста. Не придумывай факты.\n"
             "Если ответа в тексте нет — честно скажи об этом и предложи позвонить в учреждение.\n"
+            "В тексте базы знаний могут быть блоки "
+            "«КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ», "
+            "«КРАТКИЙ КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ» и "
+            "«СОДЕРЖИМОЕ ДОКУМЕНТА — НИЖЕ ПРИОРИТЕТОМ, ЧЕМ САЙТ».\n"
+            "Сначала ориентируйся на краткое описание, аннотацию, раздел, навигацию "
+            "и сведения со страниц сайта mc.eduirk.ru. Содержимое PDF/DOCX используй "
+            "как подробности только там, где сайт не даёт ответа.\n"
+            "Если описание, дата, статус, назначение или формулировки документа расходятся "
+            "с контекстом сайта, в ответе бери информацию с сайта и не повторяй "
+            "противоречивые сведения из документа.\n"
+            "Если пользователь просит рассказать про документ, начинай с того, как он "
+            "описан/размещён на сайте, а уже затем добавляй детали из самого файла.\n"
+            "Не выдавай дату из текста PDF/DOCX как актуальную дату описания документа, "
+            "если эта дата не подтверждена контекстом сайта.\n"
             "Учитывай историю диалога — не повторяй то, что уже было сказано.\n"
             "Отвечай на русском языке, кратко и по делу.\n"
+            "Не используй Markdown-разметку в ответе. Не используй звёздочки `*` "
+            "для выделения, жирного текста, курсива или списков. Если нужен список, "
+            "оформляй пункты обычным текстом через дефис и пробел: \"- пункт\".\n"
             "Если есть даты, телефоны, ссылки — обязательно укажи их.\n"
             "Если пользователь спрашивает как найти или перейти на страницу — "
             "укажи прямую ссылку (URL) из текста базы знаний и опиши путь навигации "
@@ -532,8 +631,9 @@ class RAGSystem:
             title = doc.metadata.get("title", "")[:60]
             print(f"  {i}. [{title}] {src}")
 
-        context   = self._format_docs(top_docs)
-        answer    = self._generate_answer(rewritten, context)
+        site_context = self._site_context_from_docs(top_docs) or self._load_site_context()
+        context      = self._format_docs(top_docs, site_context=site_context)
+        answer       = self._generate_answer(rewritten, context, site_context=site_context)
 
         self.memory.save(question, answer)
 

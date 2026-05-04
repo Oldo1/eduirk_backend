@@ -48,6 +48,8 @@ backups
 *.dump
 *.log
 uvicorn.*.log
+logs
+tmp_docx_render
 
 # Прочий мусор
 .DS_Store

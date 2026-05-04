@@ -1,5 +1,6 @@
 from datetime import date, datetime, time, timedelta, timezone
 import os
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
@@ -26,15 +27,31 @@ from models import (
 )
 
 router = APIRouter(prefix="/api/tpmpk", tags=["tpmpk"])
+
 PD_ENCRYPTION_KEY = os.getenv("PD_ENCRYPTION_KEY", "dev-tpmpk-key-change-me")
 DEFAULT_OPEN_TIME = time(9, 0)
 DEFAULT_CLOSE_TIME = time(17, 0)
 DEFAULT_LUNCH_START = time(13, 0)
 DEFAULT_LUNCH_END = time(14, 0)
 DEFAULT_SLOT_MINUTES = 30
+IRKUTSK_TZ = ZoneInfo("Asia/Irkutsk")
 
 
-def _build_day_slots(day: TPMPKWorkingDay) -> list:
+def _irkutsk_now() -> datetime:
+    return datetime.now(IRKUTSK_TZ)
+
+
+def _irkutsk_today() -> date:
+    return _irkutsk_now().date()
+
+
+def _is_future_slot_irkutsk(selected_date: date, slot_time: time, now: datetime | None = None) -> bool:
+    now = now or _irkutsk_now()
+    slot_at = datetime.combine(selected_date, slot_time, tzinfo=IRKUTSK_TZ)
+    return slot_at > now
+
+
+def _build_day_slots(day: TPMPKWorkingDay) -> list[time]:
     if not day.is_open or not day.open_time or not day.close_time:
         return []
 
@@ -65,6 +82,14 @@ def _time_to_str(value) -> str | None:
     return value.strftime("%H:%M")
 
 
+def _date_to_str(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return value.isoformat()
+
+
 def _day_to_dict(day: TPMPKWorkingDay) -> dict:
     return {
         "id": day.id,
@@ -92,22 +117,16 @@ def _template_to_dict(item: TPMPKScheduleTemplate) -> dict:
     }
 
 
-def _date_to_str(value) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    return value.isoformat()
-
-
 def _appointment_to_dict(row) -> dict:
     return {
         "id": row.id,
         "working_day_id": row.working_day_id,
         "date": _date_to_str(row.date),
         "start_time": _time_to_str(row.start_time),
-        "child_full_name": row.child_full_name or f"Запись #{row.id}",
+        "child_full_name": row.child_full_name or f"Appointment #{row.id}",
         "child_age": row.child_age,
+        "child_registered_irkutsk": row.child_registered_irkutsk,
+        "document_readiness": row.document_readiness,
         "is_repeat": row.is_repeat,
         "needs_psychiatrist": row.needs_psychiatrist,
         "consent_pd": row.consent_pd,
@@ -135,9 +154,11 @@ def _fetch_appointments(db: Session, day: date | None = None) -> list[dict]:
                 a.start_time,
                 COALESCE(
                     pgp_sym_decrypt(a.child_full_name, :key),
-                    'Запись #' || a.id::text
+                    'Appointment #' || a.id::text
                 ) AS child_full_name,
                 a.child_age,
+                a.child_registered_irkutsk,
+                a.document_readiness,
                 a.is_repeat,
                 a.needs_psychiatrist,
                 a.consent_pd,
@@ -156,52 +177,27 @@ def _fetch_appointments(db: Session, day: date | None = None) -> list[dict]:
     return [_appointment_to_dict(row) for row in rows]
 
 
-def _get_day_or_404(db: Session, selected_date: date) -> TPMPKWorkingDay:
-    return _ensure_working_day(db, selected_date)
-
-
-def _day_schedule(db: Session, selected_date: date) -> dict:
-    day = _get_day_or_404(db, selected_date)
-    appointments = {item["start_time"]: item for item in _fetch_appointments(db, selected_date)}
-    slots = []
-    for slot_time in _build_day_slots(day):
-        key = _time_to_str(slot_time)
-        appointment = appointments.get(key)
-        is_active = appointment and appointment["status"] != "cancelled"
-        slots.append({
-            "working_day_id": day.id,
-            "date": selected_date.isoformat(),
-            "start_time": key,
-            "status": "occupied" if is_active else "free",
-            "appointment": appointment if is_active else None,
-        })
-
-    return {"day": _day_to_dict(day), "slots": slots}
-
-
 def _audit_user_id(db: Session) -> int:
     user = db.query(TPMPKUser).filter(TPMPKUser.email == "system-tpmpk@local").first()
     if user:
         return user.id
 
-    user = TPMPKUser(
-        email="system-tpmpk@local",
-        password_hash="system",
-        role="admin",
-    )
+    user = TPMPKUser(email="system-tpmpk@local", password_hash="system", role="admin")
     db.add(user)
     db.flush()
     return user.id
 
 
 def _log_action(db: Session, action: str, object_type: str, object_id: int, payload: dict | None = None):
-    db.add(TPMPKAuditLog(
-        user_id=_audit_user_id(db),
-        action=action,
-        object_type=object_type,
-        object_id=object_id,
-        payload=payload or {},
-    ))
+    db.add(
+        TPMPKAuditLog(
+            user_id=_audit_user_id(db),
+            action=action,
+            object_type=object_type,
+            object_id=object_id,
+            payload=payload or {},
+        )
+    )
 
 
 def _default_template_row(weekday: int) -> TPMPKScheduleTemplate:
@@ -261,7 +257,7 @@ def _ensure_days_range(db: Session, start: date, count: int = 60) -> list[TPMPKW
     )
 
 
-def _free_slots_for_day(db: Session, day: TPMPKWorkingDay) -> list[time]:
+def _free_slots_for_day(db: Session, day: TPMPKWorkingDay, *, future_only: bool = False) -> list[time]:
     occupied = {
         row.start_time
         for row in db.query(TPMPKAppointment.start_time)
@@ -271,22 +267,48 @@ def _free_slots_for_day(db: Session, day: TPMPKWorkingDay) -> list[time]:
         )
         .all()
     }
-    return [slot for slot in _build_day_slots(day) if slot not in occupied]
+    return [
+        slot
+        for slot in _build_day_slots(day)
+        if slot not in occupied and (not future_only or _is_future_slot_irkutsk(day.date, slot))
+    ]
 
 
 def _validate_day_hours(day: TPMPKWorkingDay):
     if day.is_open and (not day.open_time or not day.close_time):
-        raise HTTPException(status_code=400, detail="Для открытого дня укажите часы работы")
+        raise HTTPException(status_code=400, detail="Open day requires working hours")
     if day.open_time and day.close_time and day.open_time >= day.close_time:
-        raise HTTPException(status_code=400, detail="Время начала должно быть раньше окончания")
+        raise HTTPException(status_code=400, detail="Open time must be before close time")
     if day.lunch_start and day.lunch_end and day.lunch_start >= day.lunch_end:
-        raise HTTPException(status_code=400, detail="Начало обеда должно быть раньше окончания")
+        raise HTTPException(status_code=400, detail="Lunch start must be before lunch end")
+
+
+def _day_schedule(db: Session, selected_date: date) -> dict:
+    day = _ensure_working_day(db, selected_date)
+    appointments = {item["start_time"]: item for item in _fetch_appointments(db, selected_date)}
+    slots = []
+    for slot_time in _build_day_slots(day):
+        key = _time_to_str(slot_time)
+        appointment = appointments.get(key)
+        is_active = appointment and appointment["status"] != "cancelled"
+        slots.append(
+            {
+                "working_day_id": day.id,
+                "date": selected_date.isoformat(),
+                "start_time": key,
+                "status": "occupied" if is_active else "free",
+                "appointment": appointment if is_active else None,
+            }
+        )
+
+    return {"day": _day_to_dict(day), "slots": slots}
 
 
 @router.get("/slots/", response_model=list[SlotResponse])
 def get_slots(date_: date = Query(..., alias="date"), db: Session = Depends(get_db)):
-    day = db.query(TPMPKWorkingDay).filter(TPMPKWorkingDay.date == date_).first()
-    if not day:
+    day = _ensure_working_day(db, date_)
+    db.commit()
+    if not day.is_open:
         return []
 
     occupied = {
@@ -315,25 +337,25 @@ def get_slots(date_: date = Query(..., alias="date"), db: Session = Depends(get_
             date=date_,
             start_time=slot,
             is_available=slot not in busy,
+            slot_minutes=day.slot_minutes,
         )
         for slot in _build_day_slots(day)
+        if _is_future_slot_irkutsk(day.date, slot)
     ]
 
 
-@router.post(
-    "/zapis/",
-    response_model=AppointmentResponse,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/zapis/", response_model=AppointmentResponse, status_code=status.HTTP_201_CREATED)
 def create_appointment(data: AppointmentCreate, db: Session = Depends(get_db)):
     if not (data.consent_pd and data.consent_special):
-        raise HTTPException(status_code=400, detail="Требуются оба согласия")
+        raise HTTPException(status_code=400, detail="Both consents are required")
 
     day = db.query(TPMPKWorkingDay).filter(TPMPKWorkingDay.id == data.working_day_id).first()
     if not day:
-        raise HTTPException(status_code=404, detail="День не найден")
+        raise HTTPException(status_code=404, detail="Day not found")
     if not day.is_open:
-        raise HTTPException(status_code=409, detail="День закрыт для записи")
+        raise HTTPException(status_code=409, detail="Day is closed for appointments")
+    if not _is_future_slot_irkutsk(day.date, data.start_time):
+        raise HTTPException(status_code=409, detail="Choose a future slot")
 
     try:
         row = db.execute(
@@ -341,11 +363,13 @@ def create_appointment(data: AppointmentCreate, db: Session = Depends(get_db)):
                 """
                 INSERT INTO tpmpk_appointment (
                     working_day_id, start_time, child_full_name, child_age,
+                    child_registered_irkutsk, document_readiness,
                     parent_phone, is_repeat, needs_psychiatrist,
                     consent_pd, consent_special, status, source, created_at
                 ) VALUES (
                     :working_day_id, :start_time,
                     pgp_sym_encrypt(:child_full_name, :key), :child_age,
+                    :child_registered_irkutsk, :document_readiness,
                     pgp_sym_encrypt(:parent_phone, :key),
                     :is_repeat, :needs_psychiatrist,
                     TRUE, TRUE, 'new', 'site', now()
@@ -358,6 +382,8 @@ def create_appointment(data: AppointmentCreate, db: Session = Depends(get_db)):
                 "start_time": data.start_time,
                 "child_full_name": data.child_full_name,
                 "child_age": data.child_age,
+                "child_registered_irkutsk": data.child_registered_irkutsk,
+                "document_readiness": data.document_readiness,
                 "parent_phone": data.parent_phone,
                 "is_repeat": data.is_repeat,
                 "needs_psychiatrist": data.needs_psychiatrist,
@@ -376,7 +402,7 @@ def create_appointment(data: AppointmentCreate, db: Session = Depends(get_db)):
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Слот уже занят")
+        raise HTTPException(status_code=409, detail="Slot is already occupied")
 
     return AppointmentResponse(
         appointment_id=row.id,
@@ -388,17 +414,15 @@ def create_appointment(data: AppointmentCreate, db: Session = Depends(get_db)):
 
 @router.get("/admin/dashboard/")
 def admin_dashboard(date_: date | None = Query(default=None, alias="date"), db: Session = Depends(get_db)):
-    date_ = date_ or date.today()
+    date_ = date_ or _irkutsk_today()
     appointments_today = _fetch_appointments(db, date_)
     active_today = [item for item in appointments_today if item["status"] != "cancelled"]
     new_since = datetime.now(timezone.utc) - timedelta(days=1)
     new_count = db.query(TPMPKAppointment).filter(TPMPKAppointment.created_at >= new_since).count()
 
-    try:
-        schedule = _day_schedule(db, date_)
-        nearest_slot = next((slot["start_time"] for slot in schedule["slots"] if slot["status"] == "free"), None)
-    except HTTPException:
-        nearest_slot = None
+    schedule = _day_schedule(db, date_)
+    nearest_slot = next((slot["start_time"] for slot in schedule["slots"] if slot["status"] == "free"), None)
+    db.commit()
 
     return {
         "date": date_.isoformat(),
@@ -411,8 +435,10 @@ def admin_dashboard(date_: date | None = Query(default=None, alias="date"), db: 
 
 @router.get("/admin/day/")
 def admin_day(date_: date | None = Query(default=None, alias="date"), db: Session = Depends(get_db)):
-    date_ = date_ or date.today()
-    return _day_schedule(db, date_)
+    date_ = date_ or _irkutsk_today()
+    schedule = _day_schedule(db, date_)
+    db.commit()
+    return schedule
 
 
 @router.get("/admin/appointments/")
@@ -422,7 +448,7 @@ def admin_appointments(date_: date | None = Query(default=None, alias="date"), d
 
 @router.get("/admin/days/")
 def admin_days(db: Session = Depends(get_db)):
-    days = _ensure_days_range(db, date.today(), 60)
+    days = _ensure_days_range(db, _irkutsk_today(), 60)
     db.commit()
     return {"items": [_day_to_dict(day) for day in days]}
 
@@ -431,7 +457,7 @@ def admin_days(db: Session = Depends(get_db)):
 def update_admin_day(day_id: int, data: WorkingDayUpdate, db: Session = Depends(get_db)):
     day = db.query(TPMPKWorkingDay).filter(TPMPKWorkingDay.id == day_id).first()
     if not day:
-        raise HTTPException(status_code=404, detail="День не найден")
+        raise HTTPException(status_code=404, detail="Day not found")
 
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(day, field, value)
@@ -446,7 +472,7 @@ def update_admin_day(day_id: int, data: WorkingDayUpdate, db: Session = Depends(
 def toggle_admin_day(day_id: int, db: Session = Depends(get_db)):
     day = db.query(TPMPKWorkingDay).filter(TPMPKWorkingDay.id == day_id).first()
     if not day:
-        raise HTTPException(status_code=404, detail="День не найден")
+        raise HTTPException(status_code=404, detail="Day not found")
 
     day.is_open = not day.is_open
     if day.is_open and (not day.open_time or not day.close_time):
@@ -474,14 +500,14 @@ def update_admin_template(data: ScheduleTemplateBulkUpdate, db: Session = Depend
     seen = set()
     for item in data.items:
         if item.weekday in seen:
-            raise HTTPException(status_code=400, detail="День недели повторяется в шаблоне")
+            raise HTTPException(status_code=400, detail="Weekday is duplicated")
         seen.add(item.weekday)
         if item.is_working_default and (not item.open_time or not item.close_time):
-            raise HTTPException(status_code=400, detail="Для рабочего дня укажите часы приема")
+            raise HTTPException(status_code=400, detail="Working day requires hours")
         if item.open_time and item.close_time and item.open_time >= item.close_time:
-            raise HTTPException(status_code=400, detail="Время начала должно быть раньше окончания")
+            raise HTTPException(status_code=400, detail="Open time must be before close time")
         if item.lunch_start and item.lunch_end and item.lunch_start >= item.lunch_end:
-            raise HTTPException(status_code=400, detail="Начало обеда должно быть раньше окончания")
+            raise HTTPException(status_code=400, detail="Lunch start must be before lunch end")
 
         row = existing[item.weekday]
         row.is_working_default = item.is_working_default
@@ -491,15 +517,26 @@ def update_admin_template(data: ScheduleTemplateBulkUpdate, db: Session = Depend
         row.lunch_end = item.lunch_end if item.is_working_default else None
         row.slot_minutes = item.slot_minutes
 
+    days = _ensure_days_range(db, _irkutsk_today(), 60)
+    templates = {row.weekday: row for row in existing.values()}
+    for day in days:
+        template = templates[day.date.weekday()]
+        day.is_open = template.is_working_default
+        day.open_time = template.open_time
+        day.close_time = template.close_time
+        day.lunch_start = template.lunch_start
+        day.lunch_end = template.lunch_end
+        day.slot_minutes = template.slot_minutes
+
     _log_action(db, "update_template", "schedule_template", 0, {"weekdays": sorted(seen)})
     db.commit()
-    return {"items": [_template_to_dict(item) for item in _ensure_template(db)]}
+    return {"items": [_template_to_dict(item) for item in _ensure_template(db)], "updated_days": len(days)}
 
 
 @router.post("/admin/template/apply/")
 def apply_admin_template(db: Session = Depends(get_db)):
     templates = {row.weekday: row for row in _ensure_template(db)}
-    days = _ensure_days_range(db, date.today(), 60)
+    days = _ensure_days_range(db, _irkutsk_today(), 60)
     for day in days:
         template = templates[day.date.weekday()]
         day.is_open = template.is_working_default
@@ -513,19 +550,15 @@ def apply_admin_template(db: Session = Depends(get_db)):
     return {"status": "ok", "updated": len(days)}
 
 
-@router.post(
-    "/admin/manual-appointments/",
-    response_model=AppointmentResponse,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/admin/manual-appointments/", response_model=AppointmentResponse, status_code=status.HTTP_201_CREATED)
 def create_manual_appointment(data: ManualAppointmentCreate, db: Session = Depends(get_db)):
     day = _ensure_working_day(db, data.date)
     if not day.is_open:
-        raise HTTPException(status_code=409, detail="День закрыт для записи")
+        raise HTTPException(status_code=409, detail="Day is closed for appointments")
 
-    available = _free_slots_for_day(db, day)
+    available = _free_slots_for_day(db, day, future_only=True)
     if data.start_time not in available:
-        raise HTTPException(status_code=409, detail="Слот занят или недоступен")
+        raise HTTPException(status_code=409, detail="Slot is occupied or unavailable")
 
     try:
         row = db.execute(
@@ -533,11 +566,13 @@ def create_manual_appointment(data: ManualAppointmentCreate, db: Session = Depen
                 """
                 INSERT INTO tpmpk_appointment (
                     working_day_id, start_time, child_full_name, child_age,
+                    child_registered_irkutsk, document_readiness,
                     parent_phone, is_repeat, needs_psychiatrist,
                     consent_pd, consent_special, status, source, created_at
                 ) VALUES (
                     :working_day_id, :start_time,
                     pgp_sym_encrypt(:child_full_name, :key), :child_age,
+                    :child_registered_irkutsk, :document_readiness,
                     pgp_sym_encrypt(:parent_phone, :key),
                     :is_repeat, :needs_psychiatrist,
                     TRUE, TRUE, 'new', 'phone', now()
@@ -550,6 +585,8 @@ def create_manual_appointment(data: ManualAppointmentCreate, db: Session = Depen
                 "start_time": data.start_time,
                 "child_full_name": data.child_full_name,
                 "child_age": data.child_age,
+                "child_registered_irkutsk": data.child_registered_irkutsk,
+                "document_readiness": data.document_readiness,
                 "parent_phone": data.parent_phone,
                 "is_repeat": data.is_repeat,
                 "needs_psychiatrist": data.needs_psychiatrist,
@@ -560,7 +597,7 @@ def create_manual_appointment(data: ManualAppointmentCreate, db: Session = Depen
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Слот уже занят")
+        raise HTTPException(status_code=409, detail="Slot is already occupied")
 
     return AppointmentResponse(
         appointment_id=row.id,
@@ -574,13 +611,13 @@ def create_manual_appointment(data: ManualAppointmentCreate, db: Session = Depen
 def transfer_admin_day(day_id: int, data: DayTransferRequest, db: Session = Depends(get_db)):
     source_day = db.query(TPMPKWorkingDay).filter(TPMPKWorkingDay.id == day_id).first()
     if not source_day:
-        raise HTTPException(status_code=404, detail="День не найден")
+        raise HTTPException(status_code=404, detail="Day not found")
     if data.target_date == source_day.date:
-        raise HTTPException(status_code=400, detail="Выберите другую дату для переноса")
+        raise HTTPException(status_code=400, detail="Choose another target date")
 
     target_day = _ensure_working_day(db, data.target_date)
     if not target_day.is_open:
-        raise HTTPException(status_code=409, detail="Новая дата закрыта для записи")
+        raise HTTPException(status_code=409, detail="Target day is closed")
 
     appointments = (
         db.query(TPMPKAppointment)
@@ -662,15 +699,9 @@ def reveal_phone(appointment_id: int, db: Session = Depends(get_db)):
         {"appointment_id": appointment_id, "key": PD_ENCRYPTION_KEY},
     ).scalar()
     if phone is None:
-        raise HTTPException(status_code=404, detail="Запись не найдена")
+        raise HTTPException(status_code=404, detail="Appointment not found")
 
-    db.add(TPMPKAuditLog(
-        user_id=_audit_user_id(db),
-        action="reveal_phone",
-        object_type="appointment",
-        object_id=appointment_id,
-        payload={"field": "parent_phone"},
-    ))
+    _log_action(db, "reveal_phone", "appointment", appointment_id, {"field": "parent_phone"})
     db.commit()
     return {"phone": phone}
 
@@ -679,15 +710,9 @@ def reveal_phone(appointment_id: int, db: Session = Depends(get_db)):
 def cancel_appointment(appointment_id: int, db: Session = Depends(get_db)):
     appointment = db.query(TPMPKAppointment).filter(TPMPKAppointment.id == appointment_id).first()
     if not appointment:
-        raise HTTPException(status_code=404, detail="Запись не найдена")
+        raise HTTPException(status_code=404, detail="Appointment not found")
     appointment.status = "cancelled"
-    db.add(TPMPKAuditLog(
-        user_id=_audit_user_id(db),
-        action="cancel_appointment",
-        object_type="appointment",
-        object_id=appointment_id,
-        payload={"status": "cancelled"},
-    ))
+    _log_action(db, "cancel_appointment", "appointment", appointment_id, {"status": "cancelled"})
     db.commit()
     return {"status": "cancelled"}
 
@@ -696,14 +721,8 @@ def cancel_appointment(appointment_id: int, db: Session = Depends(get_db)):
 def complete_appointment(appointment_id: int, db: Session = Depends(get_db)):
     appointment = db.query(TPMPKAppointment).filter(TPMPKAppointment.id == appointment_id).first()
     if not appointment:
-        raise HTTPException(status_code=404, detail="Запись не найдена")
+        raise HTTPException(status_code=404, detail="Appointment not found")
     appointment.status = "done"
-    db.add(TPMPKAuditLog(
-        user_id=_audit_user_id(db),
-        action="done_appointment",
-        object_type="appointment",
-        object_id=appointment_id,
-        payload={"status": "done"},
-    ))
+    _log_action(db, "done_appointment", "appointment", appointment_id, {"status": "done"})
     db.commit()
     return {"status": "done"}

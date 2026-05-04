@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 import logging
+import os
 
 from database import engine, Base, get_db
 from models import User, UserRole
@@ -14,6 +15,7 @@ from auth import (
     get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from schemas import UserCreate, UserResponse, Token
+from api import tpmpk_router
 
 from routers.assistant import (
     router as assistant_router,
@@ -26,8 +28,12 @@ from routers.certificates import router as certificates_router
 from routers.users import router as users_router
 from routers.appointments import router as appointments_router
 from routers.articles import router as articles_router
-from api import tpmpk_router
-from utils.schema_patch import ensure_certificate_layout_columns
+from utils.schema_patch import (
+    ensure_certificate_layout_columns,
+    ensure_postgresql_extensions,
+    ensure_tpmpk_bot_question_columns,
+    ensure_tpmpk_slot_minutes_range,
+)
 
 from updater import RAGScheduler, UPDATE_INTERVAL_HOURS
 
@@ -37,6 +43,14 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("main")
+
+
+def _cors_origins_from_env() -> list[str]:
+    raw_origins = os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000",
+    )
+    return [origin.strip().rstrip("/") for origin in raw_origins.split(",") if origin.strip()]
 
 # ── Планировщик (глобальный, чтобы была ссылка) ───────────────────────────────
 _scheduler: RAGScheduler | None = None
@@ -76,7 +90,8 @@ app = FastAPI(lifespan=lifespan, title="ИМЦРО API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_cors_origins_from_env(),
+    allow_origin_regex=os.getenv("CORS_ALLOW_ORIGIN_REGEX", r"https?://(localhost|127\.0\.0\.1)(:\d+)?"),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -85,8 +100,11 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+ensure_postgresql_extensions(engine)
 Base.metadata.create_all(bind=engine)
 ensure_certificate_layout_columns(engine)
+ensure_tpmpk_bot_question_columns(engine)
+ensure_tpmpk_slot_minutes_range(engine)
 
 app.include_router(assistant_router)
 app.include_router(certificates_router)
@@ -182,7 +200,10 @@ def _run_reindex_bg():
             logger.info("[reindex] update_state.json удалён")
         except FileNotFoundError:
             pass
+        except Exception as e:
+            logger.warning(f"[reindex] Не удалось удалить update_state.json: {e}")
         state = UpdateState()   # создаём пустой (файла нет — загружает пустой)
+        state.clear()           # гарантируем полный reindex даже если файл состояния остался
 
         # Полная индексация
         stats = incremental_update(
@@ -190,6 +211,7 @@ def _run_reindex_bg():
             embeddings=_EMBEDDINGS,
             state=state,
             on_update_done=_reload,
+            use_site_cache=True,
             progress_cb=progress_cb,
         )
 

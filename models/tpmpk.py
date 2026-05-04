@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     LargeBinary,
     SmallInteger,
     String,
@@ -25,7 +26,10 @@ class TPMPKScheduleTemplate(Base):
     __tablename__ = "tpmpk_schedule_template"
     __table_args__ = (
         CheckConstraint("weekday BETWEEN 0 AND 6", name="tpmpk_schedule_template_weekday_chk"),
-        CheckConstraint("slot_minutes IN (30, 60)", name="tpmpk_schedule_template_slot_minutes_chk"),
+        CheckConstraint(
+            "slot_minutes BETWEEN 10 AND 240 AND slot_minutes % 5 = 0",
+            name="tpmpk_schedule_template_slot_minutes_chk",
+        ),
     )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -41,7 +45,10 @@ class TPMPKScheduleTemplate(Base):
 class TPMPKWorkingDay(Base):
     __tablename__ = "tpmpk_working_day"
     __table_args__ = (
-        CheckConstraint("slot_minutes IN (30, 60)", name="tpmpk_working_day_slot_minutes_chk"),
+        CheckConstraint(
+            "slot_minutes BETWEEN 10 AND 240 AND slot_minutes % 5 = 0",
+            name="tpmpk_working_day_slot_minutes_chk",
+        ),
     )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -66,6 +73,10 @@ class TPMPKAppointment(Base):
             "status IN ('new', 'confirmed', 'cancelled', 'done')",
             name="tpmpk_appointment_status_chk",
         ),
+        CheckConstraint(
+            "document_readiness IN ('full', 'not_ready', 'psychiatrist_consultation')",
+            name="tpmpk_appointment_document_readiness_chk",
+        ),
         CheckConstraint("source IN ('site', 'phone')", name="tpmpk_appointment_source_chk"),
         Index(
             "tpmpk_appointment_slot_uniq",
@@ -81,6 +92,8 @@ class TPMPKAppointment(Base):
     start_time = Column(Time, nullable=False)
     child_full_name = Column(LargeBinary, nullable=False)
     child_age = Column(Integer, nullable=False)
+    child_registered_irkutsk = Column(Boolean, nullable=False)
+    document_readiness = Column(String(40), nullable=False)
     parent_phone = Column(LargeBinary, nullable=False)
     is_repeat = Column(Boolean, nullable=True)
     needs_psychiatrist = Column(Boolean, nullable=True)
@@ -127,7 +140,7 @@ class TPMPKAuditLog(Base):
     action = Column(String(50), nullable=False)
     object_type = Column(String(50), nullable=False)
     object_id = Column(BigInteger, nullable=False)
-    payload = Column(JSONB, nullable=True)
+    payload = Column(JSONB().with_variant(JSON, "sqlite"), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
