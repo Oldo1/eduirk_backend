@@ -45,6 +45,10 @@ YC_ENDPOINT:  str = "https://storage.yandexcloud.net"
 YC_REGION:    str = "ru-central1"
 
 SUPPORTED_DOC_EXTENSIONS: frozenset[str] = frozenset({".pdf", ".docx", ".doc"})
+S3_FILE_CACHE_DIR: str = os.environ.get(
+    "S3_FILE_CACHE_DIR",
+    "./s3_extracted/.cache/s3_documents",
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  OCR (Surya OCR)

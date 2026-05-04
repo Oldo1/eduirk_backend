@@ -65,3 +65,4 @@ docker-compose.*.yml
 # Логи
 *.log
 logs
+tmp_docx_render
