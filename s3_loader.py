@@ -35,12 +35,41 @@ from config import (
 logger = logging.getLogger("s3_loader")
 
 
+def _credentials_are_configured() -> bool:
+    missing = []
+    if not YC_KEY_ID.strip():
+        missing.append("YC_KEY_ID")
+    if not YC_SECRET_KEY.strip():
+        missing.append("YC_SECRET_KEY")
+
+    if missing:
+        logger.error(
+            "[s3] Yandex Object Storage не настроен: отсутствует %s. "
+            "Документы из S3 не будут добавлены в индекс ассистента.",
+            ", ".join(missing),
+        )
+        return False
+
+    if any(ch.isspace() or ch == "/" for ch in YC_KEY_ID):
+        logger.error(
+            "[s3] Некорректный YC_KEY_ID: укажите только идентификатор "
+            "статического ключа доступа, без пробелов, слэшей и без секретного ключа. "
+            "Документы из S3 не будут добавлены в индекс ассистента."
+        )
+        return False
+
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  S3-клиент
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_client():
     """Создаёт boto3-клиент для Yandex Cloud Object Storage."""
+    if not _credentials_are_configured():
+        return None
+
     return boto3.client(
         "s3",
         endpoint_url=YC_ENDPOINT,
@@ -74,6 +103,8 @@ def list_documents(
     """
     s3     = _make_client()
     result: dict[str, str] = {}
+    if s3 is None:
+        return result
 
     try:
         paginator = s3.get_paginator("list_objects_v2")
@@ -132,6 +163,8 @@ def download_file(
         Байты файла или None при ошибке.
     """
     s3 = _make_client()
+    if s3 is None:
+        return None
 
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)

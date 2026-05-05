@@ -50,6 +50,43 @@ S3_FILE_CACHE_DIR: str = os.environ.get(
     "./s3_extracted/.cache/s3_documents",
 )
 
+
+def _env_set(name: str, default: str) -> frozenset[str]:
+    return frozenset(
+        item.strip().lower()
+        for item in os.environ.get(name, default).split(",")
+        if item.strip()
+    )
+
+
+def _env_tuple(name: str, default: str) -> tuple[str, ...]:
+    return tuple(
+        item.strip().lower()
+        for item in os.environ.get(name, default).split(",")
+        if item.strip()
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Доступ к чат-боту
+# ─────────────────────────────────────────────────────────────────────────────
+
+ASSISTANT_EMPLOYEE_ROLE_NAMES: frozenset[str] = _env_set(
+    "ASSISTANT_EMPLOYEE_ROLE_NAMES",
+    "admin,administrator,employee,staff,manager,moderator,editor,"
+    "админ,администратор,сотрудник,работник,модератор,редактор",
+)
+
+ASSISTANT_INTERNAL_S3_PREFIXES: tuple[str, ...] = _env_tuple(
+    "ASSISTANT_INTERNAL_S3_PREFIXES",
+    "internal/,private/,staff/,employee/,employees/,служебные/,внутренние/",
+)
+
+ASSISTANT_INTERNAL_S3_KEYWORDS: tuple[str, ...] = _env_tuple(
+    "ASSISTANT_INTERNAL_S3_KEYWORDS",
+    "internal,private,confidential,staff,employee,служебн,внутренн,конфиденц",
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  OCR (Surya OCR)
 # ─────────────────────────────────────────────────────────────────────────────

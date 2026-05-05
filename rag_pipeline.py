@@ -43,6 +43,11 @@ from sentence_transformers import CrossEncoder
 # (LangChain-обёртка ломает кириллицу при invoke с message-списком)
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
+from assistant_access import (
+    EMPLOYEE_SCOPE,
+    can_access_document,
+    document_access_level,
+)
 
 SITE_CONTEXT_SOURCE = "__site_context__"
 SITE_CONTEXT_PROMPT_LIMIT = 4000
@@ -457,9 +462,71 @@ class RAGSystem:
 
     # ── Шаг 2: поиск + rerank ────────────────────────────────────────────────
 
-    def _retrieve_and_rerank(self, query: str) -> list[Document]:
+    @staticmethod
+    def _normalize_match_text(text: str) -> str:
+        text = (text or "").lower().replace("_", " ")
+        text = re.sub(r"\.(pdf|docx?|xlsx?|txt)\b", " ", text)
+        text = re.sub(r"[^0-9a-zа-яё]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _matches_query_by_title(cls, query: str, doc: Document) -> bool:
+        query_norm = cls._normalize_match_text(query)
+        title = doc.metadata.get("title") or Path(doc.metadata.get("s3_key") or "").name
+        title_norm = cls._normalize_match_text(str(title))
+        if not query_norm or not title_norm:
+            return False
+
+        if title_norm in query_norm:
+            return True
+
+        title_tokens = [
+            token
+            for token in title_norm.split()
+            if len(token) >= 4 and token not in {"документ", "файл"}
+        ]
+        if not title_tokens:
+            return False
+
+        matched = sum(1 for token in title_tokens if token in query_norm)
+        return matched >= min(4, len(title_tokens))
+
+    @classmethod
+    def _find_denied_requested_docs(cls, query: str, docs: list[Document]) -> list[Document]:
+        seen: set[str] = set()
+        matches: list[Document] = []
+        for doc in docs:
+            if not cls._matches_query_by_title(query, doc):
+                continue
+            key = doc.metadata.get("s3_key") or doc.metadata.get("source") or doc.metadata.get("title") or doc.page_content[:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(doc)
+        return matches
+
+    @staticmethod
+    def _access_denied_answer(docs: list[Document]) -> str:
+        title = docs[0].metadata.get("title") or Path(docs[0].metadata.get("s3_key") or "").name or "запрошенный документ"
+        return (
+            f"Документ «{title}» есть в базе знаний, но он относится к внутренним документам. "
+            "Чтобы получить его содержание через ассистента, нужно авторизоваться под учётной записью сотрудника."
+        )
+
+    def _retrieve_and_rerank(self, query: str, access_scope: str) -> tuple[list[Document], list[Document]]:
         candidates = self._base_retriever.invoke(query)
-        return self._reranker.rerank(query, candidates)
+        allowed = [
+            doc for doc in candidates
+            if can_access_document(doc.metadata, access_scope)
+        ]
+        denied = [
+            doc for doc in candidates
+            if not can_access_document(doc.metadata, access_scope)
+        ]
+        denied_count = len(candidates) - len(allowed)
+        if denied_count:
+            print(f"[access] Отфильтровано внутренних чанков: {denied_count}")
+        return self._reranker.rerank(query, allowed), self._find_denied_requested_docs(query, denied)
 
     # ── Шаг 3: форматировать чанки ───────────────────────────────────────────
 
@@ -538,7 +605,10 @@ class RAGSystem:
                 src = doc.metadata.get("page_url", "")
 
             is_site_page = (not is_document) and ("mc.eduirk.ru" in src or bool(breadcrumb))
-            if is_site_page:
+            access_level = document_access_level(doc.metadata)
+            if access_level == "internal":
+                block_label = "ВНУТРЕННИЙ ДОКУМЕНТ ДЛЯ СОТРУДНИКА"
+            elif is_site_page:
                 block_label = "КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ"
             elif is_document:
                 block_label = "СОДЕРЖИМОЕ ДОКУМЕНТА — НИЖЕ ПРИОРИТЕТОМ, ЧЕМ САЙТ"
@@ -567,10 +637,26 @@ class RAGSystem:
 
     # ── Шаг 4: генерировать ответ с историей ─────────────────────────────────
 
-    def _generate_answer(self, question: str, context: str, site_context: str = "") -> str:
+    def _generate_answer(
+        self,
+        question: str,
+        context: str,
+        site_context: str = "",
+        access_scope: str = "public",
+    ) -> str:
+        access_instruction = (
+            "Сейчас открыт контур сотрудника. Можно использовать внутренние документы, "
+            "если они есть в предоставленном тексте. Не раскрывай персональные данные, "
+            "если они не нужны для ответа.\n"
+            if access_scope == EMPLOYEE_SCOPE else
+            "Сейчас открыт публичный контур. Отвечай только по публичным страницам, "
+            "ссылкам и документам. Если запрос касается внутренних документов, "
+            "предложи авторизоваться под учётной записью сотрудника.\n"
+        )
         system_content = (
             "Ты — помощник МКУ «ИМЦРО» (Муниципальное казённое учреждение "
             "развития образования города Иркутска).\n\n"
+            f"{access_instruction}"
             "Отвечай ТОЛЬКО на основе предоставленного текста. Не придумывай факты.\n"
             "Если ответа в тексте нет — честно скажи об этом и предложи позвонить в учреждение.\n"
             "В тексте базы знаний могут быть блоки "
@@ -609,7 +695,7 @@ class RAGSystem:
 
     # ── Основной метод ────────────────────────────────────────────────────────
 
-    def ask(self, question: str) -> dict:
+    def ask(self, question: str, access_scope: str = "public") -> dict:
         """
         Возвращает:
             {
@@ -622,18 +708,34 @@ class RAGSystem:
             raise RuntimeError("Сначала вызовите load_index() или set_vectorstore().")
 
         rewritten = self._rewrite_question(question)
-        top_docs  = self._retrieve_and_rerank(rewritten)
+        top_docs, denied_requested_docs = self._retrieve_and_rerank(rewritten, access_scope)
 
         print(f"[rag] Запрос: {rewritten!r}")
+        print(f"[rag] Контур доступа: {access_scope}")
         print(f"[rag] В контекст попали {len(top_docs)} чанков:")
         for i, doc in enumerate(top_docs, 1):
             src   = doc.metadata.get("source", "")[:90]
             title = doc.metadata.get("title", "")[:60]
             print(f"  {i}. [{title}] {src}")
 
+        if denied_requested_docs and access_scope != EMPLOYEE_SCOPE:
+            answer = self._access_denied_answer(denied_requested_docs)
+            self.memory.save(question, answer)
+            return {
+                "answer":             answer,
+                "rewritten_question": rewritten,
+                "sources":            [],
+                "access_scope":       access_scope,
+            }
+
         site_context = self._site_context_from_docs(top_docs) or self._load_site_context()
         context      = self._format_docs(top_docs, site_context=site_context)
-        answer       = self._generate_answer(rewritten, context, site_context=site_context)
+        answer       = self._generate_answer(
+            rewritten,
+            context,
+            site_context=site_context,
+            access_scope=access_scope,
+        )
 
         self.memory.save(question, answer)
 
@@ -645,14 +747,16 @@ class RAGSystem:
             if url and url not in seen:
                 seen.add(url)
                 sources.append({
-                    "title":  doc.metadata.get("title", ""),
-                    "source": url,
+                    "title":        doc.metadata.get("title", ""),
+                    "source":       url,
+                    "access_level": document_access_level(doc.metadata),
                 })
 
         return {
             "answer":             answer,
             "rewritten_question": rewritten,
             "sources":            sources,
+            "access_scope":       access_scope,
         }
 
     # ── Утилиты ───────────────────────────────────────────────────────────────

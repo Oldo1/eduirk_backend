@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
@@ -34,6 +35,7 @@ from utils.schema_patch import (
     ensure_tpmpk_bot_question_columns,
     ensure_tpmpk_slot_minutes_range,
 )
+from utils.local_docs import local_openapi_docs_html
 
 from updater import RAGScheduler, UPDATE_INTERVAL_HOURS
 
@@ -86,7 +88,7 @@ async def lifespan(app: FastAPI):
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 
-app = FastAPI(lifespan=lifespan, title="ИМЦРО API")
+app = FastAPI(lifespan=lifespan, title="ИМЦРО API", docs_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,6 +101,11 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+def local_docs():
+    return HTMLResponse(local_openapi_docs_html())
 
 ensure_postgresql_extensions(engine)
 Base.metadata.create_all(bind=engine)

@@ -44,6 +44,7 @@ from site_crawler import crawl as crawl_site
 from s3_loader import list_documents as list_s3_documents
 from s3_loader import download_file, public_url
 from doc_extractor import extract_text
+from assistant_access import find_s3_folder_conflicts, infer_s3_access_level
 
 logger = logging.getLogger("updater")
 
@@ -557,7 +558,16 @@ def _update_from_s3(
     Наполняет new_chunks / ids_to_delete. Обновляет state.
     Возвращает статистику.
     """
-    stats = {"added": 0, "skipped": 0, "failed": 0, "cache_hits": 0, "downloaded": 0}
+    stats = {
+        "added": 0,
+        "skipped": 0,
+        "failed": 0,
+        "cache_hits": 0,
+        "downloaded": 0,
+        "conflict_skipped": 0,
+        "folder_conflicts": 0,
+        "conflicted_files": [],
+    }
 
     if progress_cb: progress_cb("s3_list", 0, 0, "Запрашиваю список S3…")
     s3_current = list_s3_documents()   # key → etag (без скачивания)
@@ -565,8 +575,37 @@ def _update_from_s3(
     if progress_cb: progress_cb("s3_list", total, total, f"Всего файлов в бакете: {total}")
     indexed_s3_keys = _get_indexed_metadata_values(vectorstore, "s3_key")
 
+    folder_conflicts = find_s3_folder_conflicts(s3_current.keys())
+    conflict_keys = {
+        key
+        for conflict in folder_conflicts
+        for key in conflict["keys"]
+    }
+    if folder_conflicts:
+        stats["folder_conflicts"] = len(folder_conflicts)
+        stats["conflicted_files"] = folder_conflicts
+        conflict_ids = _get_chunk_ids_by_s3_key(vectorstore, list(conflict_keys))
+        if conflict_ids:
+            ids_to_delete.extend(conflict_ids)
+            logger.warning(
+                f"[s3] Конфликтные документы будут удалены из индекса: "
+                f"{len(conflict_ids)} чанков"
+            )
+        for conflict in folder_conflicts:
+            logger.warning(f"[s3] {conflict['message']}")
+            if progress_cb:
+                progress_cb("s3_conflict", 0, total, conflict["message"])
+            for key in conflict["keys"]:
+                state.remove_s3(key)
+
     for idx, (key, etag) in enumerate(s3_current.items(), start=1):
         filename = Path(key).name
+        if key in conflict_keys:
+            stats["conflict_skipped"] += 1
+            if progress_cb:
+                progress_cb("s3_conflict", idx, total, f"Пропуск конфликта: {filename}")
+            continue
+
         old_etag = state.get_s3_etag(key)
 
         # ETag не изменился — пропускаем
@@ -611,6 +650,7 @@ def _update_from_s3(
         # Создаём новые чанки
         doc_url  = public_url(key)
         doc_type = Path(key).suffix.lower().lstrip(".")
+        access_level = infer_s3_access_level(key)
         chunks   = _make_chunks(
             source=doc_url,
             title=filename,
@@ -618,6 +658,7 @@ def _update_from_s3(
             extra_meta={
                 "s3_key":   key,
                 "doc_type": doc_type,
+                "access_level": access_level,
                 **_site_context_meta(site_context),
             },
         )
@@ -653,6 +694,7 @@ def _update_from_s3(
                 "title":     filename,
                 "s3_key":    key,
                 "doc_type":  doc_type,
+                "access_level": access_level,
                 "is_header": True,
                 **_site_context_meta(site_context),
             },
@@ -666,6 +708,7 @@ def _update_from_s3(
     logger.info(
         f"[s3] Итого: +{stats['added']} новых, "
         f"{stats['skipped']} без изменений, "
+        f"{stats['conflict_skipped']} пропущено из-за конфликта папок, "
         f"{stats['cache_hits']} из cache, "
         f"{stats['downloaded']} скачано, "
         f"{stats['failed']} ошибок"
