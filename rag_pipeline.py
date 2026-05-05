@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+from threading import Lock
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,8 @@ from assistant_access import (
 
 SITE_CONTEXT_SOURCE = "__site_context__"
 SITE_CONTEXT_PROMPT_LIMIT = 4000
+_RERANKER_CACHE: dict[tuple[str, int, float], "CrossEncoderReranker"] = {}
+_RERANKER_CACHE_LOCK = Lock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,6 +275,20 @@ class CrossEncoderReranker:
         return top_docs
 
 
+def get_cached_reranker(model_name: str, top_k: int, threshold: float) -> CrossEncoderReranker:
+    key = (model_name, top_k, threshold)
+    with _RERANKER_CACHE_LOCK:
+        reranker = _RERANKER_CACHE.get(key)
+        if reranker is None:
+            reranker = CrossEncoderReranker(
+                model_name=model_name,
+                top_k=top_k,
+                threshold=threshold,
+            )
+            _RERANKER_CACHE[key] = reranker
+        return reranker
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  RAGSystem
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,7 +389,7 @@ class RAGSystem:
         self._setup()
 
     def _setup(self) -> None:
-        self._reranker = CrossEncoderReranker(
+        self._reranker = get_cached_reranker(
             model_name=self.cfg.reranker_model,
             top_k=self.cfg.top_k,
             threshold=self.cfg.reranker_threshold,

@@ -72,6 +72,9 @@ def get_vectorstore() -> Chroma:
 def init_rag() -> None:
     """Вызывается при старте приложения из lifespan."""
     vs = get_vectorstore()
+    # Прогреваем RAG и reranker на старте, чтобы первый пользовательский
+    # запрос не ждал загрузку модели и не срывался на frontend timeout.
+    get_rag("__warmup__")
     logger.info(f"[assistant] RAG готов. Векторов в базе: {vs._collection.count()}")
 
 
