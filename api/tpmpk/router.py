@@ -34,6 +34,7 @@ DEFAULT_LUNCH_START = time(13, 0)
 DEFAULT_LUNCH_END = time(14, 0)
 DEFAULT_SLOT_MINUTES = 30
 IRKUTSK_TZ = ZoneInfo("Asia/Irkutsk")
+TRANSFERABLE_STATUSES = {"new", "confirmed"}
 
 
 def _irkutsk_now() -> datetime:
@@ -48,6 +49,14 @@ def _is_future_slot_irkutsk(selected_date: date, slot_time: time, now: datetime 
     now = now or _irkutsk_now()
     slot_at = datetime.combine(selected_date, slot_time, tzinfo=IRKUTSK_TZ)
     return slot_at > now
+
+
+def _is_transferable_status(status_value: str | None) -> bool:
+    return status_value in TRANSFERABLE_STATUSES
+
+
+def _keep_source_day_open_after_transfer(day: TPMPKWorkingDay) -> None:
+    day.is_open = True
 
 
 def _build_day_slots(day: TPMPKWorkingDay) -> list:
@@ -639,11 +648,19 @@ def transfer_admin_day(day_id: int, data: DayTransferRequest, db: Session = Depe
         db.query(TPMPKAppointment)
         .filter(
             TPMPKAppointment.working_day_id == source_day.id,
-            TPMPKAppointment.status != "cancelled",
+            TPMPKAppointment.status.in_(TRANSFERABLE_STATUSES),
         )
         .order_by(TPMPKAppointment.start_time.asc())
         .all()
     )
+    if not appointments:
+        return {
+            "status": "no_appointments",
+            "message": "В выбранном дне нет записей для переноса",
+            "moved": [],
+            "not_moved": 0,
+        }
+
     free_slots = _free_slots_for_day(db, target_day)
     if len(free_slots) < len(appointments) and not data.allow_partial:
         return {
@@ -659,7 +676,15 @@ def transfer_admin_day(day_id: int, data: DayTransferRequest, db: Session = Depe
         appointment.start_time = slot_time
         moved.append({"appointment_id": appointment.id, "start_time": _time_to_str(slot_time)})
 
-    source_day.is_open = False
+    if not moved:
+        return {
+            "status": "no_free_slots",
+            "message": "На новую дату нет свободных слотов для переноса",
+            "moved": [],
+            "not_moved": len(appointments),
+        }
+
+    _keep_source_day_open_after_transfer(source_day)
     _log_action(
         db,
         "transfer_day",

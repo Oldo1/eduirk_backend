@@ -6,7 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.tpmpk.router import _is_future_slot_irkutsk, router
+from api.tpmpk.router import _is_future_slot_irkutsk, _is_transferable_status, _keep_source_day_open_after_transfer, router
 from api.tpmpk.schemas import (
     AppointmentCreate,
     AppointmentResponse,
@@ -153,3 +153,21 @@ def test_public_slots_use_irkutsk_time_for_past_filtering():
     assert _is_future_slot_irkutsk(date(2026, 4, 28), time(9, 30), now=now) is False
     assert _is_future_slot_irkutsk(date(2026, 4, 28), time(19, 0), now=now) is True
     assert _is_future_slot_irkutsk(date(2026, 4, 29), time(9, 0), now=now) is True
+
+
+def test_day_transfer_uses_only_active_appointments():
+    assert _is_transferable_status("new") is True
+    assert _is_transferable_status("confirmed") is True
+    assert _is_transferable_status("done") is False
+    assert _is_transferable_status("cancelled") is False
+
+
+def test_day_transfer_keeps_source_day_open():
+    class Day:
+        is_open = True
+
+    day = Day()
+
+    _keep_source_day_open_after_transfer(day)
+
+    assert day.is_open is True
