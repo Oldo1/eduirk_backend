@@ -133,6 +133,17 @@ class GeneratedCertificate(Base):
     generated_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class Appointment(Base):
+    __tablename__ = "appointments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String(200), nullable=False)
+    appointment_date = Column(String(10), nullable=False)
+    appointment_time = Column(String(5), nullable=False)
+    comment = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class TemplateSigner(Base):
     __tablename__ = "template_signers"
     id = Column(Integer, primary_key=True, index=True)
@@ -149,6 +160,7 @@ class TemplateSigner(Base):
 
 
 __all__ = [
+    "Appointment",
     "Article",
     "CertificateTemplate",
     "GeneratedCertificate",

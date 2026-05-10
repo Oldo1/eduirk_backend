@@ -8,12 +8,14 @@ from typing import Optional, List, Dict
 # ====================== Аутентификация ======================
 class UserCreate(BaseModel):
     email: EmailStr
+    username: Optional[str] = Field(None, min_length=2, max_length=100)
     password: str
 
 
 class UserResponse(BaseModel):
     id: int
     email: str
+    username: Optional[str] = None
     is_active: bool
     role: str = "user"
     allowed_methodika_subjects: List[str] = Field(default_factory=list)
@@ -38,10 +40,30 @@ class UserResponse(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    role: Optional[str] = None
+    user: Optional[UserResponse] = None
 
 
 class TokenData(BaseModel):
     email: str | None = None
+
+
+class AppointmentCreate(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=200)
+    appointment_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    appointment_time: str = Field(..., pattern=r"^\d{2}:\d{2}$")
+    comment: Optional[str] = Field(None, max_length=500)
+
+
+class AppointmentResponse(BaseModel):
+    id: int
+    full_name: str
+    appointment_date: str
+    appointment_time: str
+    comment: Optional[str]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 PUBLISHING_SCOPES = {"imcro_only", "dom_uchitelya_only", "both"}

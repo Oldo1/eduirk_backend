@@ -31,6 +31,7 @@ pytrovich
 langchain
 langchain-chroma
 langchain-huggingface
+langchain-text-splitters
 gigachat
 sentence-transformers
 chromadb
@@ -43,5 +44,9 @@ beautifulsoup4
 boto3
 pypdf
 python-docx
+pymupdf
+mammoth
 pytesseract
 pdf2image
+surya-ocr
+bcrypt

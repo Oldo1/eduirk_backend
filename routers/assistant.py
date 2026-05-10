@@ -1,8 +1,13 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from sqlalchemy.orm import Session
+from auth import get_optional_current_user
+from database import get_db
+from models import User, UserRole
 from rag_pipeline import RAGConfig, RAGSystem
+from assistant_access import access_scope_for_role, scoped_session_id
 import logging
 
 logger = logging.getLogger("assistant")
@@ -19,6 +24,8 @@ class AskResponse(BaseModel):
     answer:             str
     rewritten_question: str
     sources:            list[dict]
+    access_scope:       str
+    user_role:          str | None = None
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 
@@ -82,6 +89,13 @@ def get_rag(session_id: str) -> RAGSystem:
     return _sessions[session_id]
 
 
+def _user_role_name(db: Session, user: User | None) -> str | None:
+    if user is None or user.role_id is None:
+        return None
+    role = db.query(UserRole).filter(UserRole.id == user.role_id).first()
+    return role.role_name if role else None
+
+
 def reload_all_sessions(stats: dict | None = None) -> None:
     """
     Вызывается планировщиком после обновления индекса.
@@ -110,21 +124,45 @@ def reload_all_sessions(stats: dict | None = None) -> None:
 # ── Эндпоинты ─────────────────────────────────────────────────────────────────
 
 @router.post("/ask", response_model=AskResponse)
-def ask(body: AskRequest):
-    rag = get_rag(body.session_id)
+def ask(
+    body: AskRequest,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_current_user),
+):
+    role_name = _user_role_name(db, current_user)
+    access_scope = access_scope_for_role(role_name)
+    session_key = scoped_session_id(
+        body.session_id,
+        access_scope,
+        current_user.id if current_user else None,
+    )
+    rag = get_rag(session_key)
     try:
-        result = rag.ask(body.question)
+        result = rag.ask(body.question, access_scope=access_scope)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return AskResponse(
         answer=result["answer"],
         rewritten_question=result["rewritten_question"],
         sources=result["sources"],
+        access_scope=result["access_scope"],
+        user_role=role_name,
     )
 
 
 @router.post("/clear/{session_id}")
-def clear_history(session_id: str):
-    if session_id in _sessions:
-        _sessions[session_id].clear_memory()
+def clear_history(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_current_user),
+):
+    role_name = _user_role_name(db, current_user)
+    access_scope = access_scope_for_role(role_name)
+    session_key = scoped_session_id(
+        session_id,
+        access_scope,
+        current_user.id if current_user else None,
+    )
+    if session_key in _sessions:
+        _sessions[session_key].clear_memory()
     return {"status": "ok"}

@@ -8,6 +8,14 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 
+def ensure_postgresql_extensions(engine: Engine) -> None:
+    if engine.dialect.name != "postgresql":
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
+
+
 def _pg_column_exists(conn, table: str, column: str) -> bool:
     r = conn.execute(
         text(

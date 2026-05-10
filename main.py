@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
@@ -22,16 +22,18 @@ from auth import (
     get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from schemas import UserCreate, UserResponse, Token
-from models import User
+from models import User, UserRole
 from api import tpmpk_router
 from dom_uchitelya import router as dom_uchitelya_router
 from routers.certificates import router as certificates_router
 from routers.users import router as users_router
 from utils.schema_patch import (
     ensure_certificate_layout_columns,
+    ensure_postgresql_extensions,
     ensure_tpmpk_bot_question_columns,
     ensure_tpmpk_slot_minutes_range,
 )
+from utils.local_docs import local_openapi_docs_html
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +48,7 @@ _bg_task_status: dict = {
     "running": False,
     "mode": None,
     "started_at": None,
+    "progress": None,
     "result": None,
     "error": None,
 }
@@ -185,11 +188,23 @@ else:
         return {"status": "disabled", "session_id": session_id}
 
 
-def _run_incremental_bg():
+def _make_progress_cb():
+    def cb(stage: str, current: int, total: int, detail: str = ""):
+        _bg_task_status["progress"] = {
+            "stage": stage,
+            "current": current,
+            "total": total,
+            "detail": detail,
+        }
+
+    return cb
+
+
+def _run_incremental_bg(sources: list[str] | None = None):
     from updater import incremental_update
     from update_state import UpdateState
 
-    _bg_task_status.update({"running": True, "result": None, "error": None})
+    _bg_task_status.update({"running": True, "result": None, "error": None, "progress": None})
     try:
         state = UpdateState()
         stats = incremental_update(
@@ -197,6 +212,8 @@ def _run_incremental_bg():
             embeddings=EMBEDDINGS,
             state=state,
             on_update_done=reload_all_sessions,
+            sources=sources,
+            progress_cb=_make_progress_cb(),
         )
         _bg_task_status["result"] = {"mode": "incremental", "stats": stats}
         logger.info("[update] Incremental update completed")
@@ -205,6 +222,7 @@ def _run_incremental_bg():
         logger.error("[update] Incremental update failed: %s", e, exc_info=True)
     finally:
         _bg_task_status["running"] = False
+        _bg_task_status["progress"] = None
 
 
 def _run_reindex_bg():
@@ -213,10 +231,12 @@ def _run_reindex_bg():
     import routers.assistant as assistant_module
     from routers.assistant import cfg, EMBEDDINGS as assistant_embeddings, reload_all_sessions as reload_sessions
 
-    _bg_task_status.update({"running": True, "result": None, "error": None})
+    _bg_task_status.update({"running": True, "result": None, "error": None, "progress": None})
+    progress_cb = _make_progress_cb()
     try:
         logger.info("[reindex] Starting full reindex for collection %s", cfg.collection_name)
         vectorstore = assistant_module.get_vectorstore()
+        progress_cb("reindex_clear", 0, 0, "Clearing vector index")
 
         try:
             existing_ids = vectorstore._collection.get(include=[])["ids"]
@@ -236,6 +256,8 @@ def _run_reindex_bg():
             embeddings=assistant_embeddings,
             state=state,
             on_update_done=reload_sessions,
+            use_site_cache=True,
+            progress_cb=progress_cb,
         )
         total = vectorstore._collection.count()
         _bg_task_status["result"] = {"mode": "full_reindex", "vectors": total, "stats": stats}
@@ -244,6 +266,7 @@ def _run_reindex_bg():
         logger.error("[reindex] Full reindex failed: %s", e, exc_info=True)
     finally:
         _bg_task_status["running"] = False
+        _bg_task_status["progress"] = None
 
 
 @asynccontextmanager
@@ -265,7 +288,7 @@ async def lifespan(app: FastAPI):
         _scheduler.stop()
 
 
-app = FastAPI(lifespan=lifespan, title="ИМЦРО API")
+app = FastAPI(lifespan=lifespan, title="ИМЦРО API", docs_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -279,6 +302,11 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+@app.get("/docs", include_in_schema=False)
+def local_docs():
+    return HTMLResponse(local_openapi_docs_html())
+
+ensure_postgresql_extensions(engine)
 Base.metadata.create_all(bind=engine)
 ensure_certificate_layout_columns(engine)
 ensure_tpmpk_bot_question_columns(engine)
@@ -345,21 +373,36 @@ def update_status():
     return {"scheduler": scheduler_info, "background": _bg_task_status}
 
 
-@app.post("/admin/update/run")
-def update_run_now(background_tasks: BackgroundTasks):
+def _start_incremental(background_tasks: BackgroundTasks, sources: list[str], mode_label: str):
     if not RAG_ENABLED:
         raise HTTPException(status_code=503, detail="RAG assistant is disabled. Set ENABLE_RAG=true.")
     if _bg_task_status["running"]:
         raise HTTPException(status_code=409, detail=f"Task already running: {_bg_task_status['mode']}")
 
     _bg_task_status.update({
-        "mode": "incremental",
+        "mode": mode_label,
         "started_at": datetime.now().isoformat(),
         "result": None,
         "error": None,
+        "progress": None,
     })
-    background_tasks.add_task(_run_incremental_bg)
-    return {"status": "started", "mode": "incremental"}
+    background_tasks.add_task(_run_incremental_bg, sources)
+    return {"status": "started", "mode": mode_label, "sources": sources}
+
+
+@app.post("/admin/update/run")
+def update_run_now(background_tasks: BackgroundTasks):
+    return _start_incremental(background_tasks, ["site", "s3"], "incremental")
+
+
+@app.post("/admin/update/site")
+def update_site_only(background_tasks: BackgroundTasks):
+    return _start_incremental(background_tasks, ["site"], "incremental_site")
+
+
+@app.post("/admin/update/docs")
+def update_docs_only(background_tasks: BackgroundTasks):
+    return _start_incremental(background_tasks, ["s3"], "incremental_docs")
 
 
 @app.post("/admin/reindex")
@@ -374,9 +417,28 @@ def full_reindex(background_tasks: BackgroundTasks):
         "started_at": datetime.now().isoformat(),
         "result": None,
         "error": None,
+        "progress": None,
     })
     background_tasks.add_task(_run_reindex_bg)
     return {"status": "started", "mode": "full_reindex"}
+
+
+def _user_role_name(db: Session, user: User) -> str | None:
+    if user.role_id is None:
+        return None
+    role = db.query(UserRole).filter(UserRole.id == user.role_id).first()
+    return role.role_name if role else None
+
+
+def _user_response(db: Session, user: User) -> UserResponse:
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        username=user.username,
+        is_active=user.is_active,
+        role=_user_role_name(db, user),
+        allowed_methodika_subjects=getattr(user, "allowed_methodika_subjects", None) or [],
+    )
 
 
 @app.post("/auth/register", response_model=UserResponse, status_code=201)
@@ -384,14 +446,18 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == user_data.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
+    username = user_data.username or user_data.email.split("@")[0]
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=400, detail="Username is already taken")
     user = User(
         email=user_data.email,
+        username=username,
         password_hash=hash_password(user_data.password),
     )
     db.add(user)
     db.commit()
     db.refresh(user)
-    return user
+    return _user_response(db, user)
 
 
 @app.post("/auth/login", response_model=Token)
@@ -399,20 +465,26 @@ def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.email == form_data.username).first()
+    identifier = form_data.username
+    user = (
+        db.query(User)
+        .filter((User.email == identifier) | (User.username == identifier))
+        .first()
+    )
     if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
             status_code=401,
             detail="Неверный email или пароль",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    role_name = _user_role_name(db, user)
     access_token = create_access_token(
-        data={"sub": user.email},
+        data={"sub": user.email, "role": role_name},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    return Token(access_token=access_token)
+    return Token(access_token=access_token, role=role_name, user=_user_response(db, user))
 
 
 @app.get("/auth/me", response_model=UserResponse)
-def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+def get_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return _user_response(db, current_user)

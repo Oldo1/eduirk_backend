@@ -29,6 +29,7 @@ pytrovich
 langchain
 langchain-chroma
 langchain-huggingface
+langchain-text-splitters
 gigachat
 sentence-transformers
 chromadb

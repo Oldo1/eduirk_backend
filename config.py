@@ -24,6 +24,10 @@ SITE_MAX_PAGES:    int   = int(os.environ.get("SITE_MAX_PAGES", "2000"))
 SITE_CRAWL_DELAY:  float = float(os.environ.get("SITE_CRAWL_DELAY", "0.5"))
 SITE_USER_AGENT:   str   = "RAG-Updater/1.0"
 SITE_MIN_TEXT_LEN: int   = 50    # страницы короче этого — пропускаем
+SITE_CACHE_FILE:   str   = os.environ.get(
+    "SITE_CACHE_FILE",
+    "./chroma_gigachat/site_pages_cache.json",
+)
 
 SITE_SKIP_TAGS: frozenset[str] = frozenset(
     {"script", "style", "nav", "footer", "header", "aside", "noscript"}
@@ -41,6 +45,47 @@ YC_ENDPOINT:  str = "https://storage.yandexcloud.net"
 YC_REGION:    str = "ru-central1"
 
 SUPPORTED_DOC_EXTENSIONS: frozenset[str] = frozenset({".pdf", ".docx", ".doc"})
+S3_FILE_CACHE_DIR: str = os.environ.get(
+    "S3_FILE_CACHE_DIR",
+    "./s3_extracted/.cache/s3_documents",
+)
+
+
+def _env_set(name: str, default: str) -> frozenset[str]:
+    return frozenset(
+        item.strip().lower()
+        for item in os.environ.get(name, default).split(",")
+        if item.strip()
+    )
+
+
+def _env_tuple(name: str, default: str) -> tuple[str, ...]:
+    return tuple(
+        item.strip().lower()
+        for item in os.environ.get(name, default).split(",")
+        if item.strip()
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Доступ к чат-боту
+# ─────────────────────────────────────────────────────────────────────────────
+
+ASSISTANT_EMPLOYEE_ROLE_NAMES: frozenset[str] = _env_set(
+    "ASSISTANT_EMPLOYEE_ROLE_NAMES",
+    "admin,administrator,employee,staff,manager,moderator,editor,"
+    "админ,администратор,сотрудник,работник,модератор,редактор",
+)
+
+ASSISTANT_INTERNAL_S3_PREFIXES: tuple[str, ...] = _env_tuple(
+    "ASSISTANT_INTERNAL_S3_PREFIXES",
+    "internal/,private/,staff/,employee/,employees/,служебные/,внутренние/",
+)
+
+ASSISTANT_INTERNAL_S3_KEYWORDS: tuple[str, ...] = _env_tuple(
+    "ASSISTANT_INTERNAL_S3_KEYWORDS",
+    "internal,private,confidential,staff,employee,служебн,внутренн,конфиденц",
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  OCR (Surya OCR)

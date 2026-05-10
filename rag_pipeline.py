@@ -28,8 +28,10 @@ rag_pipeline.py — ядро RAG-системы с reranker'ом и память
 from __future__ import annotations
 
 import os
+import re
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from langchain_chroma import Chroma
@@ -41,6 +43,14 @@ from sentence_transformers import CrossEncoder
 # (LangChain-обёртка ломает кириллицу при invoke с message-списком)
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
+from assistant_access import (
+    EMPLOYEE_SCOPE,
+    can_access_document,
+    document_access_level,
+)
+
+SITE_CONTEXT_SOURCE = "__site_context__"
+SITE_CONTEXT_PROMPT_LIMIT = 4000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +67,7 @@ class RAGConfig:
     model: str             = "GigaChat-Pro"        # GigaChat | GigaChat-Pro | GigaChat-Max
     verify_ssl_certs: bool = False                 # True — если установлен сертификат Минцифры
     max_tokens: int        = 1000
-    temperature: float     = 0.2
+    temperature: float     = 0.1
 
     # ── Векторная база ────────────────────────────────────────────────────────
     persist_dir: str     = "./chroma_gigachat"
@@ -126,6 +136,31 @@ class ConversationMemory:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CrossEncoderReranker:
+    """
+    CrossEncoder-ранжировщик с 4 улучшениями поверх базового rerank:
+
+    1. Title/breadcrumb добавляется в payload для CrossEncoder — модель видит
+       имя документа, а не только голый контент чанка. Резко помогает
+       вопросам, явно упоминающим имя файла.
+    2. Header-чанки (is_header=True) получают boost, когда в запросе
+       встречается имя документа (stem s3_key или title). Так короткие
+       «документ-визитки» стабильно попадают в top при вопросах «расскажи
+       про X / какой email в X / какая дата X».
+    3. Диверсификация по source — не больше MAX_PER_SOURCE чанков из одного
+       документа. Убирает дубли, которые забивали контекст.
+    4. Сигнал низкого качества: если max(scores) очень мал — логируем warning,
+       чтобы было заметно «ничего релевантного не найдено».
+    """
+
+    # Не больше N чанков из одного документа в финальном top_k
+    MAX_PER_SOURCE: int = 2
+    # Порог «низкого качества» для warning-сигнала
+    LOW_QUALITY_THRESHOLD: float = 0.1
+    # Бусты при совпадении имени документа в запросе
+    HEADER_BOOST:        float = 1.0   # header-чанк + совпадение имени
+    FILENAME_MATCH_BOOST: float = 0.3   # обычный чанк + совпадение имени
+    TITLE_MATCH_BOOST:    float = 0.2   # совпадение title (для не-S3 страниц)
+
     def __init__(self, model_name: str, top_k: int, threshold: float = 0.0):
         print(f"[reranker] Загрузка модели: {model_name}")
         self._model     = CrossEncoder(model_name, max_length=512)
@@ -133,29 +168,106 @@ class CrossEncoderReranker:
         self._threshold = threshold
         print(f"[reranker] Готово. top-{top_k}, порог скора: {threshold}")
 
+    @staticmethod
+    def _enrich_payload(doc: Document) -> str:
+        """Склеивает title + breadcrumb + content для подачи в CrossEncoder.
+        Так модель видит, из какого документа чанк, а не только голый текст."""
+        title      = (doc.metadata.get("title")      or "").strip()
+        breadcrumb = (doc.metadata.get("breadcrumb") or "").strip()
+
+        header_parts = []
+        if title:
+            header_parts.append(title)
+        if breadcrumb:
+            header_parts.append(breadcrumb)
+
+        if header_parts:
+            return f"{' | '.join(header_parts)}\n{doc.page_content}"
+        return doc.page_content
+
+    @staticmethod
+    def _normalize(s: str) -> str:
+        """Нормализует строку для сравнения: lower, подчёркивания→пробелы,
+        схлопывание пробелов. Помогает матчить «О_проведении_мероприятия» и
+        «о проведении мероприятия»."""
+        s = s.lower().replace("_", " ")
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _compute_boost(self, query_norm: str, doc: Document) -> float:
+        """Добавка к скору за совпадение имени документа/title в запросе."""
+        s3_key = doc.metadata.get("s3_key") or ""
+        title  = doc.metadata.get("title")  or ""
+
+        if s3_key:
+            stem_norm = self._normalize(Path(s3_key).stem)
+            if stem_norm and stem_norm in query_norm:
+                return self.HEADER_BOOST if doc.metadata.get("is_header") else self.FILENAME_MATCH_BOOST
+
+        if title and len(title) > 5:
+            title_norm = self._normalize(title)
+            if title_norm in query_norm:
+                return self.TITLE_MATCH_BOOST
+
+        return 0.0
+
     def rerank(self, query: str, docs: list[Document]) -> list[Document]:
         if not docs:
             return docs
 
-        pairs  = [(query, doc.page_content) for doc in docs]
-        scores = self._model.predict(pairs)
+        # 1. CrossEncoder-скор с обогащённым payload
+        pairs       = [(query, self._enrich_payload(doc)) for doc in docs]
+        base_scores = [float(s) for s in self._model.predict(pairs)]
 
-        scored_docs = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        # 2. Бусты за совпадение имени документа в запросе
+        query_norm = self._normalize(query)
+        boosted_scores = [
+            base + self._compute_boost(query_norm, doc)
+            for base, doc in zip(base_scores, docs)
+        ]
 
-        # Отбрасываем чанки ниже порога
-        filtered = [(score, doc) for score, doc in scored_docs if score >= self._threshold]
+        scored = sorted(zip(boosted_scores, docs), key=lambda x: x[0], reverse=True)
 
-        # Если после фильтрации ничего не осталось — берём хотя бы лучший чанк
+        # 3. Диверсификация: не больше MAX_PER_SOURCE чанков из одного source
+        per_source: dict[str, int] = {}
+        diversified: list[tuple[float, Document]] = []
+        for score, doc in scored:
+            key = (
+                doc.metadata.get("s3_key")
+                or doc.metadata.get("page_url")
+                or doc.metadata.get("source", "")
+            )
+            if per_source.get(key, 0) >= self.MAX_PER_SOURCE:
+                continue
+            diversified.append((score, doc))
+            per_source[key] = per_source.get(key, 0) + 1
+
+        # 4. Фильтр по порогу (с защитой от пустого результата)
+        filtered = [(s, d) for s, d in diversified if s >= self._threshold]
         if not filtered:
-            filtered = scored_docs[:1]
+            filtered = diversified[:1]
 
         top_docs = [doc for _, doc in filtered[: self._top_k]]
 
+        # Сигнал низкого качества ретривала
+        max_score = scored[0][0] if scored else 0.0
+        if max_score < self.LOW_QUALITY_THRESHOLD:
+            print(
+                f"[reranker] ⚠ Низкое качество (max score={max_score:.3f}) — "
+                "возможно, в базе нет релевантного контента"
+            )
+
+        # Лог: показываем и base, и итоговый скор (если был буст)
         print("[reranker] Топ результаты:")
-        for score, doc in scored_docs[: self._top_k]:
+        shown = diversified[: self._top_k] if diversified else scored[: self._top_k]
+        for score, doc in shown:
             mark  = "✓" if score >= self._threshold else "✗"
-            title = doc.metadata.get("title", "")[:45]
-            print(f"  {mark} {score:+.3f}  {title}")
+            title = (doc.metadata.get("title") or "")[:45]
+            idx   = docs.index(doc)
+            base  = base_scores[idx]
+            delta = score - base
+            extra = f"  (base {base:+.3f} +{delta:.2f})" if abs(delta) > 1e-6 else ""
+            tag   = " [HDR]" if doc.metadata.get("is_header") else ""
+            print(f"  {mark} {score:+.3f}  {title}{tag}{extra}")
 
         return top_docs
 
@@ -303,11 +415,17 @@ class RAGSystem:
             "им ", "ему ", "ней ", "них ", "ним ",
             "этот ", "эта ", "это ", "эти ",
             "тот ", "та ", "те ", "том ",
-            "там ", "тогда ", "тут ",
+            "там ", "тогда ", "тут ", "здесь",
             "про него", "про неё", "про них", "про это",
             "о нём", "о ней", "о них",
             "подробнее", "ещё про", "а ещё", "а как насчёт",
             "расскажи ещё", "что ещё",
+            # Ссылки на ранее упомянутый документ/файл/положение
+            "в документе", "из документа", "документа?", "документе?",
+            "в файле", "из файла", "файла?",
+            "в положении", "положения?",
+            "в тексте", "из текста",
+            "в нём", "в ней", "в них",
         ]
         q_lower = question.lower()
         has_anaphora = any(marker in q_lower for marker in ANAPHORA_MARKERS)
@@ -344,25 +462,161 @@ class RAGSystem:
 
     # ── Шаг 2: поиск + rerank ────────────────────────────────────────────────
 
-    def _retrieve_and_rerank(self, query: str) -> list[Document]:
+    @staticmethod
+    def _normalize_match_text(text: str) -> str:
+        text = (text or "").lower().replace("_", " ")
+        text = re.sub(r"\.(pdf|docx?|xlsx?|txt)\b", " ", text)
+        text = re.sub(r"[^0-9a-zа-яё]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _matches_query_by_title(cls, query: str, doc: Document) -> bool:
+        query_norm = cls._normalize_match_text(query)
+        title = doc.metadata.get("title") or Path(doc.metadata.get("s3_key") or "").name
+        title_norm = cls._normalize_match_text(str(title))
+        if not query_norm or not title_norm:
+            return False
+
+        if title_norm in query_norm:
+            return True
+
+        title_tokens = [
+            token
+            for token in title_norm.split()
+            if len(token) >= 4 and token not in {"документ", "файл"}
+        ]
+        if not title_tokens:
+            return False
+
+        matched = sum(1 for token in title_tokens if token in query_norm)
+        return matched >= min(4, len(title_tokens))
+
+    @classmethod
+    def _find_denied_requested_docs(cls, query: str, docs: list[Document]) -> list[Document]:
+        seen: set[str] = set()
+        matches: list[Document] = []
+        for doc in docs:
+            if not cls._matches_query_by_title(query, doc):
+                continue
+            key = doc.metadata.get("s3_key") or doc.metadata.get("source") or doc.metadata.get("title") or doc.page_content[:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(doc)
+        return matches
+
+    @staticmethod
+    def _access_denied_answer(docs: list[Document]) -> str:
+        title = docs[0].metadata.get("title") or Path(docs[0].metadata.get("s3_key") or "").name or "запрошенный документ"
+        return (
+            f"Документ «{title}» есть в базе знаний, но он относится к внутренним документам. "
+            "Чтобы получить его содержание через ассистента, нужно авторизоваться под учётной записью сотрудника."
+        )
+
+    def _retrieve_and_rerank(self, query: str, access_scope: str) -> tuple[list[Document], list[Document]]:
         candidates = self._base_retriever.invoke(query)
-        return self._reranker.rerank(query, candidates)
+        allowed = [
+            doc for doc in candidates
+            if can_access_document(doc.metadata, access_scope)
+        ]
+        denied = [
+            doc for doc in candidates
+            if not can_access_document(doc.metadata, access_scope)
+        ]
+        denied_count = len(candidates) - len(allowed)
+        if denied_count:
+            print(f"[access] Отфильтровано внутренних чанков: {denied_count}")
+        return self._reranker.rerank(query, allowed), self._find_denied_requested_docs(query, denied)
 
     # ── Шаг 3: форматировать чанки ───────────────────────────────────────────
 
     @staticmethod
-    def _format_docs(docs: list[Document]) -> str:
-        parts = []
+    def _limit_site_context(text: str) -> str:
+        text = re.sub(r"\s+", " ", text or "").strip()
+        if len(text) <= SITE_CONTEXT_PROMPT_LIMIT:
+            return text
+        return text[:SITE_CONTEXT_PROMPT_LIMIT].rsplit(" ", 1)[0].rstrip() + "..."
+
+    @classmethod
+    def _site_context_from_docs(cls, docs: list[Document]) -> str:
+        contexts: list[str] = []
+        seen: set[str] = set()
+        for doc in docs:
+            candidates = []
+            if doc.metadata.get("source") == SITE_CONTEXT_SOURCE:
+                candidates.append(doc.page_content)
+            if doc.metadata.get("site_context"):
+                candidates.append(doc.metadata["site_context"])
+
+            for candidate in candidates:
+                context = cls._limit_site_context(candidate)
+                if context and context not in seen:
+                    contexts.append(context)
+                    seen.add(context)
+
+        return cls._limit_site_context("\n\n".join(contexts))
+
+    def _load_site_context(self) -> str:
+        if self._vectorstore is None:
+            return ""
+
+        try:
+            existing = self._vectorstore.get(
+                where={"source": SITE_CONTEXT_SOURCE},
+                include=["documents", "metadatas"],
+            )
+        except TypeError:
+            existing = self._vectorstore.get(include=["documents", "metadatas"])
+        except Exception as e:
+            print(f"[site-context] Не удалось прочитать контекст сайта: {e}")
+            return ""
+
+        documents = existing.get("documents") or []
+        metadatas = existing.get("metadatas") or []
+        for text, meta in zip(documents, metadatas):
+            if (meta or {}).get("source") == SITE_CONTEXT_SOURCE:
+                return self._limit_site_context(text or "")
+        return ""
+
+    @staticmethod
+    def _format_docs(docs: list[Document], site_context: str = "") -> str:
+        site_parts = []
+        document_parts = []
+        other_parts = []
+
+        if site_context:
+            site_parts.append(
+                "[КРАТКИЙ КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ]\n"
+                f"{site_context.strip()}"
+            )
+
         for doc in docs:
             src        = doc.metadata.get("source", "")
             title      = doc.metadata.get("title", "")
             breadcrumb = doc.metadata.get("breadcrumb", "")
+            is_document = bool(doc.metadata.get("s3_key") or doc.metadata.get("doc_type"))
+
+            if src == SITE_CONTEXT_SOURCE:
+                continue
+
             # Для навигационных чанков реальный URL живёт в page_url,
             # а в source хранится псевдо-ключ __nav__.
             if src.startswith("__"):
                 src = doc.metadata.get("page_url", "")
 
+            is_site_page = (not is_document) and ("mc.eduirk.ru" in src or bool(breadcrumb))
+            access_level = document_access_level(doc.metadata)
+            if access_level == "internal":
+                block_label = "ВНУТРЕННИЙ ДОКУМЕНТ ДЛЯ СОТРУДНИКА"
+            elif is_site_page:
+                block_label = "КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ"
+            elif is_document:
+                block_label = "СОДЕРЖИМОЕ ДОКУМЕНТА — НИЖЕ ПРИОРИТЕТОМ, ЧЕМ САЙТ"
+            else:
+                block_label = "ФРАГМЕНТ БАЗЫ ЗНАНИЙ"
+
             header_parts = []
+            header_parts.append(block_label)
             if title:
                 header_parts.append(title)
             if src:
@@ -370,19 +624,60 @@ class RAGSystem:
             if breadcrumb:
                 header_parts.append(f"Путь: {breadcrumb}")
             header = f"[{' | '.join(header_parts)}]" if header_parts else ""
-            parts.append(f"{header}\n{doc.page_content}".strip())
-        return "\n\n---\n\n".join(parts)
+            block = f"{header}\n{doc.page_content}".strip()
+
+            if is_site_page:
+                site_parts.append(block)
+            elif is_document:
+                document_parts.append(block)
+            else:
+                other_parts.append(block)
+
+        return "\n\n---\n\n".join(site_parts + document_parts + other_parts)
 
     # ── Шаг 4: генерировать ответ с историей ─────────────────────────────────
 
-    def _generate_answer(self, question: str, context: str) -> str:
+    def _generate_answer(
+        self,
+        question: str,
+        context: str,
+        site_context: str = "",
+        access_scope: str = "public",
+    ) -> str:
+        access_instruction = (
+            "Сейчас открыт контур сотрудника. Можно использовать внутренние документы, "
+            "если они есть в предоставленном тексте. Не раскрывай персональные данные, "
+            "если они не нужны для ответа.\n"
+            if access_scope == EMPLOYEE_SCOPE else
+            "Сейчас открыт публичный контур. Отвечай только по публичным страницам, "
+            "ссылкам и документам. Если запрос касается внутренних документов, "
+            "предложи авторизоваться под учётной записью сотрудника.\n"
+        )
         system_content = (
             "Ты — помощник МКУ «ИМЦРО» (Муниципальное казённое учреждение "
             "развития образования города Иркутска).\n\n"
+            f"{access_instruction}"
             "Отвечай ТОЛЬКО на основе предоставленного текста. Не придумывай факты.\n"
             "Если ответа в тексте нет — честно скажи об этом и предложи позвонить в учреждение.\n"
+            "В тексте базы знаний могут быть блоки "
+            "«КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ», "
+            "«КРАТКИЙ КОНТЕКСТ САЙТА — ПРИОРИТЕТНЫЙ» и "
+            "«СОДЕРЖИМОЕ ДОКУМЕНТА — НИЖЕ ПРИОРИТЕТОМ, ЧЕМ САЙТ».\n"
+            "Сначала ориентируйся на краткое описание, аннотацию, раздел, навигацию "
+            "и сведения со страниц сайта mc.eduirk.ru. Содержимое PDF/DOCX используй "
+            "как подробности только там, где сайт не даёт ответа.\n"
+            "Если описание, дата, статус, назначение или формулировки документа расходятся "
+            "с контекстом сайта, в ответе бери информацию с сайта и не повторяй "
+            "противоречивые сведения из документа.\n"
+            "Если пользователь просит рассказать про документ, начинай с того, как он "
+            "описан/размещён на сайте, а уже затем добавляй детали из самого файла.\n"
+            "Не выдавай дату из текста PDF/DOCX как актуальную дату описания документа, "
+            "если эта дата не подтверждена контекстом сайта.\n"
             "Учитывай историю диалога — не повторяй то, что уже было сказано.\n"
             "Отвечай на русском языке, кратко и по делу.\n"
+            "Не используй Markdown-разметку в ответе. Не используй звёздочки `*` "
+            "для выделения, жирного текста, курсива или списков. Если нужен список, "
+            "оформляй пункты обычным текстом через дефис и пробел: \"- пункт\".\n"
             "Если есть даты, телефоны, ссылки — обязательно укажи их.\n"
             "Если пользователь спрашивает как найти или перейти на страницу — "
             "укажи прямую ссылку (URL) из текста базы знаний и опиши путь навигации "
@@ -400,7 +695,7 @@ class RAGSystem:
 
     # ── Основной метод ────────────────────────────────────────────────────────
 
-    def ask(self, question: str) -> dict:
+    def ask(self, question: str, access_scope: str = "public") -> dict:
         """
         Возвращает:
             {
@@ -413,17 +708,34 @@ class RAGSystem:
             raise RuntimeError("Сначала вызовите load_index() или set_vectorstore().")
 
         rewritten = self._rewrite_question(question)
-        top_docs  = self._retrieve_and_rerank(rewritten)
+        top_docs, denied_requested_docs = self._retrieve_and_rerank(rewritten, access_scope)
 
         print(f"[rag] Запрос: {rewritten!r}")
+        print(f"[rag] Контур доступа: {access_scope}")
         print(f"[rag] В контекст попали {len(top_docs)} чанков:")
         for i, doc in enumerate(top_docs, 1):
             src   = doc.metadata.get("source", "")[:90]
             title = doc.metadata.get("title", "")[:60]
             print(f"  {i}. [{title}] {src}")
 
-        context   = self._format_docs(top_docs)
-        answer    = self._generate_answer(rewritten, context)
+        if denied_requested_docs and access_scope != EMPLOYEE_SCOPE:
+            answer = self._access_denied_answer(denied_requested_docs)
+            self.memory.save(question, answer)
+            return {
+                "answer":             answer,
+                "rewritten_question": rewritten,
+                "sources":            [],
+                "access_scope":       access_scope,
+            }
+
+        site_context = self._site_context_from_docs(top_docs) or self._load_site_context()
+        context      = self._format_docs(top_docs, site_context=site_context)
+        answer       = self._generate_answer(
+            rewritten,
+            context,
+            site_context=site_context,
+            access_scope=access_scope,
+        )
 
         self.memory.save(question, answer)
 
@@ -435,14 +747,16 @@ class RAGSystem:
             if url and url not in seen:
                 seen.add(url)
                 sources.append({
-                    "title":  doc.metadata.get("title", ""),
-                    "source": url,
+                    "title":        doc.metadata.get("title", ""),
+                    "source":       url,
+                    "access_level": document_access_level(doc.metadata),
                 })
 
         return {
             "answer":             answer,
             "rewritten_question": rewritten,
             "sources":            sources,
+            "access_scope":       access_scope,
         }
 
     # ── Утилиты ───────────────────────────────────────────────────────────────
