@@ -322,6 +322,31 @@ def test_admin_article_attachment_upload_accepts_documents(client):
     assert payload["url"].startswith("/static/articles/attachments/")
 
 
+def test_admin_articles_alias_routes_match_news_routes(client):
+    routes = {
+        (route.path, tuple(sorted(route.methods or [])))
+        for route in client.app.routes
+        if getattr(route, "path", "").startswith("/api/admin/")
+    }
+
+    expected_routes = {
+        ("/api/admin/news/", ("GET",)),
+        ("/api/admin/news/", ("POST",)),
+        ("/api/admin/news/{article_id}/", ("PATCH",)),
+        ("/api/admin/news/{article_id}/", ("DELETE",)),
+        ("/api/admin/news/upload-cover/", ("POST",)),
+        ("/api/admin/news/upload-attachment/", ("POST",)),
+        ("/api/admin/articles/", ("GET",)),
+        ("/api/admin/articles/", ("POST",)),
+        ("/api/admin/articles/{article_id}/", ("PATCH",)),
+        ("/api/admin/articles/{article_id}/", ("DELETE",)),
+        ("/api/admin/articles/upload-cover/", ("POST",)),
+        ("/api/admin/articles/upload-attachment/", ("POST",)),
+    }
+
+    assert expected_routes <= routes
+
+
 def test_public_hub_endpoint_filters_by_hub_and_section(client):
     _add_article_obj(
         client,

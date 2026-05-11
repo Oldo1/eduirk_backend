@@ -406,6 +406,7 @@ def get_hub_news(
     return _query_public_hub_news(db, COMMON_PUBLIC_SCOPES, hub, section, subject, limit, offset)
 
 
+@router.get("/api/admin/articles/", response_model=ArticleListResponse)
 @router.get("/api/admin/news/", response_model=ArticleListResponse)
 def list_common_admin_news(
     role_name: str = Depends(require_common_admin),
@@ -415,6 +416,7 @@ def list_common_admin_news(
     return _query_admin_news(db, role_name=role_name, user=current_user)
 
 
+@router.post("/api/admin/articles/", response_model=ArticleResponse, status_code=201)
 @router.post("/api/admin/news/", response_model=ArticleResponse, status_code=201)
 def create_common_admin_news(
     data: ArticleCreate,
@@ -429,6 +431,7 @@ def create_common_admin_news(
     return _create_article(db, payload, role_name=role_name, author_id=getattr(current_user, "id", None))
 
 
+@router.patch("/api/admin/articles/{article_id}/", response_model=ArticleResponse)
 @router.patch("/api/admin/news/{article_id}/", response_model=ArticleResponse)
 def update_common_admin_news(
     article_id: int,
@@ -444,6 +447,7 @@ def update_common_admin_news(
     return _update_article(db, article_id, data, role_name=role_name)
 
 
+@router.delete("/api/admin/articles/{article_id}/", status_code=204)
 @router.delete("/api/admin/news/{article_id}/", status_code=204)
 def delete_common_admin_news(
     article_id: int,
@@ -512,6 +516,7 @@ def delete_domu_admin_news(
     return None
 
 
+@router.post("/api/admin/articles/upload-cover/")
 @router.post("/api/admin/news/upload-cover/")
 async def upload_common_article_cover(
     file: UploadFile = File(...),
@@ -520,6 +525,7 @@ async def upload_common_article_cover(
     return {"url": await _save_article_cover(file)}
 
 
+@router.post("/api/admin/articles/upload-attachment/")
 @router.post("/api/admin/news/upload-attachment/")
 async def upload_common_article_attachment(
     file: UploadFile = File(...),
