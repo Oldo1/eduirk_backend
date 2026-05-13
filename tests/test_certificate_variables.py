@@ -7,7 +7,6 @@ from io import BytesIO
 from types import SimpleNamespace
 
 os.environ["DATABASE_URL"] = f"sqlite:///{tempfile.gettempdir()}/mky_certificate_variables_test.db"
-os.environ["ENABLE_RAG"] = "false"
 
 import pandas as pd
 from fastapi.testclient import TestClient

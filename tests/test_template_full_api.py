@@ -5,7 +5,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 os.environ["DATABASE_URL"] = f"sqlite:///{tempfile.gettempdir()}/mky_template_full_test.db"
-os.environ["ENABLE_RAG"] = "false"
 
 from fastapi.testclient import TestClient
 

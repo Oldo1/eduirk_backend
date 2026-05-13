@@ -1,52 +1,30 @@
-# ====================================
-# Зависимости для Docker (production-like)
-# ====================================
+# Backend dependencies
 
-# Основной фреймворк
 fastapi
 uvicorn[standard]
 
-# База данных
+# Database and migrations
 sqlalchemy
 psycopg2-binary
 alembic
 
-# Аутентификация
+# Authentication and forms
 python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
+bcrypt
 
-# Pydantic
+# Validation
 pydantic
 pydantic[email]
 
-# Генерация грамот (PDF) + обработка изображений
+# Certificates and office files
 reportlab
 Pillow
 pandas
 openpyxl
 pytrovich
 
-# RAG-система (чат-помощник)
-langchain
-langchain-chroma
-langchain-huggingface
-langchain-text-splitters
-gigachat
-sentence-transformers
-chromadb
-
-# Дополнительно
+# Runtime helpers
 python-dotenv
 httpx
-requests
-beautifulsoup4
-boto3
-pypdf
-python-docx
-pymupdf
-mammoth
-pytesseract
-pdf2image
-surya-ocr
-bcrypt
