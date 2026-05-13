@@ -3,16 +3,16 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
-      POSTGRES_DB: ${DB_NAME:-eduirk_db}
+      POSTGRES_USER: ${DB_USER:-mky_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mky_password}
+      POSTGRES_DB: ${DB_NAME:-mky_db}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
       # Можно убрать, если БД не нужна снаружи
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-eduirk_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-mky_user} -d ${DB_NAME:-mky_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -21,22 +21,23 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-change-me}@db:5432/${DB_NAME:-eduirk_db}
-      DB_USER: ${DB_USER:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-change-me}
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-mky_user}:${DB_PASSWORD:-mky_password}@db:5432/${DB_NAME:-mky_db}
+      DB_USER: ${DB_USER:-mky_user}
+      DB_PASSWORD: ${DB_PASSWORD:-mky_password}
       DB_HOST: db
       DB_PORT: 5432
-      DB_NAME: ${DB_NAME:-eduirk_db}
+      DB_NAME: ${DB_NAME:-mky_db}
       SECRET_KEY: ${SECRET_KEY:-change-this-secret-in-dev}
       PD_ENCRYPTION_KEY: ${PD_ENCRYPTION_KEY:-change-this-key-in-dev}
       ENABLE_DEV_TEST_USERS: "${ENABLE_DEV_TEST_USERS:-true}"
     depends_on:
       db:
         condition: service_healthy
+    command: >
+      sh -c "python -m alembic upgrade head &&
+             uvicorn main:app --host 0.0.0.0 --port 8000"
     ports:
-      # Снаружи 8001 — потому что 8000 занят соседним контейнером (gamehub_backend).
-      # При обращении к API используй http://localhost:8001
-      - "8001:8000"
+      - "8000:8000"
     volumes:
       # Persistent certificate assets.
       - ./static/certificates/backgrounds:/app/static/certificates/backgrounds

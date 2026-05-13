@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sys
+from getpass import getpass
 
 from sqlalchemy import inspect, text
 
@@ -14,6 +16,25 @@ LOGIN = os.getenv("ADMIN_EMAIL", "admin@example.local")
 USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PASSWORD = os.getenv("ADMIN_PASSWORD")
 ROLE = os.getenv("ADMIN_ROLE", "admin")
+
+
+def resolve_admin_password() -> str:
+    if PASSWORD:
+        return PASSWORD
+
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "ADMIN_PASSWORD is not set. Set it in the environment for non-interactive runs, "
+            "or run python create_admin.py in an interactive terminal to enter it securely."
+        )
+
+    password = getpass("Admin password: ")
+    if not password:
+        raise SystemExit("Admin password cannot be empty.")
+    confirmation = getpass("Repeat admin password: ")
+    if password != confirmation:
+        raise SystemExit("Admin passwords do not match.")
+    return password
 
 
 def migrate_users_table() -> None:
@@ -41,8 +62,7 @@ def migrate_users_table() -> None:
 
 
 def main() -> None:
-    if not PASSWORD:
-        raise SystemExit("Set ADMIN_PASSWORD before running create_admin.py")
+    password = resolve_admin_password()
 
     Base.metadata.create_all(bind=engine)
     migrate_users_table()
@@ -60,7 +80,7 @@ def main() -> None:
 
         user = db.query(User).filter_by(email=LOGIN).first()
         if user:
-            user.password_hash = hash_password(PASSWORD)
+            user.password_hash = hash_password(password)
             user.role_id = role.id
             user.is_active = True
             user.username = USERNAME
@@ -70,7 +90,7 @@ def main() -> None:
         else:
             user = User(
                 email=LOGIN,
-                password_hash=hash_password(PASSWORD),
+                password_hash=hash_password(password),
                 username=USERNAME,
                 is_active=True,
                 role_id=role.id,

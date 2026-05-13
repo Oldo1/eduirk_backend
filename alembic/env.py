@@ -3,10 +3,11 @@ import os
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
+from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
 from alembic import context
-from database import Base, DATABASE_URL
+from database import Base, DATABASE_URL, format_database_connection_error
 import models  # noqa: F401
 
 # this is the Alembic Config object, which provides
@@ -69,8 +70,17 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
 
-    with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+    try:
+        connection_context = connectable.connect()
+    except (UnicodeDecodeError, SQLAlchemyError) as exc:
+        raise RuntimeError(format_database_connection_error(exc, DATABASE_URL)) from None
+
+    with connection_context as connection:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+        )
 
         with context.begin_transaction():
             context.run_migrations()

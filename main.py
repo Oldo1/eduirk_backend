@@ -8,13 +8,20 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from difflib import SequenceMatcher
 
 load_dotenv()
 
-from database import engine, Base, get_db, SessionLocal
+from database import (
+    engine,
+    Base,
+    get_db,
+    SessionLocal,
+    format_database_connection_error,
+)
 from dev_seed import ensure_dev_test_users
 from auth import (
     hash_password, verify_password, create_access_token,
@@ -159,14 +166,21 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def local_docs():
     return HTMLResponse(local_openapi_docs_html())
 
-ensure_postgresql_extensions(engine)
-Base.metadata.create_all(bind=engine)
-ensure_certificate_layout_columns(engine)
-ensure_tpmpk_bot_question_columns(engine)
-ensure_tpmpk_slot_minutes_range(engine)
-ensure_tpmpk_duplicate_guard(engine)
-with SessionLocal() as seed_db:
-    ensure_dev_test_users(seed_db)
+def initialize_database() -> None:
+    try:
+        ensure_postgresql_extensions(engine)
+        Base.metadata.create_all(bind=engine)
+        ensure_certificate_layout_columns(engine)
+        ensure_tpmpk_bot_question_columns(engine)
+        ensure_tpmpk_slot_minutes_range(engine)
+        ensure_tpmpk_duplicate_guard(engine)
+        with SessionLocal() as seed_db:
+            ensure_dev_test_users(seed_db)
+    except (UnicodeDecodeError, SQLAlchemyError) as exc:
+        raise RuntimeError(format_database_connection_error(exc)) from None
+
+
+initialize_database()
 
 app.include_router(certificates_router)
 app.include_router(users_router)

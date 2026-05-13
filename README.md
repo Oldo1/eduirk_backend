@@ -1,108 +1,83 @@
 # Backend MKY / EduIrk
 
-Backend портала MKY / EduIrk написан на FastAPI и отвечает за API сайта, авторизацию, серверные роли, статьи и новости, разделы Дома учителя, запись на ТПМПК, журнал действий, шаблоны и генерацию грамот.
+FastAPI backend для проекта MKY / EduIrk: API, авторизация, роли, статьи, разделы Дома учителя, запись ТПМПК, шаблоны и генерация грамот.
 
+## Docker
 
-## Возможности
-
-- JWT-авторизация.
-- Серверная проверка ролей и прав доступа.
-- Роли `admin`, `methodist`, `domu_editor`, `operator`, `user`.
-- Управление статьями, новостями и публикациями Дома учителя.
-- Проверка владения и области публикации статей на backend.
-- Публичная запись на ТПМПК/консультации с защитой от дублей.
-- Административная панель ТПМПК, журнал действий и служебные API для оператора.
-- Шаблоны грамот, конструктор шаблонов и генерация PDF.
-- Лёгкий `/api/search/` для подсказок навигации по страницам сайта.
-
-## Переменные окружения
-
-Создайте `.env` из `.env.example`:
+Из корня backend-репозитория:
 
 ```bash
-copy .env.example .env
+docker compose config
+docker compose up --build
 ```
 
-Для Linux/macOS:
+Docker поднимает PostgreSQL и backend. Перед стартом backend автоматически выполняет миграции Alembic.
 
-```bash
-cp .env.example .env
-```
+Адреса:
 
-Основные переменные:
+- API: http://localhost:8000
+- Swagger/OpenAPI: http://localhost:8000/docs
 
-- `DATABASE_URL` - полная строка подключения к PostgreSQL.
-- `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME` - параметры БД, если не используется `DATABASE_URL`.
-- `SECRET_KEY` - секрет JWT. В реальном окружении заменить на уникальное значение.
-- `PD_ENCRYPTION_KEY` - ключ для защиты персональных данных. В реальном окружении заменить.
-- `ENABLE_DEV_TEST_USERS=true` - включает локальные демонстрационные аккаунты.
-- `ADMIN_EMAIL`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `ADMIN_ROLE` - данные администратора.
+## Локальный Запуск
 
-В `.env.example` должны быть только безопасные placeholder-значения. Не коммитьте реальные `.env`, секреты, дампы БД, локальные базы, логи, кеши, сгенерированные грамоты и загруженные тестовые файлы.
-
-## Локальный запуск
-
-```bash
-cd backend
+```powershell
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
+copy .env.example .env
+```
+
+Поднимите PostgreSQL с данными из `.env.example`:
+
+```bash
+docker run --name mky-postgres -e POSTGRES_USER=mky_user -e POSTGRES_PASSWORD=mky_password -e POSTGRES_DB=mky_db -p 5432:5432 -d postgres:16
+```
+
+Затем:
+
+```powershell
 alembic upgrade head
 python create_admin.py
 uvicorn main:app --reload
 ```
 
-Для Linux/macOS:
+`create_admin.py` спросит пароль интерактивно, если `ADMIN_PASSWORD` не задан.
 
-```bash
-source venv/bin/activate
+PowerShell:
+
+```powershell
+$env:ADMIN_PASSWORD="admin123"
+python create_admin.py
 ```
 
-После запуска:
+CMD:
 
-- API: [http://localhost:8000](http://localhost:8000)
-- Swagger/OpenAPI: [http://localhost:8000/docs](http://localhost:8000/docs)
+```cmd
+set ADMIN_PASSWORD=admin123
+python create_admin.py
+```
 
-## Тестовые пользователи
-
-Если включено `ENABLE_DEV_TEST_USERS=true`, при старте доступны демонстрационные пользователи:
-
-- `admin@example.local` / `admin123` / `admin`
-- `methodist@example.local` / `methodist123` / `methodist`
-- `domu@example.local` / `domu123` / `domu_editor`
-- `operator@example.local` / `operator123` / `operator`
-- `user@example.local` / `user123` / `user`
-
-## Тесты
-
-Полная проверка:
+Linux/macOS:
 
 ```bash
+ADMIN_PASSWORD=admin123 python create_admin.py
+```
+
+## DATABASE_URL
+
+Рабочий локальный пример из `.env.example`:
+
+```env
+DATABASE_URL=postgresql+psycopg2://mky_user:mky_password@localhost:5432/mky_db
+```
+
+Если `DATABASE_URL` не задан, backend собирает строку подключения из `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME`. Также поддерживаются `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`.
+
+## Проверки
+
+```bash
+alembic upgrade head
 pytest -q
 ```
 
-Targeted-проверки по ключевым зонам:
-
-```bash
-pytest -q tests/test_security_roles.py tests/test_tpmpk_api.py tests/test_dom_uchitelya_api.py
-pytest -q tests/test_template_full_api.py tests/test_certificate_variables.py tests/test_auth_roles.py
-```
-
-## Docker
-
-Запуск backend с PostgreSQL из директории `backend`:
-
-```bash
-docker compose config
-docker compose up --build
-```
-
-Запуск всего проекта из корня репозитория:
-
-```bash
-cd ..
-docker compose config
-docker compose up --build
-```
-
-Docker-конфигурация не содержит Chroma/vector/RAG volumes и не требует GigaChat-ключей.
+Backend не требует RAG/Chroma/GigaChat/vector-зависимостей и не использует `ENABLE_RAG`.
