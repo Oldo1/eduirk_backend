@@ -12,11 +12,25 @@ docker compose up --build
 ```
 
 Docker поднимает PostgreSQL и backend. Перед стартом backend автоматически выполняет миграции Alembic.
+PostgreSQL доступен внутри Docker-сети как `db:5432`; наружу публикуется только backend-порт `8000`, чтобы не конфликтовать с локальным PostgreSQL на `5432`.
 
 Адреса:
 
 - API: http://localhost:8000
 - Swagger/OpenAPI: http://localhost:8000/docs
+
+### Если PostgreSQL ругается на роль mky_user
+
+PostgreSQL создаёт `POSTGRES_USER`, `POSTGRES_PASSWORD` и `POSTGRES_DB` только при первом создании volume. Если раньше проект запускался со старыми данными, старый volume может содержать другого пользователя.
+
+Самый быстрый сброс dev-базы:
+
+```bash
+docker compose down -v
+docker compose up --build
+```
+
+Текущий compose использует явный volume `eduirk_backend_mky_pgdata`, чтобы не цеплять старый `backend_pgdata`.
 
 ## Локальный Запуск
 
@@ -62,6 +76,18 @@ Linux/macOS:
 ```bash
 ADMIN_PASSWORD=admin123 python create_admin.py
 ```
+
+## Тестовые Пользователи
+
+При `ENABLE_DEV_TEST_USERS=true` backend автоматически создаёт dev-аккаунты:
+
+- `admin@mky.test` / `admin123` / `admin`
+- `methodist@mky.test` / `methodist123` / `methodist`
+- `domu@mky.test` / `domu123` / `domu_editor`
+- `operator@mky.test` / `operator123` / `operator`
+- `user@mky.test` / `user123` / `user`
+
+Если frontend пишет `Failed to fetch`, сначала проверьте, что backend отвечает на http://localhost:8000/docs.
 
 ## DATABASE_URL
 
