@@ -106,20 +106,3 @@ docker compose up --build
 ```
 
 Docker-конфигурация не содержит Chroma/vector/RAG volumes и не требует GigaChat-ключей.
-
-## RAG и чат-бот
-
-Backend RAG/assistant намеренно удалён из этой ветки. В backend нет маршрутов `/assistant`, `/api/assistant`, `/rag`, `/api/rag`, `/search/rag`, нет Chroma, vector store, embeddings, LangChain и GigaChat-зависимостей.
-
-Frontend содержит только демонстрационный чат-бот. Он показывает быстрые подсказки и статические ответы для навигации по порталу, но не отправляет запросы на backend assistant/RAG endpoints.
-
-## Проверка чистоты перед коммитом
-
-```bash
-git status --short
-git diff --name-only
-git diff --stat
-git ls-files | grep -Ei "(\.env|dev\.db|dump|backup|__pycache__|\.pytest_cache|coverage|node_modules|dist|build|\.log|sqlite|generated|uploads|chroma|rag|gigachat|vector)"
-```
-
-В нормальном состоянии в git не должны попадать секреты, локальные базы, дампы, кеши, `__pycache__`, `.pytest_cache`, логи и тяжёлые артефакты.
