@@ -39,6 +39,7 @@ def ensure_certificate_layout_columns(engine: Engine) -> None:
 
     alters_pg: list[tuple[str, str, str]] = [
         ("users", "is_active", "BOOLEAN DEFAULT TRUE NOT NULL"),
+        ("users", "full_name", "VARCHAR(200)"),
         ("certificate_templates", "signers_block_x_mm", "DOUBLE PRECISION DEFAULT 105"),
         ("certificate_templates", "signers_row_height_mm", "DOUBLE PRECISION DEFAULT 32"),
         ("certificate_templates", "signers_band_width_mm", "DOUBLE PRECISION DEFAULT 168"),
@@ -65,6 +66,7 @@ def ensure_certificate_layout_columns(engine: Engine) -> None:
 
     alters_sqlite: list[tuple[str, str, str]] = [
         ("users", "is_active", "BOOLEAN DEFAULT 1 NOT NULL"),
+        ("users", "full_name", "TEXT"),
         ("certificate_templates", "signers_block_x_mm", "REAL DEFAULT 105"),
         ("certificate_templates", "signers_row_height_mm", "REAL DEFAULT 32"),
         ("certificate_templates", "signers_band_width_mm", "REAL DEFAULT 168"),

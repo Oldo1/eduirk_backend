@@ -16,6 +16,7 @@ class UserResponse(BaseModel):
     id: int
     email: str
     username: Optional[str] = None
+    full_name: Optional[str] = None
     is_active: bool
     role: str = "user"
     allowed_methodika_subjects: List[str] = Field(default_factory=list)

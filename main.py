@@ -240,6 +240,7 @@ def _user_response(db: Session, user: User) -> UserResponse:
         id=user.id,
         email=user.email,
         username=user.username,
+        full_name=getattr(user, "full_name", None),
         is_active=user.is_active,
         role=_user_role_name(db, user),
         allowed_methodika_subjects=getattr(user, "allowed_methodika_subjects", None) or [],

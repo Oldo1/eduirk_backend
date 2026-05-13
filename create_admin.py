@@ -14,6 +14,7 @@ from models import User, UserRole
 
 LOGIN = os.getenv("ADMIN_EMAIL", "admin@example.local")
 USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+FULL_NAME = os.getenv("ADMIN_FULL_NAME", "Кузнецова Марина Андреевна")
 PASSWORD = os.getenv("ADMIN_PASSWORD")
 ROLE = os.getenv("ADMIN_ROLE", "admin")
 
@@ -48,6 +49,8 @@ def migrate_users_table() -> None:
             conn.execute(text("ALTER TABLE users RENAME COLUMN hashed_password TO password_hash"))
         if "username" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(100)"))
+        if "full_name" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN full_name VARCHAR(200)"))
         if "role_id" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN role_id INTEGER REFERENCES user_role(id)"))
         if "created_at" not in cols:
@@ -84,6 +87,7 @@ def main() -> None:
             user.role_id = role.id
             user.is_active = True
             user.username = USERNAME
+            user.full_name = FULL_NAME
             db.commit()
             db.refresh(user)
             print(f"Updated user: {user.email} (id={user.id}, role_id={user.role_id})")
@@ -92,6 +96,7 @@ def main() -> None:
                 email=LOGIN,
                 password_hash=hash_password(password),
                 username=USERNAME,
+                full_name=FULL_NAME,
                 is_active=True,
                 role_id=role.id,
             )

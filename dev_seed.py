@@ -15,30 +15,35 @@ DEV_TEST_USERS = [
     {
         "email": "user@mky.test",
         "username": "smirnov_ap",
+        "full_name": "Смирнов Алексей Петрович",
         "password": "user123",
         "role": "user",
     },
     {
         "email": "methodist@mky.test",
         "username": "abramova_iv",
+        "full_name": "Абрамова Ирина Владимировна",
         "password": "methodist123",
         "role": "methodist",
     },
     {
         "email": "operator@mky.test",
         "username": "tpmpk_operator",
+        "full_name": "Петрова Ольга Сергеевна",
         "password": "operator123",
         "role": "operator",
     },
     {
         "email": "admin@mky.test",
         "username": "admin_mky",
+        "full_name": "Кузнецова Марина Андреевна",
         "password": "admin123",
         "role": "admin",
     },
     {
         "email": "domu@mky.test",
         "username": "domu_editor",
+        "full_name": "Соколова Елена Павловна",
         "password": "domu123",
         "role": "domu_editor",
     },
@@ -91,6 +96,7 @@ def ensure_dev_test_users(
             user = User(
                 email=credentials["email"],
                 username=credentials["username"],
+                full_name=credentials.get("full_name"),
                 password_hash=hash_password(credentials["password"]),
                 is_active=True,
                 role_id=role.id,
@@ -99,6 +105,7 @@ def ensure_dev_test_users(
             continue
 
         user.username = credentials["username"]
+        user.full_name = credentials.get("full_name")
         user.is_active = True
         user.role_id = role.id
         if not verify_password(credentials["password"], user.password_hash):

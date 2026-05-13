@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from auth import get_current_user
 from database import Base, get_db
 from dom_uchitelya.router import router
-from models import Article
+from models import Article, User
 
 
 @pytest.fixture()
@@ -141,6 +141,38 @@ def test_public_news_sorts_pinned_then_newest_and_hides_scheduled(client):
 
     assert response.status_code == 200
     assert [item["title"] for item in response.json()["items"]] == ["Older pinned", "Newest normal"]
+
+
+def test_article_author_name_prefers_full_name(client):
+    db = client.SessionLocal()
+    try:
+        author = User(
+            email="author@example.test",
+            username="author_login",
+            full_name="Кузнецова Марина Андреевна",
+            password_hash="hash",
+            is_active=True,
+        )
+        db.add(author)
+        db.flush()
+        article = Article(
+            title="Author display",
+            slug="author-display",
+            status="published",
+            publishing_scope="imcro_only",
+            author_id=author.id,
+            published_at=datetime.now(timezone.utc),
+        )
+        db.add(article)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/news/")
+
+    assert response.status_code == 200
+    payload = response.json()["items"][0]
+    assert payload["author_name"] == "Кузнецова Марина Андреевна"
 
 
 def test_public_events_returns_only_marked_articles(client):

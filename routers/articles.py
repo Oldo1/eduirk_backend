@@ -110,7 +110,7 @@ def _serialize(article: Article, db: Session) -> dict:
         "created_at":   article.created_at.isoformat() if article.created_at else None,
         "updated_at":   article.updated_at.isoformat() if article.updated_at else None,
         "status":       {"id": status.id, "name": status.name} if status else None,
-        "author":       {"id": author.id, "email": author.email, "username": author.username} if author else None,
+        "author":       {"id": author.id, "email": author.email, "username": author.username, "full_name": getattr(author, "full_name", None)} if author else None,
         "categories":   [{"id": c.id, "name": c.name, "slug": c.slug} for c in cats],
         "tags":         [{"id": t.id, "name": t.name, "slug": t.slug} for t in tags],
         "category_ids": [c.id for c in cats],
