@@ -1,38 +1,47 @@
 # Backend MKY / EduIrk
 
-FastAPI backend for the municipal education portal. The backend covers authentication, server-side roles, articles and news administration, Dom Uchitelya sections, TPMPK appointments and audit tools, certificate templates, and certificate generation.
+Backend портала MKY / EduIrk написан на FastAPI и отвечает за API сайта, авторизацию, серверные роли, статьи и новости, разделы Дома учителя, запись на ТПМПК, журнал действий, шаблоны и генерацию грамот.
 
-This protected branch does not include heavy backend RAG/search/assistant code. It starts without Chroma, vector stores, embeddings, GigaChat, LangChain, or any special RAG toggle. The frontend keeps only a lightweight demo chatbot UI that does not call backend assistant endpoints.
+В этой ветке тяжёлый backend RAG/assistant полностью исключён из защищаемой версии. Backend запускается без Chroma, vector store, embeddings, LangChain, GigaChat и без переменной `ENABLE_RAG`. Демонстрационный чат-бот находится только во frontend и не обращается к backend assistant API.
 
-## Main Features
+## Возможности
 
-- JWT authentication and role-based access control.
-- Admin, methodist, Dom Uchitelya editor, TPMPK operator, and regular user roles.
-- Article/news editor with server-side ownership and scope checks.
-- TPMPK public appointment form with duplicate protection.
-- TPMPK admin dashboard and action log.
-- Certificate templates, template constructor API, and PDF generation.
-- Local `/api/search/` page suggestion endpoint for site navigation.
+- JWT-авторизация.
+- Серверная проверка ролей и прав доступа.
+- Роли `admin`, `methodist`, `domu_editor`, `operator`, `user`.
+- Управление статьями, новостями и публикациями Дома учителя.
+- Проверка владения и области публикации статей на backend.
+- Публичная запись на ТПМПК/консультации с защитой от дублей.
+- Административная панель ТПМПК, журнал действий и служебные API для оператора.
+- Шаблоны грамот, конструктор шаблонов и генерация PDF.
+- Лёгкий `/api/search/` для подсказок навигации по страницам сайта.
 
-## Environment
+## Переменные окружения
 
-Create `.env` from `.env.example` and change placeholder secrets:
+Создайте `.env` из `.env.example`:
+
+```bash
+copy .env.example .env
+```
+
+Для Linux/macOS:
 
 ```bash
 cp .env.example .env
 ```
 
-Important variables:
+Основные переменные:
 
-- `DATABASE_URL` or `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME`
-- `SECRET_KEY`
-- `PD_ENCRYPTION_KEY`
-- `ENABLE_DEV_TEST_USERS=true` for local demo accounts
-- `ADMIN_EMAIL`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `ADMIN_ROLE`
+- `DATABASE_URL` - полная строка подключения к PostgreSQL.
+- `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME` - параметры БД, если не используется `DATABASE_URL`.
+- `SECRET_KEY` - секрет JWT. В реальном окружении заменить на уникальное значение.
+- `PD_ENCRYPTION_KEY` - ключ для защиты персональных данных. В реальном окружении заменить.
+- `ENABLE_DEV_TEST_USERS=true` - включает локальные демонстрационные аккаунты.
+- `ADMIN_EMAIL`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `ADMIN_ROLE` - данные администратора.
 
-Do not commit `.env`, local databases, dumps, logs, caches, generated certificates, or uploaded test files.
+В `.env.example` должны быть только безопасные placeholder-значения. Не коммитьте реальные `.env`, секреты, дампы БД, локальные базы, логи, кеши, сгенерированные грамоты и загруженные тестовые файлы.
 
-## Local Run
+## Локальный запуск
 
 ```bash
 cd backend
@@ -44,13 +53,20 @@ python create_admin.py
 uvicorn main:app --reload
 ```
 
-Open API docs at [http://localhost:8000/docs](http://localhost:8000/docs).
+Для Linux/macOS:
 
-For local demonstration you can also use seeded test accounts by keeping `ENABLE_DEV_TEST_USERS=true` in `.env`.
+```bash
+source venv/bin/activate
+```
 
-## Test Users
+После запуска:
 
-When dev seed is enabled, these accounts are available:
+- API: [http://localhost:8000](http://localhost:8000)
+- Swagger/OpenAPI: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+## Тестовые пользователи
+
+Если включено `ENABLE_DEV_TEST_USERS=true`, при старте доступны демонстрационные пользователи:
 
 - `admin@example.local` / `admin123` / `admin`
 - `methodist@example.local` / `methodist123` / `methodist`
@@ -58,27 +74,53 @@ When dev seed is enabled, these accounts are available:
 - `operator@example.local` / `operator123` / `operator`
 - `user@example.local` / `user123` / `user`
 
-## Tests
+## Тесты
+
+Полная проверка:
 
 ```bash
 pytest -q
+```
+
+Targeted-проверки по ключевым зонам:
+
+```bash
 pytest -q tests/test_security_roles.py tests/test_tpmpk_api.py tests/test_dom_uchitelya_api.py
 pytest -q tests/test_template_full_api.py tests/test_certificate_variables.py tests/test_auth_roles.py
 ```
 
 ## Docker
 
-From this directory:
+Запуск backend с PostgreSQL из директории `backend`:
 
 ```bash
 docker compose config
 docker compose up --build
 ```
 
-From the project root, use the root `docker-compose.yml` to start backend, frontend, and PostgreSQL together.
+Запуск всего проекта из корня репозитория:
 
-## Notes About RAG / Chatbot
+```bash
+cd ..
+docker compose config
+docker compose up --build
+```
 
-Backend RAG/assistant is intentionally removed from this branch. There are no backend `/assistant`, `/api/assistant`, `/rag`, Chroma, vector store, embeddings, LangChain, or GigaChat requirements.
+Docker-конфигурация не содержит Chroma/vector/RAG volumes и не требует GigaChat-ключей.
 
-The frontend chatbot is a demonstration interface only. It answers with static navigation hints and clearly states that the intelligent assistant is not connected in this protected version.
+## RAG и чат-бот
+
+Backend RAG/assistant намеренно удалён из этой ветки. В backend нет маршрутов `/assistant`, `/api/assistant`, `/rag`, `/api/rag`, `/search/rag`, нет Chroma, vector store, embeddings, LangChain и GigaChat-зависимостей.
+
+Frontend содержит только демонстрационный чат-бот. Он показывает быстрые подсказки и статические ответы для навигации по порталу, но не отправляет запросы на backend assistant/RAG endpoints.
+
+## Проверка чистоты перед коммитом
+
+```bash
+git status --short
+git diff --name-only
+git diff --stat
+git ls-files | grep -Ei "(\.env|dev\.db|dump|backup|__pycache__|\.pytest_cache|coverage|node_modules|dist|build|\.log|sqlite|generated|uploads|chroma|rag|gigachat|vector)"
+```
+
+В нормальном состоянии в git не должны попадать секреты, локальные базы, дампы, кеши, `__pycache__`, `.pytest_cache`, логи и тяжёлые артефакты.

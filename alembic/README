@@ -1,1 +1,11 @@
-Generic single-database configuration.
+Каталог миграций Alembic для backend MKY / EduIrk.
+
+Основные команды выполняются из директории `backend`:
+
+```bash
+alembic upgrade head
+alembic revision --autogenerate -m "описание миграции"
+alembic downgrade -1
+```
+
+Перед созданием новой миграции проверьте актуальность моделей SQLAlchemy и подключение к базе данных через `.env`.
