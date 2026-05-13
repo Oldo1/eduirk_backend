@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from io import BytesIO
+from types import SimpleNamespace
 
 os.environ["DATABASE_URL"] = f"sqlite:///{tempfile.gettempdir()}/mky_certificate_variables_test.db"
 os.environ["ENABLE_RAG"] = "false"
@@ -11,6 +12,7 @@ os.environ["ENABLE_RAG"] = "false"
 import pandas as pd
 from fastapi.testclient import TestClient
 
+from auth import get_current_user
 from database import Base, engine
 from main import app
 from utils.certificate_text import apply_variables, extract_placeholders
@@ -30,8 +32,17 @@ def _xlsx_bytes(rows: list[dict[str, str]]) -> bytes:
 
 class CertificateVariablesTest(unittest.TestCase):
     def setUp(self):
+        app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+            id=10,
+            email="methodist@example.test",
+            role="methodist",
+            is_active=True,
+        )
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
+
+    def tearDown(self):
+        app.dependency_overrides.clear()
 
     def test_extract_placeholders_returns_unique_names_in_order(self):
         text = "{ФИО} учится в {Класс}. {ФИО} {broken"

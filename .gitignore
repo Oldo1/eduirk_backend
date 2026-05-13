@@ -1,18 +1,20 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 
-# Виртуальные окружения
+# Virtual environments
 .venv/
 .venv-*/
 venv/
 env/
 
-# Секреты и локальная конфигурация
+# Secrets and local configuration
 .env
-.env.local
+.env.*
+!.env.example
 *.pem
 *.key
 
@@ -22,22 +24,34 @@ env/
 .claude/
 *.swp
 
-# Кэши OCR и индексов
+# Runtime caches and extracted indexes
 ocr_cache/
 chroma_gigachat/
 s3_extracted/
+cache/
+logs/
 
-# Логи и состояние
+# Logs and state
 *.log
 update_state.json
 uvicorn.*.log
 
-# Локальные БД и бэкапы
+# Local databases and backups
 dev.db
+*.db
 *.sqlite
 *.sqlite3
 backups/
 *.dump
+
+# Generated uploads and runtime media
+media/
+uploads/
+static/articles/attachments/
+static/certificates/backgrounds/
+static/certificates/facsimiles/
+static/certificates/generated/
+static/fonts/custom/
 
 # OS
 .DS_Store

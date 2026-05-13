@@ -1,16 +1,23 @@
-"""Создаёт роль 'admin' и пользователя admin/admin. Идемпотентно."""
-from sqlalchemy import inspect, text
-from database import SessionLocal, engine, Base
-from models import User, UserRole
-from auth import hash_password
+"""Create or update an admin user from environment variables."""
 
-LOGIN = "admin"
-PASSWORD = "admin"
-ROLE = "admin"
+from __future__ import annotations
+
+import os
+
+from sqlalchemy import inspect, text
+
+from auth import hash_password
+from database import Base, SessionLocal, engine
+from models import User, UserRole
+
+LOGIN = os.getenv("ADMIN_EMAIL", "admin@example.local")
+USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+PASSWORD = os.getenv("ADMIN_PASSWORD")
+ROLE = os.getenv("ADMIN_ROLE", "admin")
 
 
 def migrate_users_table() -> None:
-    """Подтягивает таблицу users к актуальной схеме models.User."""
+    """Bring the users table in line with models.User for older databases."""
     insp = inspect(engine)
     if "users" not in insp.get_table_names():
         return
@@ -34,6 +41,9 @@ def migrate_users_table() -> None:
 
 
 def main() -> None:
+    if not PASSWORD:
+        raise SystemExit("Set ADMIN_PASSWORD before running create_admin.py")
+
     Base.metadata.create_all(bind=engine)
     migrate_users_table()
     db = SessionLocal()
@@ -44,31 +54,31 @@ def main() -> None:
             db.add(role)
             db.commit()
             db.refresh(role)
-            print(f"Создана роль: {role.role_name} (id={role.id})")
+            print(f"Created role: {role.role_name} (id={role.id})")
         else:
-            print(f"Роль уже существует: {role.role_name} (id={role.id})")
+            print(f"Role already exists: {role.role_name} (id={role.id})")
 
         user = db.query(User).filter_by(email=LOGIN).first()
         if user:
             user.password_hash = hash_password(PASSWORD)
             user.role_id = role.id
             user.is_active = True
-            user.username = LOGIN
+            user.username = USERNAME
             db.commit()
             db.refresh(user)
-            print(f"Обновлён пользователь: {user.email} (id={user.id}, role_id={user.role_id})")
+            print(f"Updated user: {user.email} (id={user.id}, role_id={user.role_id})")
         else:
             user = User(
                 email=LOGIN,
                 password_hash=hash_password(PASSWORD),
-                username=LOGIN,
+                username=USERNAME,
                 is_active=True,
                 role_id=role.id,
             )
             db.add(user)
             db.commit()
             db.refresh(user)
-            print(f"Создан пользователь: {user.email} (id={user.id}, role_id={user.role_id})")
+            print(f"Created user: {user.email} (id={user.id}, role_id={user.role_id})")
     finally:
         db.close()
 

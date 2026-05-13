@@ -191,6 +191,93 @@ def test_domu_editor_can_manage_domu_scoped_news_but_not_common_admin(client):
     assert denied.status_code == 403
 
 
+def test_admin_sees_all_articles_but_methodist_sees_only_own(client):
+    _add_article_obj(client, title="Admin article", slug="admin-article", author_id=20)
+    _add_article_obj(client, title="Methodist article", slug="methodist-article", author_id=21)
+    _add_article_obj(client, title="Other methodist article", slug="other-methodist-article", author_id=22)
+
+    app = client.app
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=1, email="admin@example.test", role="admin")
+    admin_response = client.get("/api/admin/news/")
+
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=21, email="methodist@example.test", role="methodist")
+    methodist_response = client.get("/api/admin/news/")
+
+    assert admin_response.status_code == 200
+    assert {item["title"] for item in admin_response.json()["items"]} == {
+        "Admin article",
+        "Methodist article",
+        "Other methodist article",
+    }
+    assert methodist_response.status_code == 200
+    assert [item["title"] for item in methodist_response.json()["items"]] == ["Methodist article"]
+
+
+def test_methodist_cannot_update_or_delete_foreign_article(client):
+    foreign_id = _add_article_obj(client, title="Foreign article", slug="foreign-article", author_id=22)
+
+    app = client.app
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=21, email="methodist@example.test", role="methodist")
+
+    patch_response = client.patch(f"/api/admin/news/{foreign_id}/", json={"title": "Changed"})
+    delete_response = client.delete(f"/api/admin/news/{foreign_id}/")
+
+    assert patch_response.status_code == 403
+    assert delete_response.status_code == 403
+
+
+def test_domu_editor_sees_only_own_domu_articles_and_cannot_manage_foreign(client):
+    own_id = _add_article_obj(
+        client,
+        title="Own domu article",
+        slug="own-domu-article",
+        author_id=31,
+        publishing_scope="both",
+        dom_uchitelya_section="master-klassy",
+    )
+    foreign_id = _add_article_obj(
+        client,
+        title="Foreign domu article",
+        slug="foreign-domu-article",
+        author_id=32,
+        publishing_scope="dom_uchitelya_only",
+        dom_uchitelya_section="master-klassy",
+    )
+    _add_article_obj(
+        client,
+        title="Own common article",
+        slug="own-common-article",
+        author_id=31,
+        publishing_scope="imcro_only",
+    )
+
+    app = client.app
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=31, email="domu@example.test", role="domu_editor")
+
+    list_response = client.get("/api/admin/dom-uchitelya/news/")
+    patch_response = client.patch(f"/api/admin/dom-uchitelya/news/{foreign_id}/", json={"title": "Changed"})
+    delete_response = client.delete(f"/api/admin/dom-uchitelya/news/{foreign_id}/")
+    wrong_section_response = client.post(
+        "/api/admin/dom-uchitelya/news/",
+        json={
+            "title": "Wrong hub",
+            "slug": "wrong-hub",
+            "status": "published",
+            "publishing_scope": "both",
+            "dom_uchitelya_section": "master-klassy",
+            "hub_kind": "methodika",
+            "hub_path": "metodicheskiy-sovet",
+        },
+    )
+
+    assert own_id
+    assert list_response.status_code == 200
+    assert [item["title"] for item in list_response.json()["items"]] == ["Own domu article"]
+    assert patch_response.status_code == 403
+    assert delete_response.status_code == 403
+    assert wrong_section_response.status_code == 403
+
+
 def test_admin_article_crud_accepts_block_body_taxonomy_fields(client):
     app = client.app
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=12, email="admin@example.test", role="admin")

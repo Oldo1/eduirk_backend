@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-root}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
       POSTGRES_DB: ${DB_NAME:-eduirk_db}
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -20,12 +20,18 @@ services:
   app:
     build: .
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
-      # Внутри docker-сети БД доступна по имени сервиса, а не localhost
+      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-change-me}@db:5432/${DB_NAME:-eduirk_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
       DB_HOST: db
       DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-eduirk_db}
+      SECRET_KEY: ${SECRET_KEY:-change-this-secret-in-dev}
+      PD_ENCRYPTION_KEY: ${PD_ENCRYPTION_KEY:-change-this-key-in-dev}
+      ENABLE_RAG: "${ENABLE_RAG:-false}"
+      ENABLE_DEV_TEST_USERS: "${ENABLE_DEV_TEST_USERS:-true}"
+      GIGACHAT_CREDENTIALS: "${GIGACHAT_CREDENTIALS:-}"
     depends_on:
       db:
         condition: service_healthy
@@ -42,7 +48,6 @@ services:
       - ./static/certificates/backgrounds:/app/static/certificates/backgrounds
       - ./static/certificates/facsimiles:/app/static/certificates/facsimiles
       - ./static/certificates/generated:/app/static/certificates/generated
-      - ./update_state.json:/app/update_state.json
       # Кэш HuggingFace/Surya моделей — named volume, чтобы не засорять репозиторий
       - hf_cache:/cache/huggingface
 

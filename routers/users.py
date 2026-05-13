@@ -6,8 +6,13 @@ from database import get_db
 from models import User, UserRole
 from schemas import UserCreate, UserResponse
 from auth import hash_password
+from permissions import require_admin_user
 
-router = APIRouter(prefix="/users", tags=["users"])
+router = APIRouter(
+    prefix="/users",
+    tags=["users"],
+    dependencies=[Depends(require_admin_user)],
+)
 
 
 # ====================== ПОЛУЧЕНИЕ ПОЛЬЗОВАТЕЛЕЙ ======================

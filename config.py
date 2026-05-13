@@ -14,6 +14,7 @@ import os
 # ─────────────────────────────────────────────────────────────────────────────
 
 UPDATE_INTERVAL_HOURS: float = float(os.environ.get("UPDATE_INTERVAL_HOURS", "24"))
+GIGACHAT_CREDENTIALS: str = os.environ.get("GIGACHAT_CREDENTIALS", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Краулер сайта

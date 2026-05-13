@@ -2,22 +2,31 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ["DATABASE_URL"] = f"sqlite:///{tempfile.gettempdir()}/mky_template_full_test.db"
 os.environ["ENABLE_RAG"] = "false"
 
 from fastapi.testclient import TestClient
 
+from auth import get_current_user
 from database import Base, engine
 from main import app
 
 
 class TemplateFullApiTest(unittest.TestCase):
     def setUp(self):
+        app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+            id=10,
+            email="methodist@example.test",
+            role="methodist",
+            is_active=True,
+        )
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
 
     def tearDown(self):
+        app.dependency_overrides.clear()
         for path in Path("static/fonts/custom").glob("*_CustomSans.ttf"):
             path.unlink(missing_ok=True)
 

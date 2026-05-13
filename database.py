@@ -4,15 +4,15 @@ from sqlalchemy.ext.declarative import declarative_base
 from dotenv import load_dotenv
 import os
 
-# Загружаем переменные из .env файла
+# Load local environment variables when a developer has a private .env file.
 load_dotenv()
 
-# === ИЗМЕНИ ЭТИ ДАННЫЕ НА СВОИ ===
-DB_USER = os.getenv("DB_USER", "postgres")           # твой логин
-DB_PASSWORD = os.getenv("DB_PASSWORD", "admin")  # твой пароль
+# Defaults are safe placeholders; production and Docker should provide env vars.
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "change-me")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "eduirk_db")          # название твоей базы
+DB_NAME = os.getenv("DB_NAME", "eduirk_db")
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -21,7 +21,7 @@ DATABASE_URL = os.getenv(
 
 engine = create_engine(
     DATABASE_URL,
-    echo=False,           # Поставь True, если хочешь видеть SQL-запросы в консоли
+    echo=False,
     pool_pre_ping=True,
 )
 

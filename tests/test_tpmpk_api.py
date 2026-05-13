@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.tpmpk.router import _is_future_slot_irkutsk, _is_transferable_status, _keep_source_day_open_after_transfer, router
+from api.tpmpk.router import _appointment_duplicate_key
 from api.tpmpk.schemas import (
     AppointmentCreate,
     AppointmentResponse,
@@ -16,6 +17,7 @@ from api.tpmpk.schemas import (
     SlotResponse,
     WorkingDayUpdate,
 )
+from models import TPMPKAppointment
 
 
 def test_tpmpk_schemas_are_importable():
@@ -171,3 +173,36 @@ def test_day_transfer_keeps_source_day_open():
     _keep_source_day_open_after_transfer(day)
 
     assert day.is_open is True
+
+
+def test_appointment_duplicate_key_normalizes_child_phone_and_date():
+    first = _appointment_duplicate_key(
+        child_full_name="  Иванов   Петр  ",
+        selected_date=date(2026, 5, 20),
+        parent_phone="+7 (999) 111-22-33",
+    )
+    second = _appointment_duplicate_key(
+        child_full_name="иванов петр",
+        selected_date=date(2026, 5, 20),
+        parent_phone="89991112233",
+    )
+    other_day = _appointment_duplicate_key(
+        child_full_name="иванов петр",
+        selected_date=date(2026, 5, 21),
+        parent_phone="89991112233",
+    )
+
+    assert first == second
+    assert first != other_day
+
+
+def test_tpmpk_appointment_has_database_duplicate_guard():
+    assert "duplicate_key" in TPMPKAppointment.__table__.columns
+
+    duplicate_indexes = [
+        index
+        for index in TPMPKAppointment.__table__.indexes
+        if index.name == "tpmpk_appointment_duplicate_active_uniq"
+    ]
+    assert duplicate_indexes
+    assert duplicate_indexes[0].unique is True

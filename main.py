@@ -17,10 +17,12 @@ from difflib import SequenceMatcher
 load_dotenv()
 
 from database import engine, Base, get_db, SessionLocal
+from dev_seed import ensure_dev_test_users
 from auth import (
     hash_password, verify_password, create_access_token,
     get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES,
 )
+from permissions import require_admin_user
 from schemas import UserCreate, UserResponse, Token
 from models import User, UserRole
 from api import tpmpk_router
@@ -31,6 +33,7 @@ from utils.schema_patch import (
     ensure_certificate_layout_columns,
     ensure_postgresql_extensions,
     ensure_tpmpk_bot_question_columns,
+    ensure_tpmpk_duplicate_guard,
     ensure_tpmpk_slot_minutes_range,
 )
 from utils.local_docs import local_openapi_docs_html
@@ -311,6 +314,9 @@ Base.metadata.create_all(bind=engine)
 ensure_certificate_layout_columns(engine)
 ensure_tpmpk_bot_question_columns(engine)
 ensure_tpmpk_slot_minutes_range(engine)
+ensure_tpmpk_duplicate_guard(engine)
+with SessionLocal() as seed_db:
+    ensure_dev_test_users(seed_db)
 
 app.include_router(assistant_router)
 app.include_router(certificates_router)

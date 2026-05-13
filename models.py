@@ -1,5 +1,6 @@
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Float
 from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
 from database import Base
 
 # ====================== СУЩЕСТВУЮЩИЕ ТАБЛИЦЫ ======================
@@ -19,6 +20,7 @@ class User(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    role = relationship("UserRole")
 
 
 # ====================== ТАБЛИЦЫ ДЛЯ ГРАМОТ ======================

@@ -18,7 +18,7 @@ DOMU_PUBLIC_SCOPES = ("dom_uchitelya_only", "both")
 COMMON_ADMIN_ROLES = {"admin", "methodist"}
 DOMU_ADMIN_ROLES = {"admin", "methodist", "domu_editor"}
 DOMU_EDITOR_ALLOWED_SCOPES = {"both", "dom_uchitelya_only"}
-MAIN_DUPLICATION_ROLES = {"admin", "metodist_editor"}
+MAIN_DUPLICATION_ROLES = {"admin", "methodist"}
 ARTICLE_COVER_DIR = Path("static/articles/covers")
 ARTICLE_ATTACHMENT_DIR = Path("static/articles/attachments")
 ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -73,9 +73,27 @@ def _allowed_methodika_subjects(user) -> list[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
+def _user_id(user) -> int | None:
+    value = getattr(user, "id", None)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ensure_article_owner(role_name: str, user, article: Article):
+    if role_name not in {"methodist", "domu_editor"}:
+        return
+    user_id = _user_id(user)
+    if user_id is None or article.author_id != user_id:
+        raise HTTPException(status_code=403, detail="Article belongs to another author")
+
+
 def _ensure_methodist_article_access(role_name: str, user, payload: dict | None = None, article: Article | None = None):
     if role_name != "methodist":
         return
+    if article is not None:
+        _ensure_article_owner(role_name, user, article)
     allowed_subjects = _allowed_methodika_subjects(user)
     if not allowed_subjects:
         return
@@ -130,6 +148,7 @@ def _pin_target_keys(values: dict) -> set[str]:
 def _extract_article_values(article: Article) -> dict:
     return {
         "status": article.status,
+        "publishing_scope": article.publishing_scope,
         "is_pinned": bool(article.is_pinned),
         "duplicate_to_main": bool(article.duplicate_to_main),
         "duplicate_to_events": bool(article.duplicate_to_events),
@@ -139,6 +158,23 @@ def _extract_article_values(article: Article) -> dict:
         "hub_kind": article.hub_kind,
         "hub_path": article.hub_path,
     }
+
+
+def _ensure_domu_editor_article_access(role_name: str, user, payload: dict | None = None, article: Article | None = None):
+    if role_name != "domu_editor":
+        return
+    values = _extract_article_values(article) if article is not None else {}
+    if article is not None:
+        _ensure_article_owner(role_name, user, article)
+    if payload:
+        values.update(payload)
+
+    if values.get("publishing_scope") not in DOMU_EDITOR_ALLOWED_SCOPES:
+        raise HTTPException(status_code=403, detail="publishing_scope is not allowed for domu_editor")
+    if not values.get("dom_uchitelya_section"):
+        raise HTTPException(status_code=400, detail="dom_uchitelya_section is required")
+    if any(values.get(key) for key in ("methodika_subject", "noko_section", "hub_kind", "hub_path")):
+        raise HTTPException(status_code=403, detail="domu_editor can publish only to Dom uchitelya sections")
 
 
 def _ensure_pin_limits(db: Session, payload: dict, current_article_id: int | None = None):
@@ -253,9 +289,25 @@ def _query_admin_news(db: Session, scopes: tuple[str, ...] | None = None, role_n
     if scopes is not None:
         query = query.filter(Article.publishing_scope.in_(scopes))
     if role_name == "methodist":
+        user_id = _user_id(user)
+        if user_id is None:
+            return {"items": []}
+        query = query.filter(Article.author_id == user_id)
         allowed_subjects = _allowed_methodika_subjects(user)
         if allowed_subjects:
             query = query.filter(Article.methodika_subject.in_(allowed_subjects))
+    elif role_name == "domu_editor":
+        user_id = _user_id(user)
+        if user_id is None:
+            return {"items": []}
+        query = query.filter(
+            Article.author_id == user_id,
+            Article.dom_uchitelya_section != None,  # noqa: E711
+            Article.methodika_subject == None,  # noqa: E711
+            Article.noko_section == None,  # noqa: E711
+            Article.hub_kind == None,  # noqa: E711
+            Article.hub_path == None,  # noqa: E711
+        )
     return {"items": query.order_by(Article.is_pinned.desc(), Article.updated_at.desc(), Article.id.desc()).all()}
 
 
@@ -451,9 +503,14 @@ def update_common_admin_news(
 @router.delete("/api/admin/news/{article_id}/", status_code=204)
 def delete_common_admin_news(
     article_id: int,
-    _: str = Depends(require_common_admin),
+    role_name: str = Depends(require_common_admin),
+    current_user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    article = db.get(Article, article_id)
+    if article is None:
+        raise HTTPException(status_code=404, detail="Article not found")
+    _ensure_article_owner(role_name, current_user, article)
     _delete_article(db, article_id)
     return None
 
@@ -480,6 +537,7 @@ def create_domu_admin_news(
         raise HTTPException(status_code=403, detail="publishing_scope is not allowed for domu_editor")
     if role_name == "domu_editor" and not data.dom_uchitelya_section:
         raise HTTPException(status_code=400, detail="dom_uchitelya_section is required")
+    _ensure_domu_editor_article_access(role_name, current_user, data.model_dump())
     _ensure_methodist_article_access(role_name, current_user, data.model_dump())
     return _create_article(db, data, role_name=role_name, author_id=getattr(current_user, "id", None))
 
@@ -489,6 +547,7 @@ def update_domu_admin_news(
     article_id: int,
     data: ArticleUpdate,
     role_name: str = Depends(require_domu_admin),
+    current_user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     if role_name == "domu_editor" and data.publishing_scope == "imcro_only":
@@ -497,7 +556,9 @@ def update_domu_admin_news(
     if article is None:
         raise HTTPException(status_code=404, detail="Article not found")
     if role_name == "domu_editor" and article.publishing_scope not in DOMU_EDITOR_ALLOWED_SCOPES:
-        raise HTTPException(status_code=403, detail="Article is outside Дом учителя scope")
+        raise HTTPException(status_code=403, detail="Article is outside Dom uchitelya scope")
+    _ensure_domu_editor_article_access(role_name, current_user, data.model_dump(exclude_unset=True), article)
+    _ensure_methodist_article_access(role_name, current_user, data.model_dump(exclude_unset=True), article)
     return _update_article(db, article_id, data, role_name=role_name)
 
 
@@ -505,13 +566,16 @@ def update_domu_admin_news(
 def delete_domu_admin_news(
     article_id: int,
     role_name: str = Depends(require_domu_admin),
+    current_user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     article = db.get(Article, article_id)
     if article is None:
         raise HTTPException(status_code=404, detail="Article not found")
     if role_name == "domu_editor" and article.publishing_scope not in DOMU_EDITOR_ALLOWED_SCOPES:
-        raise HTTPException(status_code=403, detail="Article is outside Дом учителя scope")
+        raise HTTPException(status_code=403, detail="Article is outside Dom uchitelya scope")
+    _ensure_domu_editor_article_access(role_name, current_user, article=article)
+    _ensure_methodist_article_access(role_name, current_user, article=article)
     _delete_article(db, article_id)
     return None
 

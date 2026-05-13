@@ -4,7 +4,6 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from io import BytesIO
 import os
-import shutil
 import zipfile
 import re
 from datetime import datetime
@@ -32,8 +31,13 @@ from utils.excel_batch import (
 from utils.certificate_text import extract_placeholders, merge_legacy_variables
 from utils.name_declension import prepare_certificate_variables
 from reportlab.lib.utils import ImageReader
+from permissions import require_certificate_manager_user
 
-router = APIRouter(prefix="/certificates", tags=["certificates"])
+router = APIRouter(
+    prefix="/certificates",
+    tags=["certificates"],
+    dependencies=[Depends(require_certificate_manager_user)],
+)
 
 # Пакетная генерация: размер файла и число строк
 _MAX_BATCH_EXCEL_BYTES = 15 * 1024 * 1024  # 15 МБ
@@ -129,32 +133,38 @@ def _font_family_from_filename(filename: str) -> str:
 # ====================== ЗАГРУЗКА ФАЙЛОВ ======================
 @router.post("/upload-background")
 async def upload_background(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
+    if not (file.content_type or "").startswith("image/"):
         raise HTTPException(status_code=400, detail="Только изображения")
     
     upload_dir = "static/certificates/backgrounds"
     os.makedirs(upload_dir, exist_ok=True)
-    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_upload_name(file.filename)}"
     file_path = os.path.join(upload_dir, filename)
-    
+
+    content = await file.read()
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Файл слишком большой")
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(content)
     
     return {"background_url": f"/static/certificates/backgrounds/{filename}"}
 
 
 @router.post("/upload-facsimile")
 async def upload_facsimile(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
+    if not (file.content_type or "").startswith("image/"):
         raise HTTPException(status_code=400, detail="Только изображения")
     
     upload_dir = "static/certificates/facsimiles"
     os.makedirs(upload_dir, exist_ok=True)
-    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_upload_name(file.filename)}"
     file_path = os.path.join(upload_dir, filename)
-    
+
+    content = await file.read()
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Файл слишком большой")
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(content)
     
     return {"facsimile_url": f"/static/certificates/facsimiles/{filename}"}
 
@@ -177,8 +187,11 @@ async def upload_font(file: UploadFile = File(...)):
     filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_upload_name(file.filename)}"
     file_path = os.path.join(upload_dir, filename)
 
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Файл слишком большой")
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(content)
 
     return {
         "font_family": _font_family_from_filename(file.filename),
@@ -209,8 +222,12 @@ def get_fonts():
 
 # ====================== ШАБЛОНЫ ======================
 @router.post("/templates", response_model=CertificateTemplateResponse)
-def create_template(data: CertificateTemplateCreate, db: Session = Depends(get_db)):
-    template = CertificateTemplate(**data.dict())
+def create_template(
+    data: CertificateTemplateCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_certificate_manager_user),
+):
+    template = CertificateTemplate(**data.model_dump(), created_by_id=current_user.id)
     db.add(template)
     db.commit()
     db.refresh(template)
@@ -243,7 +260,11 @@ def delete_template(template_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/templates/full", response_model=TemplateFullResponse)
-def create_template_full(data: TemplateFullUpdateRequest, db: Session = Depends(get_db)):
+def create_template_full(
+    data: TemplateFullUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_certificate_manager_user),
+):
     """
     Атомарное создание шаблона: метаданные + элементы + подписанты.
     Используется конструктором, чтобы новый шаблон не сохранялся частично.
@@ -266,6 +287,7 @@ def create_template_full(data: TemplateFullUpdateRequest, db: Session = Depends(
             margin_right_mm=data.margin_right_mm,
             margin_top_mm=data.margin_top_mm,
             margin_bottom_mm=data.margin_bottom_mm,
+            created_by_id=current_user.id,
         )
         db.add(template)
         db.flush()
@@ -711,6 +733,7 @@ async def batch_generate_certificates(
 def manual_generate_certificate(
     request: ManualCertificateRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_certificate_manager_user),
 ):
     """
     Ручная выдача сертификата: все переменные задаются вручную через JSON.
@@ -789,7 +812,7 @@ def manual_generate_certificate(
             recipient_id=None,
             event_name=event,
             file_url=file_url,
-            generated_by_id=1,
+            generated_by_id=current_user.id,
         )
         db.add(cert)
         db.commit()
@@ -810,6 +833,7 @@ def manual_generate_certificate(
 def generate_certificate(
     request: CertificateGenerateRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_certificate_manager_user),
 ):
     """
     Одиночная генерация PDF: variables подставляются в плейсхолдеры {Ключ} в тексте шаблона.
@@ -865,7 +889,7 @@ def generate_certificate(
             recipient_id=request.recipient_id,
             event_name=event_snapshot,
             file_url=file_url,
-            generated_by_id=1,
+            generated_by_id=current_user.id,
         )
 
         db.add(cert)

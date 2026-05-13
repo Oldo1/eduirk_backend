@@ -141,3 +141,34 @@ def ensure_tpmpk_slot_minutes_range(engine: Engine) -> None:
                     "CHECK (slot_minutes BETWEEN 10 AND 240 AND slot_minutes % 5 = 0)"
                 )
             )
+
+
+def ensure_tpmpk_duplicate_guard(engine: Engine) -> None:
+    dialect = engine.dialect.name
+
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            if not _pg_column_exists(conn, "tpmpk_appointment", "duplicate_key"):
+                conn.execute(text("ALTER TABLE tpmpk_appointment ADD COLUMN duplicate_key VARCHAR(64)"))
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS tpmpk_appointment_duplicate_active_uniq
+                    ON tpmpk_appointment (duplicate_key)
+                    WHERE status <> 'cancelled' AND duplicate_key IS NOT NULL
+                    """
+                )
+            )
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            if "duplicate_key" not in _sqlite_columns(conn, "tpmpk_appointment"):
+                conn.execute(text("ALTER TABLE tpmpk_appointment ADD COLUMN duplicate_key TEXT"))
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS tpmpk_appointment_duplicate_active_uniq
+                    ON tpmpk_appointment (duplicate_key)
+                    WHERE status <> 'cancelled' AND duplicate_key IS NOT NULL
+                    """
+                )
+            )
