@@ -1,11 +1,15 @@
+# ====================================
+# Зависимости для Docker (production-like)
+# ====================================
+
 # Основной фреймворк
 fastapi
 uvicorn[standard]
 
 # База данных
 sqlalchemy
-psycopg2-binary                  # для PostgreSQL
-alembic                          # миграции (нужны для модуля ТПМПК)
+psycopg2-binary
+alembic
 
 # Аутентификация
 python-jose[cryptography]
@@ -16,12 +20,12 @@ python-multipart
 pydantic
 pydantic[email]
 
-# Генерация грамот (PDF)
+# Генерация грамот (PDF) + обработка изображений
 reportlab
 Pillow
 pandas
 openpyxl
-pytrovich                        # склонение ФИО для грамот
+pytrovich
 
 # RAG-система (чат-помощник)
 langchain
@@ -32,23 +36,13 @@ gigachat
 sentence-transformers
 chromadb
 
-# Дополнительно (рекомендуется)
-python-dotenv                    # для .env файла
-httpx                            # для HTTP-запросов
-
-# HTTP / S3 / краулер сайта
+# Дополнительно
+python-dotenv
+httpx
 requests
-boto3
 beautifulsoup4
-
-# Извлечение текста из документов
+boto3
 pypdf
 python-docx
-pymupdf                          # fitz — рендер PDF в картинки для OCR
-mammoth                          # fallback-конвертация .doc без MS Word
-
-# OCR
-surya-ocr                        # Surya OCR (на CPU)
-
-# Auth — bcrypt напрямую (auth.py) + используется passlib[bcrypt] выше
-bcrypt
+pytesseract
+pdf2image

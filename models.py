@@ -18,6 +18,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
 
@@ -26,6 +27,7 @@ class UserRole(Base):
     __tablename__ = "user_role"
     id = Column(Integer, primary_key=True, index=True)
     role_name = Column(String(50), unique=True, nullable=False)
+    can_access_internal_docs = Column(Boolean, nullable=False, default=False, server_default=text("FALSE"))
 
 
 class User(Base):
@@ -38,6 +40,11 @@ class User(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    role = relationship("UserRole")
+
+    @property
+    def can_access_internal_docs(self) -> bool:
+        return bool(getattr(self.role, "can_access_internal_docs", False))
 
 
 # ====================== ТАБЛИЦЫ ДЛЯ ГРАМОТ ======================

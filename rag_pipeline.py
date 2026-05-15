@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import os
 import re
+import logging
 from threading import Lock
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Optional
 
 from langchain_chroma import Chroma
@@ -54,6 +56,44 @@ SITE_CONTEXT_SOURCE = "__site_context__"
 SITE_CONTEXT_PROMPT_LIMIT = 4000
 _RERANKER_CACHE: dict[tuple[str, int, float], "CrossEncoderReranker"] = {}
 _RERANKER_CACHE_LOCK = Lock()
+DEFAULT_GIGACHAT_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
+logger = logging.getLogger("rag_pipeline")
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None else default
+    except ValueError:
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float | None = None) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw is not None else default
+    except ValueError:
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+def _env_status_codes(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.environ.get(name, "")
+    codes: list[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            codes.append(int(item))
+        except ValueError:
+            continue
+    return tuple(codes) or default
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +111,21 @@ class RAGConfig:
     verify_ssl_certs: bool = False                 # True — если установлен сертификат Минцифры
     max_tokens: int        = 1000
     temperature: float     = 0.1
+    request_timeout: float = field(
+        default_factory=lambda: _env_float("GIGACHAT_TIMEOUT_SECONDS", 30.0, minimum=1.0)
+    )
+    max_retries: int = field(
+        default_factory=lambda: _env_int("GIGACHAT_MAX_RETRIES", 1, minimum=0)
+    )
+    retry_backoff_factor: float = field(
+        default_factory=lambda: _env_float("GIGACHAT_RETRY_BACKOFF_SECONDS", 0.5, minimum=0.0)
+    )
+    retry_on_status_codes: tuple[int, ...] = field(
+        default_factory=lambda: _env_status_codes(
+            "GIGACHAT_RETRY_STATUS_CODES",
+            DEFAULT_GIGACHAT_RETRY_STATUS_CODES,
+        )
+    )
 
     # ── Векторная база ────────────────────────────────────────────────────────
     persist_dir: str     = "./chroma_gigachat"
@@ -308,6 +363,10 @@ class RAGSystem:
             scope=cfg.scope,
             model=cfg.model,
             verify_ssl_certs=cfg.verify_ssl_certs,
+            timeout=cfg.request_timeout,
+            max_retries=cfg.max_retries,
+            retry_backoff_factor=cfg.retry_backoff_factor,
+            retry_on_status_codes=cfg.retry_on_status_codes,
         )
 
     # ── Валидация ключа ───────────────────────────────────────────────────────
@@ -415,9 +474,27 @@ class RAGSystem:
             max_tokens=self.cfg.max_tokens,
             temperature=self.cfg.temperature,
         )
-        with GigaChat(**self._gc_kwargs) as client:
-            response = client.chat(payload)
-        return response.choices[0].message.content
+        started_at = perf_counter()
+        try:
+            with GigaChat(**self._gc_kwargs) as client:
+                response = client.chat(payload)
+        except Exception as e:
+            elapsed = perf_counter() - started_at
+            logger.warning(
+                "[gigachat] request failed after %.2fs: %s",
+                elapsed,
+                type(e).__name__,
+                exc_info=True,
+            )
+            raise RuntimeError("GigaChat request failed") from e
+
+        elapsed = perf_counter() - started_at
+        logger.info("[gigachat] request finished in %.2fs", elapsed)
+
+        try:
+            return response.choices[0].message.content or ""
+        except (AttributeError, IndexError) as e:
+            raise RuntimeError("GigaChat returned empty response") from e
 
     # ── Шаг 1: перефразировать вопрос с учётом истории ───────────────────────
 

@@ -34,11 +34,73 @@ def _sqlite_columns(conn, table: str) -> set[str]:
     return {r[1] for r in rows}
 
 
+INTERNAL_DOCS_DEFAULT_ROLE_NAMES = {
+    "admin",
+    "administrator",
+    "employee",
+    "staff",
+    "manager",
+    "админ",
+    "администратор",
+    "сотрудник",
+    "работник",
+}
+
+
+def _backfill_internal_docs_roles(conn) -> None:
+    for role_name in INTERNAL_DOCS_DEFAULT_ROLE_NAMES:
+        conn.execute(
+            text(
+                """
+                UPDATE user_role
+                SET can_access_internal_docs = TRUE
+                WHERE can_access_internal_docs = FALSE
+                  AND (role_name = :role_name OR lower(role_name) = :role_name)
+                """
+            ),
+            {"role_name": role_name},
+        )
+
+
+def ensure_user_role_permission_columns(engine: Engine) -> None:
+    dialect = engine.dialect.name
+
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            table_exists = conn.execute(text("SELECT to_regclass('public.user_role')")).scalar()
+            if not table_exists:
+                return
+            if not _pg_column_exists(conn, "user_role", "can_access_internal_docs"):
+                conn.execute(
+                    text(
+                        "ALTER TABLE user_role "
+                        "ADD COLUMN can_access_internal_docs BOOLEAN DEFAULT FALSE NOT NULL"
+                    )
+                )
+            _backfill_internal_docs_roles(conn)
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            tables = conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='user_role'")
+            ).fetchall()
+            if not tables:
+                return
+            if "can_access_internal_docs" not in _sqlite_columns(conn, "user_role"):
+                conn.execute(
+                    text(
+                        "ALTER TABLE user_role "
+                        "ADD COLUMN can_access_internal_docs BOOLEAN NOT NULL DEFAULT 0"
+                    )
+                )
+            _backfill_internal_docs_roles(conn)
+
+
 def ensure_certificate_layout_columns(engine: Engine) -> None:
     dialect = engine.dialect.name
 
     alters_pg: list[tuple[str, str, str]] = [
         ("users", "is_active", "BOOLEAN DEFAULT TRUE NOT NULL"),
+        ("users", "allowed_methodika_subjects", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
         ("certificate_templates", "signers_block_x_mm", "DOUBLE PRECISION DEFAULT 105"),
         ("certificate_templates", "signers_row_height_mm", "DOUBLE PRECISION DEFAULT 32"),
         ("certificate_templates", "signers_band_width_mm", "DOUBLE PRECISION DEFAULT 168"),
@@ -65,6 +127,7 @@ def ensure_certificate_layout_columns(engine: Engine) -> None:
 
     alters_sqlite: list[tuple[str, str, str]] = [
         ("users", "is_active", "BOOLEAN DEFAULT 1 NOT NULL"),
+        ("users", "allowed_methodika_subjects", "TEXT DEFAULT '[]' NOT NULL"),
         ("certificate_templates", "signers_block_x_mm", "REAL DEFAULT 105"),
         ("certificate_templates", "signers_row_height_mm", "REAL DEFAULT 32"),
         ("certificate_templates", "signers_band_width_mm", "REAL DEFAULT 168"),
@@ -121,6 +184,73 @@ def ensure_tpmpk_bot_question_columns(engine: Engine) -> None:
                 conn.execute(text("ALTER TABLE tpmpk_appointment ADD COLUMN child_registered_irkutsk BOOLEAN NOT NULL DEFAULT 1"))
             if "document_readiness" not in columns:
                 conn.execute(text("ALTER TABLE tpmpk_appointment ADD COLUMN document_readiness TEXT NOT NULL DEFAULT 'full'"))
+
+
+def ensure_article_editor_columns(engine: Engine) -> None:
+    dialect = engine.dialect.name
+
+    alters_pg: list[tuple[str, str]] = [
+        ("status", "VARCHAR(20) DEFAULT 'draft' NOT NULL"),
+        ("excerpt", "VARCHAR(800)"),
+        ("image", "VARCHAR(500)"),
+        ("lead", "VARCHAR(800)"),
+        ("body", "TEXT DEFAULT '' NOT NULL"),
+        ("cover_image_url", "VARCHAR(500)"),
+        ("is_pinned", "BOOLEAN DEFAULT FALSE NOT NULL"),
+        ("duplicate_to_main", "BOOLEAN DEFAULT FALSE NOT NULL"),
+        ("duplicate_to_events", "BOOLEAN DEFAULT FALSE NOT NULL"),
+        ("blocks", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
+        ("attachments", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
+        ("categories", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
+        ("tags", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
+        ("publishing_scope", "VARCHAR(20) DEFAULT 'both' NOT NULL"),
+        ("methodika_subject", "VARCHAR(120)"),
+        ("dom_uchitelya_section", "VARCHAR(120)"),
+        ("noko_section", "VARCHAR(120)"),
+        ("hub_kind", "VARCHAR(64)"),
+        ("hub_path", "VARCHAR(160)"),
+        ("published_at", "TIMESTAMP WITH TIME ZONE"),
+    ]
+    alters_sqlite: list[tuple[str, str]] = [
+        ("status", "TEXT DEFAULT 'draft' NOT NULL"),
+        ("excerpt", "TEXT"),
+        ("image", "TEXT"),
+        ("lead", "TEXT"),
+        ("body", "TEXT DEFAULT '' NOT NULL"),
+        ("cover_image_url", "TEXT"),
+        ("is_pinned", "BOOLEAN DEFAULT 0 NOT NULL"),
+        ("duplicate_to_main", "BOOLEAN DEFAULT 0 NOT NULL"),
+        ("duplicate_to_events", "BOOLEAN DEFAULT 0 NOT NULL"),
+        ("blocks", "TEXT DEFAULT '[]' NOT NULL"),
+        ("attachments", "TEXT DEFAULT '[]' NOT NULL"),
+        ("categories", "TEXT DEFAULT '[]' NOT NULL"),
+        ("tags", "TEXT DEFAULT '[]' NOT NULL"),
+        ("publishing_scope", "TEXT DEFAULT 'both' NOT NULL"),
+        ("methodika_subject", "TEXT"),
+        ("dom_uchitelya_section", "TEXT"),
+        ("noko_section", "TEXT"),
+        ("hub_kind", "TEXT"),
+        ("hub_path", "TEXT"),
+        ("published_at", "TIMESTAMP"),
+    ]
+
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            table_exists = conn.execute(text("SELECT to_regclass('public.article')")).scalar()
+            if not table_exists:
+                return
+            for col, coltype in alters_pg:
+                if not _pg_column_exists(conn, "article", col):
+                    conn.execute(text(f"ALTER TABLE article ADD COLUMN {col} {coltype}"))
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            tables = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='article'")).fetchall()
+            if not tables:
+                return
+            columns = _sqlite_columns(conn, "article")
+            for col, coltype in alters_sqlite:
+                if col not in columns:
+                    conn.execute(text(f"ALTER TABLE article ADD COLUMN {col} {coltype}"))
 
 
 def ensure_tpmpk_slot_minutes_range(engine: Engine) -> None:

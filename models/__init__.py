@@ -1,4 +1,5 @@
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text, text
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from database import Base
@@ -16,6 +17,7 @@ class UserRole(Base):
     __tablename__ = "user_role"
     id = Column(Integer, primary_key=True, index=True)
     role_name = Column(String(50), unique=True, nullable=False)
+    can_access_internal_docs = Column(Boolean, nullable=False, default=False, server_default=text("FALSE"))
 
 
 class User(Base):
@@ -27,7 +29,13 @@ class User(Base):
     username = Column(String(100), unique=True, index=True, nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
+    allowed_methodika_subjects = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    role = relationship("UserRole")
+
+    @property
+    def can_access_internal_docs(self) -> bool:
+        return bool(getattr(self.role, "can_access_internal_docs", False))
 
 
 class CertificateTemplate(Base):
@@ -129,14 +137,53 @@ class Tag(Base):
 
 class Article(Base):
     __tablename__ = "article"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'published', 'archive')",
+            name="article_status_chk",
+        ),
+        CheckConstraint(
+            "publishing_scope IN ('imcro_only', 'dom_uchitelya_only', 'both')",
+            name="article_publishing_scope_chk",
+        ),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(500), nullable=False)
     slug = Column(String(500), nullable=False)
     content = Column(Text, nullable=True)
     status_id = Column(Integer, ForeignKey("article_status.id"), nullable=True)
+    status = Column(String(20), nullable=False, default="draft", index=True)
+    excerpt = Column(String(800), nullable=True)
+    image = Column(String(500), nullable=True)
+    lead = Column(String(800), nullable=True)
+    body = Column(Text, nullable=False, default="")
+    cover_image_url = Column(String(500), nullable=True)
+    is_pinned = Column(Boolean, nullable=False, default=False, index=True)
+    duplicate_to_main = Column(Boolean, nullable=False, default=False, index=True)
+    duplicate_to_events = Column(Boolean, nullable=False, default=False, index=True)
+    blocks = Column(JSON, nullable=False, default=list)
+    attachments = Column(JSON, nullable=False, default=list)
+    categories = Column(JSON, nullable=False, default=list)
+    tags = Column(JSON, nullable=False, default=list)
+    publishing_scope = Column(String(20), nullable=False, default="both", index=True)
+    methodika_subject = Column(String(120), nullable=True, index=True)
+    dom_uchitelya_section = Column(String(120), nullable=True, index=True)
+    noko_section = Column(String(120), nullable=True, index=True)
+    hub_kind = Column(String(64), nullable=True, index=True)
+    hub_path = Column(String(160), nullable=True, index=True)
     author_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    published_at = Column(DateTime(timezone=True), nullable=True)
+
+    author = relationship("User", foreign_keys=[author_id])
+
+    @property
+    def author_name(self):
+        if self.author is None:
+            return None
+        return getattr(self.author, "username", None) or getattr(self.author, "email", None)
 
 
 class ArticleCategory(Base):

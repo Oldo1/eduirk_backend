@@ -13,7 +13,10 @@ from schemas import TokenData
 load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "14"))
+ACCESS_TOKEN_TYPE = "access"
+REFRESH_TOKEN_TYPE = "refresh"
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 optional_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
@@ -25,13 +28,31 @@ def hash_password(password: str) -> str:
 def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode(), hashed.encode())
 
-def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+def _create_token(data: dict, token_type: str, expires_delta: timedelta) -> str:
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
+    expire = datetime.now(timezone.utc) + expires_delta
     to_encode["exp"] = expire
+    to_encode["type"] = token_type
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def _get_user_from_token(token: str, db: Session) -> User:
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    return _create_token(
+        data=data,
+        token_type=ACCESS_TOKEN_TYPE,
+        expires_delta=expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+
+
+def create_refresh_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    return _create_token(
+        data=data,
+        token_type=REFRESH_TOKEN_TYPE,
+        expires_delta=expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+
+
+def _decode_token_payload(token: str, expected_type: str) -> dict:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Невалидный токен",
@@ -39,12 +60,26 @@ def _get_user_from_token(token: str, db: Session) -> User:
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
+        token_type = payload.get("type")
+        is_legacy_access = expected_type == ACCESS_TOKEN_TYPE and token_type is None
+        if token_type != expected_type and not is_legacy_access:
             raise credentials_exception
-        token_data = TokenData(email=email)
     except JWTError:
         raise credentials_exception
+    return payload
+
+
+def _get_user_from_token(token: str, db: Session, expected_type: str = ACCESS_TOKEN_TYPE) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Невалидный токен",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    payload = _decode_token_payload(token, expected_type)
+    email: str | None = payload.get("sub")
+    if email is None:
+        raise credentials_exception
+    token_data = TokenData(email=email)
 
     user = db.query(User).filter(User.email == token_data.email).first()
     if user is None:
@@ -66,3 +101,7 @@ def get_optional_current_user(
     if not token:
         return None
     return _get_user_from_token(token, db)
+
+
+def get_user_from_refresh_token(refresh_token: str, db: Session) -> User:
+    return _get_user_from_token(refresh_token, db, expected_type=REFRESH_TOKEN_TYPE)

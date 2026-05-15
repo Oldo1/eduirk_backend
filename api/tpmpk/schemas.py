@@ -13,7 +13,10 @@ class AppointmentCreate(BaseModel):
     child_full_name: str = Field(..., min_length=2, max_length=255)
     child_age: int = Field(..., ge=0, le=18)
     child_registered_irkutsk: bool
-    document_readiness: str = Field(..., pattern=r"^(full|not_ready|psychiatrist_consultation)$")
+    document_readiness: str = Field(
+        ...,
+        pattern=r"^(full|not_ready|psychiatrist_consultation)$",
+    )
     parent_phone: str = Field(..., pattern=r"^\+7\d{10}$")
     is_repeat: bool = False
     needs_psychiatrist: bool = False
@@ -49,9 +52,9 @@ class WorkingDayUpdate(BaseModel):
     @classmethod
     def validate_slot_minutes(cls, value):
         if value is not None and not MIN_SLOT_MINUTES <= value <= MAX_SLOT_MINUTES:
-            raise ValueError(f"Slot duration must be from {MIN_SLOT_MINUTES} to {MAX_SLOT_MINUTES} minutes")
+            raise ValueError(f"Длительность приема должна быть от {MIN_SLOT_MINUTES} до {MAX_SLOT_MINUTES} минут")
         if value is not None and value % SLOT_MINUTES_STEP != 0:
-            raise ValueError(f"Slot duration must be divisible by {SLOT_MINUTES_STEP}")
+            raise ValueError(f"Длительность приема должна быть кратна {SLOT_MINUTES_STEP} минутам")
         return value
 
 
@@ -68,9 +71,9 @@ class ScheduleTemplateUpdate(BaseModel):
     @classmethod
     def validate_template_slot_minutes(cls, value):
         if not MIN_SLOT_MINUTES <= value <= MAX_SLOT_MINUTES:
-            raise ValueError(f"Slot duration must be from {MIN_SLOT_MINUTES} to {MAX_SLOT_MINUTES} minutes")
+            raise ValueError(f"Длительность приема должна быть от {MIN_SLOT_MINUTES} до {MAX_SLOT_MINUTES} минут")
         if value % SLOT_MINUTES_STEP != 0:
-            raise ValueError(f"Slot duration must be divisible by {SLOT_MINUTES_STEP}")
+            raise ValueError(f"Длительность приема должна быть кратна {SLOT_MINUTES_STEP} минутам")
         return value
 
 
@@ -89,7 +92,10 @@ class ManualAppointmentCreate(BaseModel):
     child_full_name: str = Field(..., min_length=2, max_length=255)
     child_age: int = Field(..., ge=0, le=18)
     child_registered_irkutsk: bool
-    document_readiness: str = Field(..., pattern=r"^(full|not_ready|psychiatrist_consultation)$")
+    document_readiness: str = Field(
+        ...,
+        pattern=r"^(full|not_ready|psychiatrist_consultation)$",
+    )
     parent_phone: str = Field(..., pattern=r"^\+7\d{10}$")
     is_repeat: bool = False
     needs_psychiatrist: bool = False

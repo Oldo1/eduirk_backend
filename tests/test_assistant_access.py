@@ -14,10 +14,10 @@ from langchain_core.documents import Document
 from rag_pipeline import RAGSystem
 
 
-def test_employee_roles_get_employee_scope():
-    assert access_scope_for_role("admin") == EMPLOYEE_SCOPE
-    assert access_scope_for_role("Сотрудник") == EMPLOYEE_SCOPE
-    assert access_scope_for_role("Администратор МКУ РОИ") == EMPLOYEE_SCOPE
+def test_internal_docs_scope_requires_explicit_permission():
+    assert access_scope_for_role("admin", can_access_internal_docs=True) == EMPLOYEE_SCOPE
+    assert access_scope_for_role("admin") == PUBLIC_SCOPE
+    assert access_scope_for_role("Сотрудник", can_access_internal_docs=False) == PUBLIC_SCOPE
     assert access_scope_for_role(None) == PUBLIC_SCOPE
 
 

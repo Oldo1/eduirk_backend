@@ -14,7 +14,6 @@ from typing import Iterable
 from typing import Mapping
 
 from config import (
-    ASSISTANT_EMPLOYEE_ROLE_NAMES,
     ASSISTANT_INTERNAL_S3_KEYWORDS,
     ASSISTANT_INTERNAL_S3_PREFIXES,
 )
@@ -29,13 +28,21 @@ def normalize_role_name(role_name: str | None) -> str:
     return (role_name or "").strip().lower()
 
 
-def access_scope_for_role(role_name: str | None) -> str:
-    role = normalize_role_name(role_name)
-    if role in ASSISTANT_EMPLOYEE_ROLE_NAMES:
-        return EMPLOYEE_SCOPE
-    if any(known in role for known in ASSISTANT_EMPLOYEE_ROLE_NAMES if len(known) >= 4):
-        return EMPLOYEE_SCOPE
-    return PUBLIC_SCOPE
+def access_scope_for_internal_docs_permission(can_access_internal_docs: bool | None) -> str:
+    return EMPLOYEE_SCOPE if bool(can_access_internal_docs) else PUBLIC_SCOPE
+
+
+def access_scope_for_role(
+    role_name: str | None = None,
+    *,
+    can_access_internal_docs: bool | None = False,
+) -> str:
+    """Return the assistant access scope.
+
+    Role names are kept only for API compatibility. Access to internal
+    documents is controlled by the explicit DB permission flag.
+    """
+    return access_scope_for_internal_docs_permission(can_access_internal_docs)
 
 
 def infer_s3_access_level(s3_key: str | None) -> str:

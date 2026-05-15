@@ -26,13 +26,22 @@ services:
       # Внутри docker-сети БД доступна по имени сервиса, а не localhost
       DB_HOST: db
       DB_PORT: 5432
+      HF_HOME: /cache/huggingface
+      HF_HUB_CACHE: /cache/huggingface/hub
+      HF_HUB_DISABLE_XET: "1"
+      TRANSFORMERS_CACHE: /cache/huggingface/transformers
+      SENTENCE_TRANSFORMERS_HOME: /cache/huggingface/sentence-transformers
+      GIGACHAT_TIMEOUT_SECONDS: ${GIGACHAT_TIMEOUT_SECONDS:-30}
+      GIGACHAT_MAX_RETRIES: ${GIGACHAT_MAX_RETRIES:-1}
+      GIGACHAT_RETRY_BACKOFF_SECONDS: ${GIGACHAT_RETRY_BACKOFF_SECONDS:-0.5}
+      ASSISTANT_RATE_LIMIT_WINDOW_SECONDS: ${ASSISTANT_RATE_LIMIT_WINDOW_SECONDS:-60}
+      ASSISTANT_RATE_LIMIT_MAX_REQUESTS: ${ASSISTANT_RATE_LIMIT_MAX_REQUESTS:-12}
     depends_on:
       db:
         condition: service_healthy
     ports:
-      # Снаружи 8001 — потому что 8000 занят соседним контейнером (gamehub_backend).
-      # При обращении к API используй http://localhost:8001
-      - "8001:8000"
+      # Снаружи API доступен на http://localhost:8000
+      - "8000:8000"
     volumes:
       # Persistent данные — bind-mounts, чтобы контейнер видел уже существующие
       # локальные файлы (Chroma-БД с векторами, кэш OCR, загруженные шаблоны)

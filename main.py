@@ -6,23 +6,32 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
+import asyncio
+import contextlib
 import logging
 import os
+from typing import Any
 
 from database import engine, Base, get_db
 from models import User, UserRole
 from auth import (
-    hash_password, verify_password, create_access_token,
-    get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES,
+    hash_password, verify_password, create_access_token, create_refresh_token,
+    get_current_user, get_user_from_refresh_token,
+    ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS,
 )
-from schemas import UserCreate, UserResponse, Token
+from schemas import RefreshTokenRequest, UserCreate, UserResponse, Token
 from api import tpmpk_router
+from dom_uchitelya import router as dom_uchitelya_router
 
 from routers.assistant import (
     router as assistant_router,
     init_rag,
+    warmup_embeddings,
     get_vectorstore,
     reload_all_sessions,
+    mark_assistant_warmup_started,
+    mark_assistant_warmup_completed,
+    set_assistant_last_error,
     EMBEDDINGS,
 )
 from routers.certificates import router as certificates_router
@@ -31,13 +40,15 @@ from routers.appointments import router as appointments_router
 from routers.articles import router as articles_router
 from utils.schema_patch import (
     ensure_certificate_layout_columns,
+    ensure_article_editor_columns,
     ensure_postgresql_extensions,
     ensure_tpmpk_bot_question_columns,
     ensure_tpmpk_slot_minutes_range,
+    ensure_user_role_permission_columns,
 )
 from utils.local_docs import local_openapi_docs_html
 
-from updater import RAGScheduler, UPDATE_INTERVAL_HOURS
+from config import UPDATE_INTERVAL_HOURS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,32 +66,60 @@ def _cors_origins_from_env() -> list[str]:
     return [origin.strip().rstrip("/") for origin in raw_origins.split(",") if origin.strip()]
 
 # ── Планировщик (глобальный, чтобы была ссылка) ───────────────────────────────
-_scheduler: RAGScheduler | None = None
+_scheduler: Any | None = None
+_rag_startup_task: asyncio.Task | None = None
+
+
+def _prepare_rag_startup() -> tuple[type, Any]:
+    from updater import RAGScheduler
+
+    init_rag()
+    warmup_embeddings()
+    return RAGScheduler, get_vectorstore()
+
+
+async def _init_rag_and_scheduler_bg() -> None:
+    global _scheduler
+
+    mark_assistant_warmup_started()
+    try:
+        logger.info("[main] Initializing assistant RAG in background")
+        scheduler_cls, vectorstore = await asyncio.to_thread(_prepare_rag_startup)
+
+        _scheduler = scheduler_cls(
+            vectorstore=vectorstore,
+            embeddings=EMBEDDINGS,
+            interval_hours=UPDATE_INTERVAL_HOURS,
+            on_update_done=reload_all_sessions,
+            run_on_start=False,
+        )
+        _scheduler.start()
+        mark_assistant_warmup_completed()
+        logger.info(f"[main] Scheduler started (every {UPDATE_INTERVAL_HOURS} h.)")
+    except asyncio.CancelledError:
+        logger.info("[main] Assistant RAG startup task cancelled")
+        raise
+    except Exception as e:
+        set_assistant_last_error("Ошибка прогрева ассистента. Подробности в логах backend.")
+        logger.error(f"[main] Assistant RAG startup failed: {e}", exc_info=True)
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scheduler
+    global _scheduler, _rag_startup_task
 
-    # 1. Инициализируем RAG
-    init_rag()
-
-    # 2. Запускаем планировщик обновлений
-    _scheduler = RAGScheduler(
-        vectorstore=get_vectorstore(),
-        embeddings=EMBEDDINGS,
-        interval_hours=UPDATE_INTERVAL_HOURS,   # менять в updater.py
-        on_update_done=reload_all_sessions,      # callback после обновления
-        run_on_start=False,                      # True = сразу краулить при старте
-    )
-    _scheduler.start()
-    logger.info(f"[main] Планировщик запущен (каждые {UPDATE_INTERVAL_HOURS} ч.)")
+    # Start assistant warmup without blocking the API.
+    _rag_startup_task = asyncio.create_task(_init_rag_and_scheduler_bg())
 
     yield
 
     # Остановка
+    if _rag_startup_task and not _rag_startup_task.done():
+        _rag_startup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _rag_startup_task
     if _scheduler:
         _scheduler.stop()
     logger.info("[main] Сервер остановлен")
@@ -110,8 +149,10 @@ def local_docs():
 ensure_postgresql_extensions(engine)
 Base.metadata.create_all(bind=engine)
 ensure_certificate_layout_columns(engine)
+ensure_article_editor_columns(engine)
 ensure_tpmpk_bot_question_columns(engine)
 ensure_tpmpk_slot_minutes_range(engine)
+ensure_user_role_permission_columns(engine)
 
 app.include_router(assistant_router)
 app.include_router(certificates_router)
@@ -119,6 +160,7 @@ app.include_router(users_router)
 app.include_router(appointments_router)
 app.include_router(articles_router)
 app.include_router(tpmpk_router)
+app.include_router(dom_uchitelya_router)
 
 
 # ── Состояние фоновых задач ───────────────────────────────────────────────────
@@ -322,20 +364,44 @@ def full_reindex(background_tasks: BackgroundTasks):
 
 # ── Аутентификация ────────────────────────────────────────────────────────────
 
-def _user_role_name(db: Session, user: User) -> str | None:
+def _user_role(db: Session, user: User) -> UserRole | None:
     if user.role_id is None:
         return None
-    role = db.query(UserRole).filter(UserRole.id == user.role_id).first()
+    return db.query(UserRole).filter(UserRole.id == user.role_id).first()
+
+
+def _user_role_name(db: Session, user: User) -> str | None:
+    role = _user_role(db, user)
     return role.role_name if role else None
 
 
 def _user_response(db: Session, user: User) -> UserResponse:
+    role = _user_role(db, user)
     return UserResponse(
         id=user.id,
         email=user.email,
         username=user.username,
         is_active=user.is_active,
-        role=_user_role_name(db, user),
+        role=role.role_name if role else None,
+        can_access_internal_docs=bool(
+            getattr(role, "can_access_internal_docs", False)
+        ),
+    )
+
+
+def _token_response(db: Session, user: User) -> Token:
+    role_name = _user_role_name(db, user)
+    return Token(
+        access_token=create_access_token(
+            data={"sub": user.email, "role": role_name},
+            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        ),
+        refresh_token=create_refresh_token(
+            data={"sub": user.email},
+            expires_delta=timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+        ),
+        role=role_name,
+        user=_user_response(db, user),
     )
 
 
@@ -373,16 +439,16 @@ def login(
             detail="Неверный логин или пароль",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    role_name = _user_role_name(db, user)
-    access_token = create_access_token(
-        data={"sub": user.email, "role": role_name},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-    )
-    return Token(
-        access_token=access_token,
-        role=role_name,
-        user=_user_response(db, user),
-    )
+    return _token_response(db, user)
+
+
+@app.post("/auth/refresh", response_model=Token)
+def refresh_auth_token(
+    payload: RefreshTokenRequest,
+    db: Session = Depends(get_db),
+):
+    user = get_user_from_refresh_token(payload.refresh_token, db)
+    return _token_response(db, user)
 
 
 @app.get("/auth/me", response_model=UserResponse)
