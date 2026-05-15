@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Path as ApiPath
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import Any
@@ -42,6 +43,8 @@ _status_lock = Lock()
 _warmup_started_at: str | None = None
 _warmup_completed_at: str | None = None
 _assistant_last_error: str | None = None
+_assistant_last_request_error: str | None = None
+_assistant_last_request_error_at: str | None = None
 _evicted_sessions_total = 0
 _rate_limit_lock = Lock()
 _rate_limit_buckets: dict[str, list[float]] = {}
@@ -61,13 +64,6 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=ASSISTANT_QUESTION_MAX_LENGTH)
     session_id: str = Field("default", min_length=1, max_length=ASSISTANT_SESSION_ID_MAX_LENGTH)
 
-class AskResponse(BaseModel):
-    answer:             str
-    rewritten_question: str
-    sources:            list[dict]
-    access_scope:       str
-    user_role:          str | None = None
-
 
 class AssistantStatusResponse(BaseModel):
     status:              str
@@ -80,6 +76,8 @@ class AssistantStatusResponse(BaseModel):
     warmup_started_at:   str | None = None
     warmup_completed_at: str | None = None
     last_error:          str | None = None
+    last_request_error:  str | None = None
+    last_request_error_at: str | None = None
     session_ttl_seconds: int
     max_sessions:        int
     evicted_sessions:    int
@@ -155,6 +153,13 @@ def set_assistant_last_error(message: str | None) -> None:
     global _assistant_last_error
     with _status_lock:
         _assistant_last_error = message
+
+
+def set_assistant_last_request_error(message: str | None) -> None:
+    global _assistant_last_request_error, _assistant_last_request_error_at
+    with _status_lock:
+        _assistant_last_request_error = message
+        _assistant_last_request_error_at = _now_utc_iso() if message else None
 
 
 def _mark_embeddings_ready() -> None:
@@ -424,6 +429,11 @@ def _request_metrics_snapshot() -> dict:
         }
 
 
+def _sse(event: str, data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
 def get_vectorstore() -> Any:
     """Возвращает единый Chroma-объект, создаёт при первом вызове."""
     global _vectorstore
@@ -516,6 +526,8 @@ def get_assistant_status() -> AssistantStatusResponse:
         warmup_started_at = _warmup_started_at
         warmup_completed_at = _warmup_completed_at
         last_error = _assistant_last_error
+        last_request_error = _assistant_last_request_error
+        last_request_error_at = _assistant_last_request_error_at
         evicted_sessions = _evicted_sessions_total
 
     ready = bool(
@@ -545,6 +557,8 @@ def get_assistant_status() -> AssistantStatusResponse:
         warmup_started_at=warmup_started_at,
         warmup_completed_at=warmup_completed_at,
         last_error=last_error,
+        last_request_error=last_request_error,
+        last_request_error_at=last_request_error_at,
         session_ttl_seconds=ASSISTANT_SESSION_TTL_SECONDS,
         max_sessions=ASSISTANT_MAX_SESSIONS,
         evicted_sessions=evicted_sessions,
@@ -859,52 +873,76 @@ def status():
     return get_assistant_status()
 
 
-@router.post("/ask", response_model=AskResponse)
-def ask(
+@router.post("/ask/stream")
+def ask_stream(
     body: AskRequest,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
 ):
     started_at = monotonic()
-    successful = False
     try:
         cleanup_idle_sessions()
         question = _validated_question(body.question)
         role_name, access_scope, clean_session_id, session_key = _session_context(db, current_user, body.session_id)
         _check_assistant_rate_limit(request, current_user)
-        with _get_session_lock(session_key):
-            rag = _get_or_create_rag_locked(session_key)
-            _hydrate_rag_memory(session_key, rag)
-            try:
-                result = rag.ask(question, access_scope=access_scope)
-            except Exception:
-                set_assistant_last_error("Ошибка при обработке вопроса. Подробности в логах backend.")
-                logger.exception("[assistant] Failed to answer question")
-                raise HTTPException(
-                    status_code=500,
-                    detail="Не удалось получить ответ ассистента. Попробуйте позже.",
-                )
-            _append_history_turn(
-                session_key=session_key,
-                session_id=clean_session_id,
-                user=current_user,
-                user_role=role_name,
-                access_scope=access_scope,
-                question=question,
-                result=result,
-            )
-        response = AskResponse(
-            answer=result["answer"],
-            rewritten_question=result["rewritten_question"],
-            sources=result["sources"],
-            access_scope=result["access_scope"],
-            user_role=role_name,
-        )
-        successful = True
-        return response
-    finally:
-        _record_assistant_request(monotonic() - started_at, successful)
+    except Exception:
+        _record_assistant_request(monotonic() - started_at, False)
+        raise
+
+    def event_stream():
+        successful = False
+        try:
+            yield _sse("status", {"stage": "queued", "message": "Запрос принят"})
+            with _get_session_lock(session_key):
+                rag = _get_or_create_rag_locked(session_key)
+                _hydrate_rag_memory(session_key, rag)
+                for event in rag.ask_stream(question, access_scope=access_scope):
+                    event_type = event.get("type", "status")
+                    if event_type == "token":
+                        yield _sse("token", {"content": event.get("content", "")})
+                    elif event_type == "done":
+                        result = event.get("result") or {}
+                        _append_history_turn(
+                            session_key=session_key,
+                            session_id=clean_session_id,
+                            user=current_user,
+                            user_role=role_name,
+                            access_scope=access_scope,
+                            question=question,
+                            result=result,
+                        )
+                        set_assistant_last_request_error(None)
+                        successful = True
+                        yield _sse("done", {**result, "user_role": role_name})
+                    elif event_type == "rewritten_question":
+                        yield _sse("rewritten_question", {
+                            "rewritten_question": event.get("rewritten_question", question)
+                        })
+                    elif event_type == "sources":
+                        yield _sse("sources", {"sources": event.get("sources", [])})
+                    else:
+                        yield _sse("status", {
+                            "stage": event.get("stage", event_type),
+                            "message": event.get("message", ""),
+                        })
+        except Exception:
+            set_assistant_last_request_error("Ошибка при потоковой обработке вопроса. Подробности в логах backend.")
+            logger.exception("[assistant] Failed to stream answer")
+            yield _sse("error", {
+                "detail": "Не удалось получить ответ ассистента. Попробуйте позже.",
+            })
+        finally:
+            _record_assistant_request(monotonic() - started_at, successful)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/clear/{session_id}")

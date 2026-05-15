@@ -35,7 +35,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import Optional
+from typing import Iterator, Optional
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -220,11 +220,12 @@ class CrossEncoderReranker:
     TITLE_MATCH_BOOST:    float = 0.2   # совпадение title (для не-S3 страниц)
 
     def __init__(self, model_name: str, top_k: int, threshold: float = 0.0):
-        print(f"[reranker] Загрузка модели: {model_name}")
+        logger.info("[reranker] loading model: %s", model_name)
         self._model     = CrossEncoder(model_name, max_length=512)
         self._top_k     = top_k
         self._threshold = threshold
-        print(f"[reranker] Готово. top-{top_k}, порог скора: {threshold}")
+        self._predict_lock = Lock()
+        logger.info("[reranker] ready. top-%s, score threshold: %s", top_k, threshold)
 
     @staticmethod
     def _enrich_payload(doc: Document) -> str:
@@ -274,7 +275,8 @@ class CrossEncoderReranker:
 
         # 1. CrossEncoder-скор с обогащённым payload
         pairs       = [(query, self._enrich_payload(doc)) for doc in docs]
-        base_scores = [float(s) for s in self._model.predict(pairs)]
+        with self._predict_lock:
+            base_scores = [float(s) for s in self._model.predict(pairs)]
 
         # 2. Бусты за совпадение имени документа в запросе
         query_norm = self._normalize(query)
@@ -309,23 +311,24 @@ class CrossEncoderReranker:
         # Сигнал низкого качества ретривала
         max_score = scored[0][0] if scored else 0.0
         if max_score < self.LOW_QUALITY_THRESHOLD:
-            print(
-                f"[reranker] ⚠ Низкое качество (max score={max_score:.3f}) — "
-                "возможно, в базе нет релевантного контента"
+            logger.warning(
+                "[reranker] low quality retrieval: max score=%.3f; "
+                "possibly no relevant content in knowledge base",
+                max_score,
             )
 
         # Лог: показываем и base, и итоговый скор (если был буст)
-        print("[reranker] Топ результаты:")
+        logger.debug("[reranker] top results:")
         shown = diversified[: self._top_k] if diversified else scored[: self._top_k]
         for score, doc in shown:
-            mark  = "✓" if score >= self._threshold else "✗"
+            mark  = "ok" if score >= self._threshold else "skip"
             title = (doc.metadata.get("title") or "")[:45]
             idx   = docs.index(doc)
             base  = base_scores[idx]
             delta = score - base
             extra = f"  (base {base:+.3f} +{delta:.2f})" if abs(delta) > 1e-6 else ""
             tag   = " [HDR]" if doc.metadata.get("is_header") else ""
-            print(f"  {mark} {score:+.3f}  {title}{tag}{extra}")
+            logger.debug("[reranker] %s %+.3f %s%s%s", mark, score, title, tag, extra)
 
         return top_docs
 
@@ -441,7 +444,7 @@ class RAGSystem:
         )
         self._setup()
         count = self._vectorstore._collection.count()
-        print(f"[rag] Индекс загружен. Векторов в базе: {count}")
+        logger.info("[rag] index loaded. vector count: %s", count)
 
     def set_vectorstore(self, vectorstore: Chroma) -> None:
         self._vectorstore = vectorstore
@@ -495,6 +498,35 @@ class RAGSystem:
             return response.choices[0].message.content or ""
         except (AttributeError, IndexError) as e:
             raise RuntimeError("GigaChat returned empty response") from e
+
+    def _stream_gigachat(self, messages: list[Messages]) -> Iterator[str]:
+        payload = Chat(
+            messages=messages,
+            max_tokens=self.cfg.max_tokens,
+            temperature=self.cfg.temperature,
+            stream=True,
+            update_interval=0.2,
+        )
+        started_at = perf_counter()
+        try:
+            with GigaChat(**self._gc_kwargs) as client:
+                for chunk in client.stream(payload):
+                    for choice in getattr(chunk, "choices", []) or []:
+                        content = getattr(getattr(choice, "delta", None), "content", None)
+                        if content:
+                            yield content
+        except Exception as e:
+            elapsed = perf_counter() - started_at
+            logger.warning(
+                "[gigachat] stream failed after %.2fs: %s",
+                elapsed,
+                type(e).__name__,
+                exc_info=True,
+            )
+            raise RuntimeError("GigaChat stream failed") from e
+
+        elapsed = perf_counter() - started_at
+        logger.info("[gigachat] stream finished in %.2fs", elapsed)
 
     # ── Шаг 1: перефразировать вопрос с учётом истории ───────────────────────
 
@@ -550,7 +582,7 @@ class RAGSystem:
         rewritten = self._call_gigachat(messages).strip()
 
         if rewritten and rewritten != question:
-            print(f"[memory] Вопрос переформулирован: «{rewritten}»")
+            logger.info("[memory] question rewritten: %s", rewritten)
 
         return rewritten or question
 
@@ -619,7 +651,7 @@ class RAGSystem:
         ]
         denied_count = len(candidates) - len(allowed)
         if denied_count:
-            print(f"[access] Отфильтровано внутренних чанков: {denied_count}")
+            logger.info("[access] filtered internal chunks: %s", denied_count)
         return self._reranker.rerank(query, allowed), self._find_denied_requested_docs(query, denied)
 
     # ── Шаг 3: форматировать чанки ───────────────────────────────────────────
@@ -662,7 +694,7 @@ class RAGSystem:
         except TypeError:
             existing = self._vectorstore.get(include=["documents", "metadatas"])
         except Exception as e:
-            print(f"[site-context] Не удалось прочитать контекст сайта: {e}")
+            logger.warning("[site-context] failed to read site context: %s", e, exc_info=True)
             return ""
 
         documents = existing.get("documents") or []
@@ -731,13 +763,13 @@ class RAGSystem:
 
     # ── Шаг 4: генерировать ответ с историей ─────────────────────────────────
 
-    def _generate_answer(
+    def _answer_messages(
         self,
         question: str,
         context: str,
         site_context: str = "",
         access_scope: str = "public",
-    ) -> str:
+    ) -> list[Messages]:
         access_instruction = (
             "Сейчас открыт контур сотрудника. Можно использовать внутренние документы, "
             "если они есть в предоставленном тексте. Не раскрывай персональные данные, "
@@ -785,7 +817,52 @@ class RAGSystem:
             + [Messages(role=MessagesRole.USER, content=question)]
         )
 
-        return self._call_gigachat(messages)
+        return messages
+
+    def _generate_answer(
+        self,
+        question: str,
+        context: str,
+        site_context: str = "",
+        access_scope: str = "public",
+    ) -> str:
+        return self._call_gigachat(
+            self._answer_messages(
+                question,
+                context,
+                site_context=site_context,
+                access_scope=access_scope,
+            )
+        )
+
+    @staticmethod
+    def _sources_from_docs(docs: list[Document]) -> list[dict]:
+        seen, sources = set(), []
+        for doc in docs:
+            url = doc.metadata.get("source", "")
+            if url.startswith("__"):
+                url = doc.metadata.get("page_url", "")
+            if url and url not in seen:
+                seen.add(url)
+                sources.append({
+                    "title":        doc.metadata.get("title", ""),
+                    "source":       url,
+                    "access_level": document_access_level(doc.metadata),
+                })
+        return sources
+
+    @staticmethod
+    def _log_retrieved_context(query: str, access_scope: str, docs: list[Document]) -> None:
+        logger.info(
+            "[rag] query=%r access_scope=%s context_chunks=%s",
+            query,
+            access_scope,
+            len(docs),
+        )
+        for index, doc in enumerate(docs, 1):
+            source = doc.metadata.get("source", "")[:90]
+            title = doc.metadata.get("title", "")[:60]
+            logger.debug("[rag] context doc %s: [%s] %s", index, title, source)
 
     # ── Основной метод ────────────────────────────────────────────────────────
 
@@ -804,13 +881,7 @@ class RAGSystem:
         rewritten = self._rewrite_question(question)
         top_docs, denied_requested_docs = self._retrieve_and_rerank(rewritten, access_scope)
 
-        print(f"[rag] Запрос: {rewritten!r}")
-        print(f"[rag] Контур доступа: {access_scope}")
-        print(f"[rag] В контекст попали {len(top_docs)} чанков:")
-        for i, doc in enumerate(top_docs, 1):
-            src   = doc.metadata.get("source", "")[:90]
-            title = doc.metadata.get("title", "")[:60]
-            print(f"  {i}. [{title}] {src}")
+        self._log_retrieved_context(rewritten, access_scope, top_docs)
 
         if denied_requested_docs and access_scope != EMPLOYEE_SCOPE:
             answer = self._access_denied_answer(denied_requested_docs)
@@ -833,18 +904,7 @@ class RAGSystem:
 
         self.memory.save(question, answer)
 
-        seen, sources = set(), []
-        for doc in top_docs:
-            url = doc.metadata.get("source", "")
-            if url.startswith("__"):
-                url = doc.metadata.get("page_url", "")
-            if url and url not in seen:
-                seen.add(url)
-                sources.append({
-                    "title":        doc.metadata.get("title", ""),
-                    "source":       url,
-                    "access_level": document_access_level(doc.metadata),
-                })
+        sources = self._sources_from_docs(top_docs)
 
         return {
             "answer":             answer,
@@ -853,15 +913,74 @@ class RAGSystem:
             "access_scope":       access_scope,
         }
 
+    def ask_stream(self, question: str, access_scope: str = "public") -> Iterator[dict]:
+        if self._base_retriever is None:
+            raise RuntimeError("Сначала вызовите load_index() или set_vectorstore().")
+
+        yield {"type": "status", "stage": "rewrite", "message": "Уточняю вопрос"}
+        rewritten = self._rewrite_question(question)
+        yield {"type": "rewritten_question", "rewritten_question": rewritten}
+
+        yield {"type": "status", "stage": "retrieve", "message": "Ищу материалы в базе знаний"}
+        top_docs, denied_requested_docs = self._retrieve_and_rerank(rewritten, access_scope)
+        sources = self._sources_from_docs(top_docs)
+        yield {"type": "sources", "sources": sources}
+
+        self._log_retrieved_context(rewritten, access_scope, top_docs)
+
+        if denied_requested_docs and access_scope != EMPLOYEE_SCOPE:
+            answer = self._access_denied_answer(denied_requested_docs)
+            self.memory.save(question, answer)
+            yield {"type": "token", "content": answer}
+            yield {
+                "type": "done",
+                "result": {
+                    "answer":             answer,
+                    "rewritten_question": rewritten,
+                    "sources":            [],
+                    "access_scope":       access_scope,
+                },
+            }
+            return
+
+        site_context = self._site_context_from_docs(top_docs) or self._load_site_context()
+        context      = self._format_docs(top_docs, site_context=site_context)
+        messages     = self._answer_messages(
+            rewritten,
+            context,
+            site_context=site_context,
+            access_scope=access_scope,
+        )
+
+        yield {"type": "status", "stage": "generate", "message": "Готовлю ответ"}
+        answer_parts: list[str] = []
+        for chunk in self._stream_gigachat(messages):
+            answer_parts.append(chunk)
+            yield {"type": "token", "content": chunk}
+
+        answer = "".join(answer_parts).strip()
+        if not answer:
+            raise RuntimeError("GigaChat stream returned empty response")
+
+        self.memory.save(question, answer)
+        yield {
+            "type": "done",
+            "result": {
+                "answer":             answer,
+                "rewritten_question": rewritten,
+                "sources":            sources,
+                "access_scope":       access_scope,
+            },
+        }
+
     # ── Утилиты ───────────────────────────────────────────────────────────────
 
     def clear_memory(self) -> None:
         self.memory.clear()
-        print("[memory] История диалога очищена.")
+        logger.info("[memory] dialog history cleared")
 
     def print_history(self) -> None:
         if self.memory.is_empty():
-            print("[memory] История пуста.")
+            logger.info("[memory] history is empty")
             return
-        print(f"[memory] История ({len(self.memory)} обменов):")
-        print(self.memory.as_text())
+        logger.info("[memory] history (%s turns):\n%s", len(self.memory), self.memory.as_text())
