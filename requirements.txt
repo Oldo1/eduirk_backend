@@ -44,5 +44,8 @@ beautifulsoup4
 boto3
 pypdf
 python-docx
+pymupdf
+surya-ocr
+mammoth
 pytesseract
 pdf2image

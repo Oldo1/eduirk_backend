@@ -9,6 +9,7 @@ uvicorn[standard]
 # База данных
 sqlalchemy
 psycopg2-binary
+alembic
 
 # Аутентификация
 python-jose[cryptography]
@@ -42,5 +43,8 @@ beautifulsoup4
 boto3
 pypdf
 python-docx
+pymupdf
+surya-ocr
+mammoth
 pytesseract
 pdf2image

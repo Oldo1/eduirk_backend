@@ -95,6 +95,26 @@ def _decline_with_petrovich(fio: str, case: str, gender: str | None) -> str | No
     if len(parts) < 2:
         return None
 
+    # pytrovich package API used by Docker requirements.
+    try:
+        from pytrovich.maker import PetrovichDeclinationMaker  # type: ignore
+        from pytrovich.enums import Case, Gender, NamePart  # type: ignore
+
+        petrovich = PetrovichDeclinationMaker()
+        target_case = Case.DATIVE
+        target_gender = Gender.FEMALE if gender == "female" else Gender.MALE
+        declined = [
+            petrovich.make(NamePart.LASTNAME, target_gender, target_case, parts[0]),
+            petrovich.make(NamePart.FIRSTNAME, target_gender, target_case, parts[1]),
+        ]
+        if len(parts) >= 3:
+            declined.append(
+                petrovich.make(NamePart.MIDDLENAME, target_gender, target_case, parts[2])
+            )
+        return " ".join(declined + parts[3:])
+    except Exception:
+        pass
+
     # pytrovich package API.
     try:
         from petrovich.main import Petrovich  # type: ignore
