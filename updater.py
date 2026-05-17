@@ -567,13 +567,38 @@ def _update_from_s3(
         "conflict_skipped": 0,
         "folder_conflicts": 0,
         "conflicted_files": [],
+        "removed": 0,
+        "removed_files": [],
     }
 
     if progress_cb: progress_cb("s3_list", 0, 0, "Запрашиваю список S3…")
-    s3_current = list_s3_documents()   # key → etag (без скачивания)
+    s3_current = list_s3_documents(raise_on_error=True)   # key → etag (без скачивания)
     total = len(s3_current)
     if progress_cb: progress_cb("s3_list", total, total, f"Всего файлов в бакете: {total}")
     indexed_s3_keys = _get_indexed_metadata_values(vectorstore, "s3_key")
+    current_s3_keys = set(s3_current.keys())
+    known_s3_keys = state.all_s3_keys() | indexed_s3_keys
+    removed_s3_keys = sorted(known_s3_keys - current_s3_keys)
+
+    if removed_s3_keys:
+        removed_ids = _get_chunk_ids_by_s3_key(vectorstore, removed_s3_keys)
+        if removed_ids:
+            ids_to_delete.extend(removed_ids)
+        for key in removed_s3_keys:
+            state.remove_s3(key)
+        stats["removed"] = len(removed_s3_keys)
+        stats["removed_files"] = removed_s3_keys
+        logger.info(
+            f"[s3] Удалены из облачного хранилища: {len(removed_s3_keys)} файлов; "
+            f"помечено к удалению чанков: {len(removed_ids)}"
+        )
+        if progress_cb:
+            progress_cb(
+                "s3_removed",
+                len(removed_s3_keys),
+                len(removed_s3_keys),
+                f"Удалено из S3: {len(removed_s3_keys)} файлов",
+            )
 
     folder_conflicts = find_s3_folder_conflicts(s3_current.keys())
     conflict_keys = {
@@ -708,6 +733,7 @@ def _update_from_s3(
     logger.info(
         f"[s3] Итого: +{stats['added']} новых, "
         f"{stats['skipped']} без изменений, "
+        f"{stats['removed']} удалено из облака, "
         f"{stats['conflict_skipped']} пропущено из-за конфликта папок, "
         f"{stats['cache_hits']} из cache, "
         f"{stats['downloaded']} скачано, "

@@ -53,7 +53,7 @@ def is_ocr_available() -> bool:
         return _ocr_available
 
     try:
-        import fitz                                       # noqa: F401
+        import fitz                                     
         from surya.foundation   import FoundationPredictor
         from surya.detection    import DetectionPredictor
         from surya.recognition  import RecognitionPredictor

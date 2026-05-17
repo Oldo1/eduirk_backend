@@ -3,15 +3,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import Any
-from auth import get_optional_current_user
-from database import get_db
-from models import User, UserRole
+from auth import get_current_user, get_optional_current_user
+from database import SessionLocal, get_db
+from models import AssistantChatMessage, AssistantChatSession, User, UserRole
 from assistant_access import access_scope_for_role, scoped_session_id
 from datetime import datetime, timezone
-from pathlib import Path
 from threading import Lock
 from time import monotonic
-import hashlib
 import json
 import logging
 import os
@@ -21,8 +19,6 @@ import uuid
 logger = logging.getLogger("assistant")
 
 router = APIRouter(prefix="/assistant", tags=["assistant"])
-ASSISTANT_HISTORY_FILE = Path(os.getenv("ASSISTANT_HISTORY_FILE", "./chroma_gigachat/assistant_history.json"))
-ASSISTANT_HISTORY_DIR = Path(os.getenv("ASSISTANT_HISTORY_DIR", str(ASSISTANT_HISTORY_FILE.with_suffix(""))))
 ASSISTANT_HISTORY_MAX_MESSAGES = int(os.getenv("ASSISTANT_HISTORY_MAX_MESSAGES", "400"))
 ASSISTANT_QUESTION_MAX_LENGTH = max(1, int(os.getenv("ASSISTANT_QUESTION_MAX_LENGTH", "4000")))
 ASSISTANT_SESSION_ID_MAX_LENGTH = max(1, int(os.getenv("ASSISTANT_SESSION_ID_MAX_LENGTH", "120")))
@@ -36,9 +32,6 @@ ASSISTANT_RATE_LIMIT_MAX_REQUESTS = int(os.getenv("ASSISTANT_RATE_LIMIT_MAX_REQU
 ASSISTANT_RATE_LIMIT_MAX_ENTRIES = int(os.getenv("ASSISTANT_RATE_LIMIT_MAX_ENTRIES", "1000"))
 WARMUP_SESSION_ID = "__warmup__"
 SESSION_ID_RE = re.compile(r"^[0-9A-Za-zА-Яа-яЁё._:@-]+$")
-_history_lock = Lock()
-_hydrated_sessions: set[str] = set()
-_hydrated_sessions_lock = Lock()
 _status_lock = Lock()
 _warmup_started_at: str | None = None
 _warmup_completed_at: str | None = None
@@ -97,6 +90,12 @@ class AssistantStatusResponse(BaseModel):
     last_request_duration_seconds: float | None
     max_request_duration_seconds: float | None
     last_request_at: str | None
+
+
+class AssistantAnswerQualityRequest(BaseModel):
+    score: int | None = Field(None, ge=1, le=5)
+    comment: str | None = Field(None, max_length=1000)
+    tags: list[str] = Field(default_factory=list, max_length=10)
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 
@@ -240,11 +239,6 @@ def _touch_session_unlocked(session_id: str, now: float | None = None) -> None:
     _session_accessed_at[session_id] = now if now is not None else monotonic()
 
 
-def _discard_hydrated_session(session_id: str) -> None:
-    with _hydrated_sessions_lock:
-        _hydrated_sessions.discard(session_id)
-
-
 def cleanup_idle_sessions(force: bool = False) -> int:
     global _last_session_cleanup_at, _evicted_sessions_total
 
@@ -301,7 +295,6 @@ def cleanup_idle_sessions(force: bool = False) -> int:
                 _sessions.pop(session_id, None)
                 _session_accessed_at.pop(session_id, None)
 
-            _discard_hydrated_session(session_id)
             evicted += 1
         finally:
             session_lock.release()
@@ -586,66 +579,6 @@ def _user_role_name(db: Session, user: User | None) -> str | None:
     return role.role_name if role else None
 
 
-def _history_empty() -> dict:
-    return {"version": 1, "sessions": {}}
-
-
-def _session_history_path(session_key: str) -> Path:
-    digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
-    return ASSISTANT_HISTORY_DIR / f"{digest}.json"
-
-
-def _read_legacy_history_unlocked() -> dict:
-    if not ASSISTANT_HISTORY_FILE.exists():
-        return _history_empty()
-    try:
-        data = json.loads(ASSISTANT_HISTORY_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning(f"[assistant-history] Failed to read legacy JSON history: {e}")
-        return _history_empty()
-    if not isinstance(data, dict):
-        return _history_empty()
-    data.setdefault("version", 1)
-    data.setdefault("sessions", {})
-    return data
-
-
-def _session_from_history_payload(data: dict) -> dict | None:
-    if not isinstance(data, dict):
-        return None
-    session = data.get("session") if isinstance(data.get("session"), dict) else data
-    if not isinstance(session, dict):
-        return None
-    session.setdefault("messages", [])
-    return session
-
-
-def _read_session_history_unlocked(session_key: str) -> dict | None:
-    path = _session_history_path(session_key)
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.warning(f"[assistant-history] Failed to read session JSON history: {e}")
-            return None
-        return _session_from_history_payload(data)
-
-    legacy_session = _read_legacy_history_unlocked().get("sessions", {}).get(session_key)
-    if isinstance(legacy_session, dict):
-        legacy_session.setdefault("messages", [])
-        return legacy_session
-    return None
-
-
-def _write_session_history_unlocked(session_key: str, session: dict) -> None:
-    ASSISTANT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    path = _session_history_path(session_key)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    payload = {"version": 2, "session": session}
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
-
-
 def _session_context(db: Session, user: User | None, session_id: str) -> tuple[str | None, str, str, str]:
     role = _user_role(db, user)
     role_name = role.role_name if role else None
@@ -696,41 +629,224 @@ def _validated_session_id(session_id: str | None) -> str:
     return clean_session_id
 
 
-def _history_session_payload(
+def _dt_iso(value: Any) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _history_session_query(db: Session, session_key: str):
+    return db.query(AssistantChatSession).filter(
+        AssistantChatSession.session_key == session_key
+    )
+
+
+def _sync_history_session(
+    db: Session,
     *,
     session_key: str,
     session_id: str,
     user: User | None,
     user_role: str | None,
     access_scope: str,
-    created_at: str,
-    updated_at: str,
-    messages: list[dict] | None = None,
-) -> dict:
+) -> AssistantChatSession:
+    now = datetime.now(timezone.utc)
+    session = _history_session_query(db, session_key).first()
+    if session is None:
+        session = AssistantChatSession(
+            session_key=session_key,
+            session_id=session_id,
+            access_scope=access_scope,
+            user_role=user_role,
+            user_id=user.id if user else None,
+            user_email=user.email if user else None,
+            username=user.username if user else None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(session)
+        db.flush()
+        return session
+
+    session.session_id = session_id
+    session.access_scope = access_scope
+    session.user_role = user_role
+    session.user_id = user.id if user else None
+    session.user_email = user.email if user else None
+    session.username = user.username if user else None
+    session.updated_at = now
+    db.flush()
+    return session
+
+
+def _db_user_history_payload(session: AssistantChatSession) -> dict:
     return {
-        "session_id": session_id,
-        "scoped_session_id": session_key,
-        "access_scope": access_scope,
-        "user_role": user_role,
-        "user": _user_history_payload(user),
-        "created_at": created_at,
-        "updated_at": updated_at,
-        "messages": messages or [],
+        "id": session.user_id,
+        "email": session.user_email,
+        "username": session.username,
     }
 
 
-def _get_session_history(session_key: str, fallback: dict, limit: int | None = None) -> dict:
-    with _history_lock:
-        session = _read_session_history_unlocked(session_key)
-    if not session:
-        session = fallback
-    messages = list(session.get("messages") or [])
+def _normalize_manual_quality_payload(value: Any) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    normalized = dict(value)
+    raw_score = normalized.get("score")
+    try:
+        score = int(raw_score)
+    except (TypeError, ValueError):
+        return None
+    normalized["score"] = max(1, min(5, score))
+    normalized["max_score"] = 5
+    return normalized
+
+
+def _db_message_payload(message: AssistantChatMessage) -> dict:
+    payload = {
+        "id": f"{message.turn_id}:{message.role}" if message.turn_id else str(message.id),
+        "db_id": message.id,
+        "turn_id": message.turn_id,
+        "role": message.role,
+        "content": message.content,
+        "created_at": _dt_iso(message.created_at),
+    }
+    if message.message_metadata:
+        metadata = dict(message.message_metadata)
+        metadata.pop("quality", None)
+        manual_quality = _normalize_manual_quality_payload(metadata.get("manual_quality"))
+        if manual_quality:
+            metadata["manual_quality"] = manual_quality
+            payload["manual_quality"] = manual_quality
+            payload["quality"] = manual_quality
+        else:
+            metadata.pop("manual_quality", None)
+            payload["manual_quality"] = None
+            payload["quality"] = None
+        payload["metadata"] = metadata
+    return payload
+
+
+def _db_session_payload(
+    session: AssistantChatSession,
+    messages: list[AssistantChatMessage],
+) -> dict:
+    return {
+        "session_id": session.session_id,
+        "scoped_session_id": session.session_key,
+        "access_scope": session.access_scope,
+        "user_role": session.user_role,
+        "user": _db_user_history_payload(session),
+        "created_at": _dt_iso(session.created_at),
+        "updated_at": _dt_iso(session.updated_at),
+        "messages": [_db_message_payload(message) for message in messages],
+    }
+
+
+def _get_session_history(
+    db: Session,
+    session_key: str,
+    fallback: dict,
+    limit: int | None = None,
+) -> dict:
+    session = _history_session_query(db, session_key).first()
+    if session is None:
+        return fallback
+
+    query = db.query(AssistantChatMessage).filter(
+        AssistantChatMessage.assistant_session_id == session.id
+    )
     if limit and limit > 0:
-        messages = messages[-limit:]
-    return {**session, "messages": messages}
+        messages = list(
+            reversed(
+                query.order_by(AssistantChatMessage.id.desc())
+                .limit(limit)
+                .all()
+            )
+        )
+    else:
+        messages = query.order_by(AssistantChatMessage.id.asc()).all()
+    return _db_session_payload(session, messages)
+
+
+def _get_answer_message_or_404(db: Session, message_id: int) -> AssistantChatMessage:
+    message = db.query(AssistantChatMessage).filter(
+        AssistantChatMessage.id == message_id,
+        AssistantChatMessage.role == "assistant",
+    ).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Ответ ассистента не найден")
+    return message
+
+
+def _question_for_answer(db: Session, message: AssistantChatMessage) -> AssistantChatMessage | None:
+    return db.query(AssistantChatMessage).filter(
+        AssistantChatMessage.assistant_session_id == message.assistant_session_id,
+        AssistantChatMessage.turn_id == message.turn_id,
+        AssistantChatMessage.role == "user",
+    ).order_by(AssistantChatMessage.id.asc()).first()
+
+
+def _clean_quality_tags(tags: list[str]) -> list[str]:
+    clean_tags: list[str] = []
+    for tag in tags:
+        clean_tag = str(tag or "").strip()
+        if clean_tag:
+            clean_tags.append(clean_tag[:64])
+        if len(clean_tags) >= 10:
+            break
+    return clean_tags
+
+
+def _manual_quality_payload(
+    body: AssistantAnswerQualityRequest,
+    current_user: User,
+    user_role: str | None,
+) -> dict | None:
+    if body.score is None:
+        return None
+    comment = body.comment.strip() if body.comment else None
+    return {
+        "score": body.score,
+        "max_score": 5,
+        "comment": comment or None,
+        "tags": _clean_quality_tags(body.tags),
+        "rated_at": _now_utc_iso(),
+        "rated_by": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "username": current_user.username,
+            "role": user_role,
+        },
+    }
+
+
+def _answer_quality_payload(db: Session, message: AssistantChatMessage) -> dict:
+    message_payload = _db_message_payload(message)
+    metadata = message_payload.get("metadata") or {}
+    question_message = _question_for_answer(db, message)
+    session = message.session
+    return {
+        "message_id": message.id,
+        "turn_id": message.turn_id,
+        "session": {
+            "id": session.id if session else None,
+            "session_id": session.session_id if session else None,
+            "scoped_session_id": session.session_key if session else None,
+            "access_scope": session.access_scope if session else None,
+            "user_role": session.user_role if session else None,
+            "user": _db_user_history_payload(session) if session else None,
+        },
+        "question": question_message.content if question_message else None,
+        "answer": message.content,
+        "created_at": _dt_iso(message.created_at),
+        "quality": message_payload.get("manual_quality"),
+        "manual_quality": message_payload.get("manual_quality"),
+        "rated": message_payload.get("manual_quality") is not None,
+        "sources": metadata.get("sources", []),
+        "metadata": metadata,
+    }
 
 
 def _append_history_turn(
+    db: Session,
     *,
     session_key: str,
     session_id: str,
@@ -740,102 +856,97 @@ def _append_history_turn(
     question: str,
     result: dict,
 ) -> None:
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at = datetime.now(timezone.utc)
     turn_id = uuid.uuid4().hex
-    with _history_lock:
-        session = _read_session_history_unlocked(session_key)
-        if not session:
-            session = _history_session_payload(
-                session_key=session_key,
-                session_id=session_id,
-                user=user,
-                user_role=user_role,
-                access_scope=access_scope,
-                created_at=created_at,
-                updated_at=created_at,
-            )
-        else:
-            session.update(
-                {
-                    "session_id": session_id,
-                    "scoped_session_id": session_key,
-                    "access_scope": access_scope,
-                    "user_role": user_role,
-                    "user": _user_history_payload(user),
-                    "updated_at": created_at,
-                }
-            )
-        session.setdefault("messages", []).extend(
+    try:
+        session = _sync_history_session(
+            db,
+            session_key=session_key,
+            session_id=session_id,
+            user=user,
+            user_role=user_role,
+            access_scope=access_scope,
+        )
+        db.add_all(
             [
-                {
-                    "id": f"{turn_id}:user",
-                    "turn_id": turn_id,
-                    "role": "user",
-                    "content": question,
-                    "created_at": created_at,
-                },
-                {
-                    "id": f"{turn_id}:assistant",
-                    "turn_id": turn_id,
-                    "role": "assistant",
-                    "content": result.get("answer", ""),
-                    "created_at": created_at,
-                    "metadata": {
+                AssistantChatMessage(
+                    assistant_session_id=session.id,
+                    turn_id=turn_id,
+                    role="user",
+                    content=question,
+                    created_at=created_at,
+                ),
+                AssistantChatMessage(
+                    assistant_session_id=session.id,
+                    turn_id=turn_id,
+                    role="assistant",
+                    content=result.get("answer", ""),
+                    created_at=created_at,
+                    message_metadata={
                         "rewritten_question": result.get("rewritten_question", ""),
                         "sources": result.get("sources", []),
                         "access_scope": result.get("access_scope", access_scope),
                         "user_role": user_role,
+                        "storage_purpose": "staff_analysis",
                     },
-                },
+                ),
             ]
         )
+        db.flush()
         if ASSISTANT_HISTORY_MAX_MESSAGES > 0:
-            session["messages"] = session["messages"][-ASSISTANT_HISTORY_MAX_MESSAGES:]
-        _write_session_history_unlocked(session_key, session)
+            message_count = db.query(AssistantChatMessage).filter(
+                AssistantChatMessage.assistant_session_id == session.id
+            ).count()
+            overflow = message_count - ASSISTANT_HISTORY_MAX_MESSAGES
+            if overflow > 0:
+                old_ids = [
+                    row.id
+                    for row in db.query(AssistantChatMessage.id)
+                    .filter(AssistantChatMessage.assistant_session_id == session.id)
+                    .order_by(AssistantChatMessage.id.asc())
+                    .limit(overflow)
+                    .all()
+                ]
+                if old_ids:
+                    db.query(AssistantChatMessage).filter(
+                        AssistantChatMessage.id.in_(old_ids)
+                    ).delete(synchronize_session=False)
+        session.updated_at = created_at
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("[assistant-history] Failed to save dialog history to database")
+        raise
 
 
-def _history_turns_for_rag(session_key: str) -> list[dict]:
-    with _history_lock:
-        session = _read_session_history_unlocked(session_key)
-        messages = session.get("messages", []) if session else []
-    turns: list[dict] = []
-    pending_question: str | None = None
-    for message in messages:
-        role = message.get("role")
-        if role == "user":
-            pending_question = message.get("content") or ""
-        elif role == "assistant" and pending_question:
-            answer = message.get("content") or ""
-            if answer:
-                turns.append({"question": pending_question, "answer": answer})
-            pending_question = None
-    return turns[-getattr(cfg, "memory_turns", 5):]
-
-
-def _hydrate_rag_memory(session_key: str, rag: Any) -> None:
-    with _hydrated_sessions_lock:
-        if session_key in _hydrated_sessions:
-            return
-    for turn in _history_turns_for_rag(session_key):
-        rag.memory.save(turn["question"], turn["answer"])
-    with _hydrated_sessions_lock:
-        _hydrated_sessions.add(session_key)
-
-
-def _clear_session_history(session_key: str, fallback: dict) -> int:
-    updated_at = datetime.now(timezone.utc).isoformat()
-    with _history_lock:
-        session = _read_session_history_unlocked(session_key)
-        deleted = len(session.get("messages", [])) if session else 0
-        cleared = {
-            **fallback,
-            "created_at": session.get("created_at", updated_at) if session else updated_at,
-            "updated_at": updated_at,
-            "messages": [],
-        }
-        _write_session_history_unlocked(session_key, cleared)
-    _discard_hydrated_session(session_key)
-    return deleted
+def _clear_session_history(
+    db: Session,
+    *,
+    session_key: str,
+    session_id: str,
+    user: User | None,
+    user_role: str | None,
+    access_scope: str,
+) -> int:
+    try:
+        session = _sync_history_session(
+            db,
+            session_key=session_key,
+            session_id=session_id,
+            user=user,
+            user_role=user_role,
+            access_scope=access_scope,
+        )
+        deleted = db.query(AssistantChatMessage).filter(
+            AssistantChatMessage.assistant_session_id == session.id
+        ).delete(synchronize_session=False)
+        session.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("[assistant-history] Failed to clear dialog history in database")
+        raise
+    return int(deleted or 0)
 
 
 def reload_all_sessions(stats: dict | None = None) -> None:
@@ -862,7 +973,7 @@ def reload_all_sessions(stats: dict | None = None) -> None:
         logger.info(
             f"[assistant] Обновление: сайт +{site.get('added',0)} "
             f"~{site.get('updated',0)} -{site.get('removed',0)} | "
-            f"S3 +{s3.get('added',0)}"
+            f"S3 +{s3.get('added',0)} -{s3.get('removed',0)}"
         )
 
 
@@ -871,6 +982,92 @@ def reload_all_sessions(stats: dict | None = None) -> None:
 @router.get("/status", response_model=AssistantStatusResponse)
 def status():
     return get_assistant_status()
+
+
+@router.get("/quality")
+def list_answer_quality(
+    limit: int = Query(ASSISTANT_HISTORY_DEFAULT_LIMIT, ge=1, le=ASSISTANT_HISTORY_LIMIT_MAX),
+    session_id: str | None = Query(None, min_length=1, max_length=ASSISTANT_SESSION_ID_MAX_LENGTH),
+    rated_only: bool = Query(False),
+    min_score: int | None = Query(None, ge=1, le=5),
+    max_score: int | None = Query(None, ge=1, le=5),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if min_score is not None and max_score is not None and min_score > max_score:
+        _validation_error("min_score не может быть больше max_score.")
+
+    query = db.query(AssistantChatMessage).join(AssistantChatSession).filter(
+        AssistantChatMessage.role == "assistant"
+    )
+    if session_id:
+        query = query.filter(AssistantChatSession.session_id == _validated_session_id(session_id))
+
+    fetch_limit = min(max(limit * 5, limit), 1000)
+    messages = query.order_by(AssistantChatMessage.id.desc()).limit(fetch_limit).all()
+
+    items: list[dict] = []
+    for message in messages:
+        payload = _answer_quality_payload(db, message)
+        manual_quality = payload.get("manual_quality")
+
+        if rated_only and not manual_quality:
+            continue
+        score = manual_quality.get("score") if isinstance(manual_quality, dict) else None
+        if score is not None:
+            if min_score is not None and score < min_score:
+                continue
+            if max_score is not None and score > max_score:
+                continue
+        elif min_score is not None or max_score is not None:
+            continue
+
+        items.append(payload)
+        if len(items) >= limit:
+            break
+
+    return {
+        "items": items,
+        "count": len(items),
+        "max_score": 5,
+        "rated_only": rated_only,
+    }
+
+
+@router.get("/quality/{message_id}")
+def get_answer_quality(
+    message_id: int = ApiPath(..., ge=1),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    message = _get_answer_message_or_404(db, message_id)
+    return _answer_quality_payload(db, message)
+
+
+@router.post("/quality/{message_id}")
+def rate_answer_quality(
+    body: AssistantAnswerQualityRequest,
+    message_id: int = ApiPath(..., ge=1),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    message = _get_answer_message_or_404(db, message_id)
+    metadata = dict(message.message_metadata or {})
+    metadata.pop("quality", None)
+    manual_quality = _manual_quality_payload(
+        body,
+        current_user,
+        _user_role_name(db, current_user),
+    )
+    if manual_quality is None:
+        metadata.pop("manual_quality", None)
+    else:
+        metadata["manual_quality"] = manual_quality
+    metadata["storage_purpose"] = "staff_analysis"
+    message.message_metadata = metadata
+    db.commit()
+    db.refresh(message)
+    return _answer_quality_payload(db, message)
 
 
 @router.post("/ask/stream")
@@ -892,11 +1089,11 @@ def ask_stream(
 
     def event_stream():
         successful = False
+        history_db = SessionLocal()
         try:
             yield _sse("status", {"stage": "queued", "message": "Запрос принят"})
             with _get_session_lock(session_key):
                 rag = _get_or_create_rag_locked(session_key)
-                _hydrate_rag_memory(session_key, rag)
                 for event in rag.ask_stream(question, access_scope=access_scope):
                     event_type = event.get("type", "status")
                     if event_type == "token":
@@ -904,6 +1101,7 @@ def ask_stream(
                     elif event_type == "done":
                         result = event.get("result") or {}
                         _append_history_turn(
+                            history_db,
                             session_key=session_key,
                             session_id=clean_session_id,
                             user=current_user,
@@ -933,6 +1131,7 @@ def ask_stream(
                 "detail": "Не удалось получить ответ ассистента. Попробуйте позже.",
             })
         finally:
+            history_db.close()
             _record_assistant_request(monotonic() - started_at, successful)
 
     return StreamingResponse(
@@ -961,14 +1160,12 @@ def clear_history(
         if rag is not None:
             rag.clear_memory()
         deleted_messages = _clear_session_history(
-            session_key,
-            fallback={
-                "session_id": clean_session_id,
-                "scoped_session_id": session_key,
-                "access_scope": access_scope,
-                "user_role": role_name,
-                "user": _user_history_payload(current_user),
-            },
+            db,
+            session_key=session_key,
+            session_id=clean_session_id,
+            user=current_user,
+            user_role=role_name,
+            access_scope=access_scope,
         )
     return {
         "status": "ok",
@@ -987,6 +1184,7 @@ def get_history(
 ):
     role_name, access_scope, clean_session_id, session_key = _session_context(db, current_user, session_id)
     return _get_session_history(
+        db,
         session_key,
         fallback={
             "session_id": clean_session_id,

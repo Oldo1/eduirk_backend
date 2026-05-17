@@ -1,4 +1,5 @@
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text, text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -36,6 +37,55 @@ class User(Base):
     @property
     def can_access_internal_docs(self) -> bool:
         return bool(getattr(self.role, "can_access_internal_docs", False))
+
+
+class AssistantChatSession(Base):
+    __tablename__ = "assistant_chat_session"
+    __table_args__ = (
+        Index("assistant_chat_session_user_idx", "user_id"),
+        Index("assistant_chat_session_updated_idx", "updated_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_key = Column(String(255), unique=True, nullable=False, index=True)
+    session_id = Column(String(120), nullable=False)
+    access_scope = Column(String(20), nullable=False)
+    user_role = Column(String(100), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    user_email = Column(String, nullable=True)
+    username = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    user = relationship("User")
+    messages = relationship(
+        "AssistantChatMessage",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="AssistantChatMessage.id",
+    )
+
+
+class AssistantChatMessage(Base):
+    __tablename__ = "assistant_chat_message"
+    __table_args__ = (
+        Index("assistant_chat_message_session_idx", "assistant_session_id", "id"),
+        Index("assistant_chat_message_turn_idx", "turn_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    assistant_session_id = Column(
+        Integer,
+        ForeignKey("assistant_chat_session.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    turn_id = Column(String(64), nullable=False)
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=False)
+    message_metadata = Column("metadata", JSONB().with_variant(JSON, "sqlite"), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    session = relationship("AssistantChatSession", back_populates="messages")
 
 
 class CertificateTemplate(Base):

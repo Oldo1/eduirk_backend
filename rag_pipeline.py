@@ -274,7 +274,7 @@ class CrossEncoderReranker:
             return docs
 
         # 1. CrossEncoder-скор с обогащённым payload
-        pairs       = [(query, self._enrich_payload(doc)) for doc in docs]
+        pairs = [(query, self._enrich_payload(doc)) for doc in docs]
         with self._predict_lock:
             base_scores = [float(s) for s in self._model.predict(pairs)]
 

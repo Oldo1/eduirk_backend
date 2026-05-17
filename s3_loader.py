@@ -35,6 +35,10 @@ from config import (
 logger = logging.getLogger("s3_loader")
 
 
+class S3ListError(RuntimeError):
+    """Raised when the S3 object list could not be loaded reliably."""
+
+
 def _credentials_are_configured() -> bool:
     missing = []
     if not YC_KEY_ID.strip():
@@ -87,6 +91,8 @@ def _make_client():
 def list_documents(
     bucket: str = YC_BUCKET,
     prefix: str = YC_PREFIX,
+    *,
+    raise_on_error: bool = False,
 ) -> dict[str, str]:
     """
     Возвращает словарь: s3_key → etag для всех поддерживаемых файлов в бакете.
@@ -104,6 +110,8 @@ def list_documents(
     s3     = _make_client()
     result: dict[str, str] = {}
     if s3 is None:
+        if raise_on_error:
+            raise S3ListError("S3 client is not configured")
         return result
 
     try:
@@ -129,17 +137,25 @@ def list_documents(
     except ClientError as e:
         code = e.response["Error"]["Code"]
         if code == "AccessDenied":
-            logger.error(
+            message = (
                 f"[s3] Нет доступа к бакету '{bucket}'. "
                 "Проверьте YC_KEY_ID, YC_SECRET_KEY и права сервисного аккаунта."
             )
+            logger.error(message)
         elif code == "NoSuchBucket":
-            logger.error(f"[s3] Бакет '{bucket}' не существует")
+            message = f"[s3] Бакет '{bucket}' не существует"
+            logger.error(message)
         else:
-            logger.error(f"[s3] Ошибка S3 ({code}): {e}")
+            message = f"[s3] Ошибка S3 ({code}): {e}"
+            logger.error(message)
+        if raise_on_error:
+            raise S3ListError(message) from e
 
     except BotoCoreError as e:
-        logger.error(f"[s3] Сетевая ошибка при листинге: {e}")
+        message = f"[s3] Сетевая ошибка при листинге: {e}"
+        logger.error(message)
+        if raise_on_error:
+            raise S3ListError(message) from e
 
     return result
 
