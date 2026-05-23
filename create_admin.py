@@ -14,7 +14,9 @@ from models import User, UserRole
 
 LOGIN = os.getenv("ADMIN_EMAIL", "admin@example.local")
 USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-FULL_NAME = os.getenv("ADMIN_FULL_NAME", "Кузнецова Марина Андреевна")
+LAST_NAME = os.getenv("ADMIN_LAST_NAME", "Администратор")
+FIRST_NAME = os.getenv("ADMIN_FIRST_NAME", "МКУ")
+MIDDLE_NAME = os.getenv("ADMIN_MIDDLE_NAME", "ИМЦРО")
 PASSWORD = os.getenv("ADMIN_PASSWORD")
 ROLE = os.getenv("ADMIN_ROLE", "admin")
 
@@ -49,8 +51,12 @@ def migrate_users_table() -> None:
             conn.execute(text("ALTER TABLE users RENAME COLUMN hashed_password TO password_hash"))
         if "username" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(100)"))
-        if "full_name" not in cols:
-            conn.execute(text("ALTER TABLE users ADD COLUMN full_name VARCHAR(200)"))
+        if "last_name" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN last_name VARCHAR(100)"))
+        if "first_name" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN first_name VARCHAR(100)"))
+        if "middle_name" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN middle_name VARCHAR(100)"))
         if "role_id" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN role_id INTEGER REFERENCES user_role(id)"))
         if "created_at" not in cols:
@@ -87,7 +93,9 @@ def main() -> None:
             user.role_id = role.id
             user.is_active = True
             user.username = USERNAME
-            user.full_name = FULL_NAME
+            user.last_name = LAST_NAME
+            user.first_name = FIRST_NAME
+            user.middle_name = MIDDLE_NAME
             db.commit()
             db.refresh(user)
             print(f"Updated user: {user.email} (id={user.id}, role_id={user.role_id})")
@@ -96,7 +104,9 @@ def main() -> None:
                 email=LOGIN,
                 password_hash=hash_password(password),
                 username=USERNAME,
-                full_name=FULL_NAME,
+                last_name=LAST_NAME,
+                first_name=FIRST_NAME,
+                middle_name=MIDDLE_NAME,
                 is_active=True,
                 role_id=role.id,
             )

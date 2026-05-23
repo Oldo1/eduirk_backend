@@ -13,10 +13,33 @@ from models.tpmpk import (
 )
 
 
+def _user_display_name(user):
+    if user is None:
+        return None
+
+    full_name = getattr(user, "full_name", None) or getattr(user, "fullName", None)
+    if full_name:
+        return full_name
+
+    fio = " ".join(
+        part for part in [
+            getattr(user, "last_name", None) or getattr(user, "lastName", None),
+            getattr(user, "first_name", None) or getattr(user, "firstName", None),
+            getattr(user, "middle_name", None) or getattr(user, "middleName", None),
+        ]
+        if part
+    )
+    if fio:
+        return fio
+
+    return "Редакция ИМЦРО"
+
+
 class UserRole(Base):
     __tablename__ = "user_role"
     id = Column(Integer, primary_key=True, index=True)
     role_name = Column(String(50), unique=True, nullable=False)
+    permissions = Column(JSON, nullable=False, default=dict)
 
 
 class User(Base):
@@ -26,7 +49,9 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
     username = Column(String(100), nullable=True)
-    full_name = Column(String(200), nullable=True)
+    last_name = Column(String(100), nullable=True)
+    first_name = Column(String(100), nullable=True)
+    middle_name = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
     allowed_methodika_subjects = Column(JSON, nullable=False, default=list)
@@ -78,13 +103,27 @@ class Article(Base):
 
     @property
     def author_name(self):
-        if self.author is None:
-            return None
-        return (
-            getattr(self.author, "full_name", None)
-            or getattr(self.author, "email", None)
-            or getattr(self.author, "username", None)
-        )
+        return _user_display_name(self.author)
+
+    @property
+    def author_full_name(self):
+        return _user_display_name(self.author)
+
+    @property
+    def author_last_name(self):
+        return getattr(self.author, "last_name", None) if self.author is not None else None
+
+    @property
+    def author_first_name(self):
+        return getattr(self.author, "first_name", None) if self.author is not None else None
+
+    @property
+    def author_middle_name(self):
+        return getattr(self.author, "middle_name", None) if self.author is not None else None
+
+    @property
+    def author_key(self):
+        return f"id-{self.author_id}" if self.author_id else None
 
 
 class CertificateTemplate(Base):

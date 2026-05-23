@@ -16,6 +16,21 @@ def ensure_postgresql_extensions(engine: Engine) -> None:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
 
 
+def ensure_user_name_columns(engine: Engine) -> None:
+    dialect = engine.dialect.name
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            for column in ("last_name", "first_name", "middle_name"):
+                if not _pg_column_exists(conn, "users", column):
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} VARCHAR(100)"))
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            columns = _sqlite_columns(conn, "users")
+            for column in ("last_name", "first_name", "middle_name"):
+                if column not in columns:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} TEXT"))
+
+
 def _pg_column_exists(conn, table: str, column: str) -> bool:
     r = conn.execute(
         text(
@@ -39,7 +54,7 @@ def ensure_certificate_layout_columns(engine: Engine) -> None:
 
     alters_pg: list[tuple[str, str, str]] = [
         ("users", "is_active", "BOOLEAN DEFAULT TRUE NOT NULL"),
-        ("users", "full_name", "VARCHAR(200)"),
+        ("user_role", "permissions", "JSONB DEFAULT '{}'::jsonb NOT NULL"),
         ("certificate_templates", "signers_block_x_mm", "DOUBLE PRECISION DEFAULT 105"),
         ("certificate_templates", "signers_row_height_mm", "DOUBLE PRECISION DEFAULT 32"),
         ("certificate_templates", "signers_band_width_mm", "DOUBLE PRECISION DEFAULT 168"),
@@ -66,7 +81,7 @@ def ensure_certificate_layout_columns(engine: Engine) -> None:
 
     alters_sqlite: list[tuple[str, str, str]] = [
         ("users", "is_active", "BOOLEAN DEFAULT 1 NOT NULL"),
-        ("users", "full_name", "TEXT"),
+        ("user_role", "permissions", "TEXT DEFAULT '{}' NOT NULL"),
         ("certificate_templates", "signers_block_x_mm", "REAL DEFAULT 105"),
         ("certificate_templates", "signers_row_height_mm", "REAL DEFAULT 32"),
         ("certificate_templates", "signers_band_width_mm", "REAL DEFAULT 168"),

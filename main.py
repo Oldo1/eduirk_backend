@@ -27,6 +27,7 @@ from auth import (
     hash_password, verify_password, create_access_token,
     get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES,
 )
+from permissions import user_permissions
 from schemas import UserCreate, UserResponse, Token
 from models import User, UserRole
 from api import tpmpk_router
@@ -39,6 +40,7 @@ from utils.schema_patch import (
     ensure_tpmpk_bot_question_columns,
     ensure_tpmpk_duplicate_guard,
     ensure_tpmpk_slot_minutes_range,
+    ensure_user_name_columns,
 )
 from utils.local_docs import local_openapi_docs_html
 
@@ -170,6 +172,7 @@ def initialize_database() -> None:
     try:
         ensure_postgresql_extensions(engine)
         Base.metadata.create_all(bind=engine)
+        ensure_user_name_columns(engine)
         ensure_certificate_layout_columns(engine)
         ensure_tpmpk_bot_question_columns(engine)
         ensure_tpmpk_slot_minutes_range(engine)
@@ -240,9 +243,12 @@ def _user_response(db: Session, user: User) -> UserResponse:
         id=user.id,
         email=user.email,
         username=user.username,
-        full_name=getattr(user, "full_name", None),
+        last_name=getattr(user, "last_name", None),
+        first_name=getattr(user, "first_name", None),
+        middle_name=getattr(user, "middle_name", None),
         is_active=user.is_active,
         role=_user_role_name(db, user),
+        permissions=user_permissions(user),
         allowed_methodika_subjects=getattr(user, "allowed_methodika_subjects", None) or [],
     )
 
@@ -258,6 +264,9 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     user = User(
         email=user_data.email,
         username=username,
+        last_name=user_data.last_name,
+        first_name=user_data.first_name,
+        middle_name=user_data.middle_name,
         password_hash=hash_password(user_data.password),
     )
     db.add(user)

@@ -8,7 +8,6 @@ def test_user_response_exposes_role_name_from_relationship():
         id=42,
         email="domu@example.test",
         username="domu",
-        full_name="Соколова Елена Павловна",
         is_active=True,
     )
     user.role = role
@@ -16,4 +15,3 @@ def test_user_response_exposes_role_name_from_relationship():
     response = UserResponse.model_validate(user)
 
     assert response.role == "domu_editor"
-    assert response.full_name == "Соколова Елена Павловна"

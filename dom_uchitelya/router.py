@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import get_db
 from models import Article
+from permissions import has_permission
 from schemas import ArticleCreate, ArticleListResponse, ArticleResponse, ArticleUpdate
 
 router = APIRouter(tags=["dom-uchitelya"])
@@ -42,11 +43,17 @@ def _require_roles(user, allowed_roles: set[str]) -> str:
 
 
 def require_common_admin(current_user=Depends(get_current_user)) -> str:
-    return _require_roles(current_user, COMMON_ADMIN_ROLES)
+    role_name = _require_roles(current_user, COMMON_ADMIN_ROLES)
+    if getattr(current_user, "is_active", True) is False or not has_permission(current_user, "articles", "edit"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    return role_name
 
 
 def require_domu_admin(current_user=Depends(get_current_user)) -> str:
-    return _require_roles(current_user, DOMU_ADMIN_ROLES)
+    role_name = _require_roles(current_user, DOMU_ADMIN_ROLES)
+    if getattr(current_user, "is_active", True) is False or not has_permission(current_user, "articles", "edit"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    return role_name
 
 
 def _published_now_if_needed(status_value: str | None, current_value):

@@ -15,6 +15,9 @@ from api.tpmpk.schemas import (
     DayTransferRequest,
     ManualAppointmentCreate,
     ScheduleTemplateBulkUpdate,
+    SlotLockReleaseRequest,
+    SlotLockRequest,
+    SlotLockResponse,
     SlotResponse,
     WorkingDayUpdate,
 )
@@ -36,6 +39,7 @@ DEFAULT_CLOSE_TIME = time(17, 0)
 DEFAULT_LUNCH_START = time(13, 0)
 DEFAULT_LUNCH_END = time(14, 0)
 DEFAULT_SLOT_MINUTES = 30
+SLOT_LOCK_TTL_SECONDS = 10 * 60
 IRKUTSK_TZ = ZoneInfo("Asia/Irkutsk")
 TRANSFERABLE_STATUSES = {"new", "confirmed"}
 DUPLICATE_APPOINTMENT_MESSAGE = (
@@ -393,6 +397,91 @@ def _ensure_working_day(db: Session, selected_date: date) -> TPMPKWorkingDay:
     return day
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _cleanup_expired_slot_locks(db: Session, now: datetime | None = None) -> int:
+    now = now or _utc_now()
+    return (
+        db.query(TPMPKSlotLock)
+        .filter(TPMPKSlotLock.expires_at <= now)
+        .delete(synchronize_session=False)
+    )
+
+
+def _resolve_lock_day(
+    db: Session,
+    *,
+    working_day_id: int | None = None,
+    selected_date: date | None = None,
+) -> TPMPKWorkingDay:
+    if working_day_id is not None:
+        day = db.query(TPMPKWorkingDay).filter(TPMPKWorkingDay.id == working_day_id).first()
+        if not day:
+            raise HTTPException(status_code=404, detail="День не найден")
+        if selected_date is not None and day.date != selected_date:
+            raise HTTPException(status_code=400, detail="Дата не соответствует рабочему дню")
+        return day
+    if selected_date is None:
+        raise HTTPException(status_code=400, detail="Укажите дату или идентификатор рабочего дня")
+    return _ensure_working_day(db, selected_date)
+
+
+def _active_slot_lock(
+    db: Session,
+    *,
+    working_day_id: int,
+    start_time: time,
+    now: datetime | None = None,
+) -> TPMPKSlotLock | None:
+    now = now or _utc_now()
+    return (
+        db.query(TPMPKSlotLock)
+        .filter(
+            TPMPKSlotLock.working_day_id == working_day_id,
+            TPMPKSlotLock.start_time == start_time,
+            TPMPKSlotLock.expires_at > now,
+        )
+        .first()
+    )
+
+
+def _ensure_slot_can_be_locked(
+    db: Session,
+    *,
+    day: TPMPKWorkingDay,
+    start_time: time,
+    session_id: str,
+) -> TPMPKSlotLock | None:
+    if not day.is_open:
+        raise HTTPException(status_code=409, detail="День закрыт для записи")
+    if start_time not in _build_day_slots(day):
+        raise HTTPException(status_code=409, detail="Слот не входит в расписание выбранного дня")
+    if not _is_future_slot_irkutsk(day.date, start_time):
+        raise HTTPException(
+            status_code=409,
+            detail="Нельзя удержать прошедшее время. Выберите будущий слот по иркутскому времени.",
+        )
+
+    occupied = (
+        db.query(TPMPKAppointment.id)
+        .filter(
+            TPMPKAppointment.working_day_id == day.id,
+            TPMPKAppointment.start_time == start_time,
+            TPMPKAppointment.status != "cancelled",
+        )
+        .first()
+    )
+    if occupied:
+        raise HTTPException(status_code=409, detail="Слот уже занят")
+
+    lock = _active_slot_lock(db, working_day_id=day.id, start_time=start_time)
+    if lock and lock.locked_by_session != session_id:
+        raise HTTPException(status_code=409, detail="Слот временно удерживается другим пользователем")
+    return lock
+
+
 def _ensure_days_range(db: Session, start: date, count: int = 60) -> list[TPMPKWorkingDay]:
     for index in range(count):
         _ensure_working_day(db, start + timedelta(days=index))
@@ -407,6 +496,7 @@ def _ensure_days_range(db: Session, start: date, count: int = 60) -> list[TPMPKW
 
 
 def _free_slots_for_day(db: Session, day: TPMPKWorkingDay, *, future_only: bool = False) -> list[time]:
+    _cleanup_expired_slot_locks(db)
     occupied = {
         row.start_time
         for row in db.query(TPMPKAppointment.start_time)
@@ -416,10 +506,20 @@ def _free_slots_for_day(db: Session, day: TPMPKWorkingDay, *, future_only: bool 
         )
         .all()
     }
+    locked = {
+        row.start_time
+        for row in db.query(TPMPKSlotLock.start_time)
+        .filter(
+            TPMPKSlotLock.working_day_id == day.id,
+            TPMPKSlotLock.expires_at > _utc_now(),
+        )
+        .all()
+    }
+    busy = occupied | locked
     return [
         slot
         for slot in _build_day_slots(day)
-        if slot not in occupied and (not future_only or _is_future_slot_irkutsk(day.date, slot))
+        if slot not in busy and (not future_only or _is_future_slot_irkutsk(day.date, slot))
     ]
 
 
@@ -434,6 +534,7 @@ def _validate_day_hours(day: TPMPKWorkingDay):
 
 @router.get("/slots/", response_model=list[SlotResponse])
 def get_slots(date_: date = Query(..., alias="date"), db: Session = Depends(get_db)):
+    _cleanup_expired_slot_locks(db)
     day = _ensure_working_day(db, date_)
     db.commit()
     if not day.is_open:
@@ -472,6 +573,61 @@ def get_slots(date_: date = Query(..., alias="date"), db: Session = Depends(get_
     ]
 
 
+@router.post("/slot-locks/", response_model=SlotLockResponse, status_code=status.HTTP_201_CREATED)
+def create_slot_lock(data: SlotLockRequest, db: Session = Depends(get_db)):
+    _cleanup_expired_slot_locks(db)
+    day = _resolve_lock_day(db, working_day_id=data.working_day_id, selected_date=data.date)
+    lock = _ensure_slot_can_be_locked(
+        db,
+        day=day,
+        start_time=data.start_time,
+        session_id=data.session_id,
+    )
+    expires_at = _utc_now() + timedelta(seconds=SLOT_LOCK_TTL_SECONDS)
+
+    try:
+        if lock:
+            lock.expires_at = expires_at
+        else:
+            lock = TPMPKSlotLock(
+                **_sqlite_bigint_id_kwargs(db, TPMPKSlotLock),
+                working_day_id=day.id,
+                start_time=data.start_time,
+                locked_by_session=data.session_id,
+                expires_at=expires_at,
+            )
+            db.add(lock)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Слот временно удерживается другим пользователем")
+
+    return SlotLockResponse(
+        working_day_id=day.id,
+        date=day.date,
+        start_time=data.start_time,
+        session_id=data.session_id,
+        expires_at=expires_at,
+    )
+
+
+@router.delete("/slot-locks/")
+def release_slot_lock(data: SlotLockReleaseRequest, db: Session = Depends(get_db)):
+    _cleanup_expired_slot_locks(db)
+    day = _resolve_lock_day(db, working_day_id=data.working_day_id, selected_date=data.date)
+    deleted = (
+        db.query(TPMPKSlotLock)
+        .filter(
+            TPMPKSlotLock.working_day_id == day.id,
+            TPMPKSlotLock.start_time == data.start_time,
+            TPMPKSlotLock.locked_by_session == data.session_id,
+        )
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"status": "released", "released": deleted}
+
+
 @router.post(
     "/zapis/",
     response_model=AppointmentResponse,
@@ -482,6 +638,7 @@ def create_appointment(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    _cleanup_expired_slot_locks(db)
     if not (data.consent_pd and data.consent_special):
         raise HTTPException(status_code=400, detail="Требуются оба согласия")
 
@@ -492,11 +649,16 @@ def create_appointment(
         raise HTTPException(status_code=404, detail="День не найден")
     if not day.is_open:
         raise HTTPException(status_code=409, detail="День закрыт для записи")
+    if data.start_time not in _build_day_slots(day):
+        raise HTTPException(status_code=409, detail="Слот не входит в расписание выбранного дня")
     if not _is_future_slot_irkutsk(day.date, data.start_time):
         raise HTTPException(
             status_code=409,
             detail="Нельзя записаться на прошедшее время. Выберите будущий слот по иркутскому времени.",
         )
+    lock = _active_slot_lock(db, working_day_id=day.id, start_time=data.start_time)
+    if lock and lock.locked_by_session != data.lock_session_id:
+        raise HTTPException(status_code=409, detail="Слот временно удерживается другим пользователем")
 
     duplicate_key = _appointment_duplicate_key(data.child_full_name, day.date, data.parent_phone)
     _ensure_no_duplicate_appointment(db, duplicate_key)

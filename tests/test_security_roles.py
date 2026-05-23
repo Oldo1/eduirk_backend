@@ -64,6 +64,61 @@ def test_users_crud_requires_admin_role():
     assert admin.status_code == 200
 
 
+def test_users_api_lists_roles_and_updates_role_and_activity():
+    client, SessionLocal = _client_and_session_factory_for(users_router)
+    db = SessionLocal()
+    try:
+        user_role = UserRole(role_name="user")
+        methodist_role = UserRole(role_name="methodist")
+        db.add_all([user_role, methodist_role])
+        db.flush()
+        editable = User(
+            email="editable@example.com",
+            username="editable",
+            password_hash=hash_password("oldpass"),
+            is_active=True,
+            role_id=user_role.id,
+        )
+        db.add(editable)
+        db.commit()
+        user_id = editable.id
+        methodist_role_id = methodist_role.id
+    finally:
+        db.close()
+
+    client.app.dependency_overrides[get_current_user] = lambda: _user("admin")
+
+    roles = client.get("/users/roles/")
+    assert roles.status_code == 200
+    assert {item["role_name"] for item in roles.json()} == {"user", "methodist"}
+    methodist_role_payload = next(item for item in roles.json() if item["role_name"] == "methodist")
+    assert methodist_role_payload["permissions"]["articles"] == "edit"
+
+    role_permissions = client.put(
+        f"/users/roles/{methodist_role_id}/permissions/",
+        json={"permissions": {"articles": "view", "users_roles": "none"}},
+    )
+    assert role_permissions.status_code == 200
+    assert role_permissions.json()["permissions"]["articles"] == "view"
+    assert role_permissions.json()["permissions"]["users_roles"] == "none"
+
+    updated = client.put(
+        f"/users/{user_id}",
+        json={
+            "email": "editable@example.com",
+            "username": "edited",
+            "role": "methodist",
+            "is_active": False,
+        },
+    )
+
+    assert updated.status_code == 200
+    payload = updated.json()
+    assert payload["username"] == "edited"
+    assert payload["role"] == "methodist"
+    assert payload["is_active"] is False
+
+
 def test_certificate_template_mutations_require_certificate_manager_role():
     client = _client_for(certificates_router)
     payload = {

@@ -143,36 +143,74 @@ def test_public_news_sorts_pinned_then_newest_and_hides_scheduled(client):
     assert [item["title"] for item in response.json()["items"]] == ["Older pinned", "Newest normal"]
 
 
-def test_article_author_name_prefers_full_name(client):
+def test_public_news_returns_author_display_name_not_username(client):
     db = client.SessionLocal()
     try:
-        author = User(
-            email="author@example.test",
-            username="author_login",
-            full_name="Кузнецова Марина Андреевна",
-            password_hash="hash",
-            is_active=True,
+        user = User(
+            email="abramova@example.test",
+            username="abramova_iv",
+            password_hash="secret",
+            last_name="Абрамова",
+            first_name="Ирина",
+            middle_name="Владимировна",
         )
-        db.add(author)
-        db.flush()
-        article = Article(
-            title="Author display",
-            slug="author-display",
-            status="published",
-            publishing_scope="imcro_only",
-            author_id=author.id,
-            published_at=datetime.now(timezone.utc),
-        )
-        db.add(article)
+        db.add(user)
         db.commit()
+        db.refresh(user)
+        author_id = user.id
     finally:
         db.close()
+
+    _add_article_obj(
+        client,
+        title="Author article",
+        slug="author-article",
+        author_id=author_id,
+    )
 
     response = client.get("/api/news/")
 
     assert response.status_code == 200
-    payload = response.json()["items"][0]
-    assert payload["author_name"] == "Кузнецова Марина Андреевна"
+    item = response.json()["items"][0]
+    assert item["author_name"] == "Абрамова Ирина Владимировна"
+    assert item["author_name"] != "abramova_iv"
+
+
+def test_public_news_returns_author_fio_fields_and_key(client):
+    db = client.SessionLocal()
+    try:
+        user = User(
+            email="petrova@example.test",
+            username="tpmpk_operator",
+            password_hash="secret",
+            last_name="Петрова",
+            first_name="Ольга",
+            middle_name="Сергеевна",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        author_id = user.id
+    finally:
+        db.close()
+
+    _add_article_obj(
+        client,
+        title="Author fio article",
+        slug="author-fio-article",
+        author_id=author_id,
+    )
+
+    response = client.get("/api/news/")
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["author_name"] == "Петрова Ольга Сергеевна"
+    assert item["author_full_name"] == "Петрова Ольга Сергеевна"
+    assert item["author_last_name"] == "Петрова"
+    assert item["author_first_name"] == "Ольга"
+    assert item["author_middle_name"] == "Сергеевна"
+    assert item["author_key"] == f"id-{author_id}"
 
 
 def test_public_events_returns_only_marked_articles(client):

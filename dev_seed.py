@@ -9,41 +9,52 @@ from sqlalchemy.orm import Session
 
 from auth import hash_password, verify_password
 from models import User, UserRole
+from permissions import default_permissions_for_role, normalize_role_permissions
 
 
 DEV_TEST_USERS = [
     {
         "email": "user@mky.test",
         "username": "smirnov_ap",
-        "full_name": "Смирнов Алексей Петрович",
+        "last_name": "Смирнов",
+        "first_name": "Алексей",
+        "middle_name": "Петрович",
         "password": "user123",
         "role": "user",
     },
     {
         "email": "methodist@mky.test",
         "username": "abramova_iv",
-        "full_name": "Абрамова Ирина Владимировна",
+        "last_name": "Абрамова",
+        "first_name": "Ирина",
+        "middle_name": "Владимировна",
         "password": "methodist123",
         "role": "methodist",
     },
     {
         "email": "operator@mky.test",
         "username": "tpmpk_operator",
-        "full_name": "Петрова Ольга Сергеевна",
+        "last_name": "Петрова",
+        "first_name": "Ольга",
+        "middle_name": "Сергеевна",
         "password": "operator123",
         "role": "operator",
     },
     {
         "email": "admin@mky.test",
         "username": "admin_mky",
-        "full_name": "Кузнецова Марина Андреевна",
+        "last_name": "Кузнецова",
+        "first_name": "Марина",
+        "middle_name": "Андреевна",
         "password": "admin123",
         "role": "admin",
     },
     {
         "email": "domu@mky.test",
         "username": "domu_editor",
-        "full_name": "Соколова Елена Павловна",
+        "last_name": "Соколова",
+        "first_name": "Елена",
+        "middle_name": "Павловна",
         "password": "domu123",
         "role": "domu_editor",
     },
@@ -66,9 +77,10 @@ def dev_test_users_enabled() -> bool:
 def _get_or_create_role(db: Session, role_name: str) -> UserRole:
     role = db.query(UserRole).filter_by(role_name=role_name).first()
     if role:
+        role.permissions = normalize_role_permissions(role.permissions, role.role_name)
         return role
 
-    role = UserRole(role_name=role_name)
+    role = UserRole(role_name=role_name, permissions=default_permissions_for_role(role_name))
     db.add(role)
     db.flush()
     return role
@@ -96,7 +108,9 @@ def ensure_dev_test_users(
             user = User(
                 email=credentials["email"],
                 username=credentials["username"],
-                full_name=credentials.get("full_name"),
+                last_name=credentials["last_name"],
+                first_name=credentials["first_name"],
+                middle_name=credentials["middle_name"],
                 password_hash=hash_password(credentials["password"]),
                 is_active=True,
                 role_id=role.id,
@@ -105,7 +119,9 @@ def ensure_dev_test_users(
             continue
 
         user.username = credentials["username"]
-        user.full_name = credentials.get("full_name")
+        user.last_name = credentials["last_name"]
+        user.first_name = credentials["first_name"]
+        user.middle_name = credentials["middle_name"]
         user.is_active = True
         user.role_id = role.id
         if not verify_password(credentials["password"], user.password_hash):

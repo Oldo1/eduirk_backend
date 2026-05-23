@@ -9,16 +9,95 @@ from typing import Optional, List, Dict
 class UserCreate(BaseModel):
     email: EmailStr
     username: Optional[str] = Field(None, min_length=2, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
     password: str
+
+
+class UserAdminCreate(BaseModel):
+    email: EmailStr
+    username: Optional[str] = Field(None, min_length=2, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    password: str = Field(..., min_length=6)
+    role: Optional[str] = Field("user", max_length=50)
+    is_active: bool = True
+    allowed_methodika_subjects: List[str] = Field(default_factory=list)
+
+    @field_validator("role")
+    @classmethod
+    def _normalize_role(cls, value: str | None) -> str:
+        return str(value or "user").strip().lower() or "user"
+
+
+class UserAdminUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    username: Optional[str] = Field(None, min_length=2, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    password: Optional[str] = Field(None, min_length=6)
+    role: Optional[str] = Field(None, max_length=50)
+    is_active: Optional[bool] = None
+    allowed_methodika_subjects: Optional[List[str]] = None
+
+    @field_validator("role")
+    @classmethod
+    def _normalize_role(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return str(value or "").strip().lower() or None
+
+
+class RoleResponse(BaseModel):
+    id: int
+    role_name: str
+    permissions: Dict[str, str] = Field(default_factory=dict)
+
+    model_config = {"from_attributes": True}
+
+
+class RolePermissionsUpdate(BaseModel):
+    permissions: Dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("permissions")
+    @classmethod
+    def _validate_permissions(cls, value: Dict[str, str]) -> Dict[str, str]:
+        allowed_modules = {
+            "articles",
+            "certificates",
+            "certificate_templates",
+            "users_roles",
+            "tpmpk",
+            "audit_log",
+            "portal_settings",
+        }
+        allowed_levels = {"none", "view", "edit"}
+        invalid_modules = set(value) - allowed_modules
+        if invalid_modules:
+            raise ValueError(f"unknown permission modules: {', '.join(sorted(invalid_modules))}")
+
+        normalized: Dict[str, str] = {}
+        for module_key, level in value.items():
+            normalized_level = str(level or "none").strip().lower()
+            if normalized_level not in allowed_levels:
+                raise ValueError("permission level must be none, view, or edit")
+            normalized[module_key] = normalized_level
+        return normalized
 
 
 class UserResponse(BaseModel):
     id: int
     email: str
     username: Optional[str] = None
-    full_name: Optional[str] = None
+    last_name: Optional[str] = None
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
     is_active: bool
     role: str = "user"
+    permissions: Dict[str, str] = Field(default_factory=dict)
     allowed_methodika_subjects: List[str] = Field(default_factory=list)
 
     @field_validator("role", mode="before")
@@ -187,6 +266,11 @@ class ArticleResponse(ArticleBase):
     id: int
     author_id: Optional[int]
     author_name: Optional[str] = None
+    author_full_name: Optional[str] = None
+    author_last_name: Optional[str] = None
+    author_first_name: Optional[str] = None
+    author_middle_name: Optional[str] = None
+    author_key: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
