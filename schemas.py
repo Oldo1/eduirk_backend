@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 
 
 # ====================== Аутентификация ======================
@@ -166,6 +166,7 @@ class ArticleBase(BaseModel):
     attachments: List[Dict] = Field(default_factory=list)
     categories: List = Field(default_factory=list)
     tags: List = Field(default_factory=list)
+    sections: List[Dict] = Field(default_factory=list)
     publishing_scope: str = "both"
     methodika_subject: Optional[str] = Field(None, max_length=120)
     dom_uchitelya_section: Optional[str] = Field(None, max_length=120)
@@ -229,6 +230,7 @@ class ArticleUpdate(BaseModel):
     attachments: Optional[List[Dict]] = None
     categories: Optional[List] = None
     tags: Optional[List] = None
+    sections: Optional[List[Dict]] = None
     publishing_scope: Optional[str] = None
     methodika_subject: Optional[str] = Field(None, max_length=120)
     dom_uchitelya_section: Optional[str] = Field(None, max_length=120)
@@ -326,34 +328,78 @@ class CertificateTemplateResponse(BaseModel):
 
 # ====================== ЭЛЕМЕНТЫ ТЕКСТА ======================
 class TemplateTextElementCreate(BaseModel):
-    text: str
+    client_id: Optional[str] = Field(None, alias="id", max_length=80)
+    element_type: str = Field("text", alias="type", max_length=32)
+    text: str = ""
+    value: Optional[str] = None
     is_variable: bool = False
     x_mm: float
     y_mm: float
+    width_mm: Optional[float] = Field(None, alias="width", ge=0, le=400)
+    height_mm: Optional[float] = Field(None, alias="height", ge=0, le=400)
     font_size: int = 24
     align: str = "center"
     color: str = Field("#0F172A", max_length=16)
     font_weight: str = Field("400", max_length=8)
     font_family: str = Field("DejaVu", max_length=120)
+    italic: bool = False
+    underline: bool = False
+    line_height: Optional[float] = Field(None, ge=0.5, le=4)
+    z_index: Optional[int] = None
+    hidden: bool = False
+    locked: bool = False
+    opacity: Optional[float] = Field(None, ge=0, le=1)
+    source_url: Optional[str] = Field(None, max_length=500)
+    variable_name: Optional[str] = Field(None, alias="variableName", max_length=120)
+    grammar_settings: Optional[Dict[str, Any]] = None
+    signer_group_id: Optional[str] = Field(None, alias="signerGroupId", max_length=80)
+    anchor: Optional[str] = Field(None, max_length=20)
     max_width_mm: Optional[float] = Field(None, ge=5, le=210)
     max_height_mm: Optional[float] = Field(None, ge=5, le=280)
 
+    @field_validator("client_id", mode="before")
+    @classmethod
+    def _coerce_client_id(cls, value):
+        if value is None or value == "":
+            return None
+        return str(value)
+
+    model_config = {"populate_by_name": True}
+
 
 class TemplateTextElementResponse(BaseModel):
-    id: int
+    id: str | int = Field(validation_alias="public_id")
+    db_id: Optional[int] = Field(None, validation_alias="id")
+    client_id: Optional[str] = None
+    element_type: str = Field("text", alias="type")
     text: str
+    value: Optional[str] = None
     is_variable: bool
     x_mm: float
     y_mm: float
+    width_mm: Optional[float] = Field(None, alias="width")
+    height_mm: Optional[float] = Field(None, alias="height")
     font_size: int
     align: str
     color: str
     font_weight: str
     font_family: str
+    italic: bool = False
+    underline: bool = False
+    line_height: Optional[float] = None
+    z_index: Optional[int] = None
+    hidden: bool = False
+    locked: bool = False
+    opacity: Optional[float] = None
+    source_url: Optional[str] = None
+    variable_name: Optional[str] = Field(None, alias="variableName")
+    grammar_settings: Optional[Dict[str, Any]] = None
+    signer_group_id: Optional[str] = Field(None, alias="signerGroupId")
+    anchor: Optional[str] = None
     max_width_mm: Optional[float]
     max_height_mm: Optional[float]
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": True, "populate_by_name": True}
 
 
 # ====================== ГЕНЕРАЦИЯ ======================
@@ -411,22 +457,50 @@ class ExcelInspectResponse(BaseModel):
     template_variables: List[str]
     matched_columns: List[str]
     missing_columns: List[str]
+    warnings: List[str] = Field(default_factory=list)
+    processed_preview: List[Dict[str, str]] = Field(default_factory=list)
 
 
 # ====================== АТОМАРНОЕ ОБНОВЛЕНИЕ ШАБЛОНА ======================
 class TemplateTextElementInput(BaseModel):
     """Элемент текста для атомарного обновления шаблона."""
-    text: str
+    client_id: Optional[str] = Field(None, alias="id", max_length=80)
+    element_type: str = Field("text", alias="type", max_length=32)
+    text: str = ""
+    value: Optional[str] = None
     is_variable: bool = False
     x_mm: float
     y_mm: float
+    width_mm: Optional[float] = Field(None, alias="width", ge=0, le=400)
+    height_mm: Optional[float] = Field(None, alias="height", ge=0, le=400)
     font_size: int = 24
     align: str = "center"
     color: str = "#0F172A"
     font_weight: str = "400"
     font_family: str = Field("DejaVu", max_length=120)
+    italic: bool = False
+    underline: bool = False
+    line_height: Optional[float] = Field(None, ge=0.5, le=4)
+    z_index: Optional[int] = None
+    hidden: bool = False
+    locked: bool = False
+    opacity: Optional[float] = Field(None, ge=0, le=1)
+    source_url: Optional[str] = Field(None, max_length=500)
+    variable_name: Optional[str] = Field(None, alias="variableName", max_length=120)
+    grammar_settings: Optional[Dict[str, Any]] = None
+    signer_group_id: Optional[str] = Field(None, alias="signerGroupId", max_length=80)
+    anchor: Optional[str] = Field(None, max_length=20)
     max_width_mm: Optional[float] = Field(None, ge=0, le=300)
     max_height_mm: Optional[float] = Field(None, ge=0, le=400)
+
+    @field_validator("client_id", mode="before")
+    @classmethod
+    def _coerce_client_id(cls, value):
+        if value is None or value == "":
+            return None
+        return str(value)
+
+    model_config = {"populate_by_name": True}
 
 
 class TemplateSignerInput(BaseModel):

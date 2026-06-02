@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Float
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Float, JSON
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from database import Base
@@ -56,18 +56,39 @@ class TemplateTextElement(Base):
     __tablename__ = "template_text_elements"
     id = Column(Integer, primary_key=True, index=True)
     template_id = Column(Integer, ForeignKey("certificate_templates.id"), nullable=False)
-    text = Column(String(500), nullable=False)
+    client_id = Column(String(80), nullable=True)
+    element_type = Column(String(32), default="text", nullable=False)
+    text = Column(String(1000), nullable=False)
+    value = Column(String(1000), nullable=True)
     is_variable = Column(Boolean, default=False)
     x_mm = Column(Float, nullable=False)
     y_mm = Column(Float, nullable=False)
+    width_mm = Column(Float, nullable=True)
+    height_mm = Column(Float, nullable=True)
     font_size = Column(Integer, default=24)
     align = Column(String(10), default="center")
     color = Column(String(16), default="#0F172A")
     font_weight = Column(String(8), default="400")
     font_family = Column(String(120), default="DejaVu")
+    italic = Column(Boolean, default=False)
+    underline = Column(Boolean, default=False)
+    line_height = Column(Float, nullable=True)
+    z_index = Column(Integer, nullable=True)
+    hidden = Column(Boolean, default=False)
+    locked = Column(Boolean, default=False)
+    opacity = Column(Float, nullable=True)
+    source_url = Column(String(500), nullable=True)
+    variable_name = Column(String(120), nullable=True)
+    grammar_settings = Column(JSON, nullable=True)
+    signer_group_id = Column(String(80), nullable=True)
+    anchor = Column(String(20), nullable=True)
     # Ограничение области для auto-fit текста (мм); None — оценка по позиции на листе
     max_width_mm = Column(Float, nullable=True)
     max_height_mm = Column(Float, nullable=True)
+
+    @property
+    def public_id(self):
+        return self.client_id or self.id
 
 
 class GeneratedCertificate(Base):

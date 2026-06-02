@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Optional, Sequence, Tuple
 
@@ -34,6 +35,13 @@ _SIGN_RIGHT_FRAC = 0.38
 # Допустимое отклонение пропорций изображения от A4 для «точного» покрытия (без crop)
 _A4_ASPECT = PAGE_H_MM / PAGE_W_MM  # ≈ 1.4142
 _ASPECT_TOLERANCE = 0.04            # ±4% — считаем изображение «A4-совместимым»
+
+
+@dataclass(frozen=True)
+class TextStyleFlags:
+    bold: bool
+    italic: bool
+    underline: bool
 def register_fonts() -> bool:
     ok = False
     regular = os.path.join("static", "fonts", "DejaVuSans.ttf")
@@ -141,6 +149,91 @@ def _resolve_static_path(url: Optional[str]) -> Optional[str]:
         return None
     path = url.lstrip("/")
     return path if os.path.exists(path) else None
+
+
+def _element_type(el: Any) -> str:
+    return str(getattr(el, "element_type", None) or getattr(el, "type", None) or "text").strip().lower() or "text"
+
+
+def _ordered_visible_elements(elements: Sequence[Any]) -> list[Any]:
+    def safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def sort_key(item: Any) -> tuple[int, int]:
+        z_value = getattr(item, "z_index", None)
+        if z_value is None:
+            z_value = getattr(item, "zIndex", None)
+        if z_value is None:
+            z_value = safe_int(getattr(item, "id", 0), 0)
+        return safe_int(z_value, 0), safe_int(getattr(item, "id", 0), 0)
+
+    return sorted(
+        [item for item in elements if not bool(getattr(item, "hidden", False))],
+        key=sort_key,
+    )
+
+
+def _text_style_flags(el: Any) -> TextStyleFlags:
+    try:
+        weight = int(float(getattr(el, "font_weight", None) or getattr(el, "weight", None) or 400))
+    except (TypeError, ValueError):
+        weight = 400
+    return TextStyleFlags(
+        bold=weight >= 600,
+        italic=bool(getattr(el, "italic", False)),
+        underline=bool(getattr(el, "underline", False)),
+    )
+
+
+def _element_opacity(el: Any) -> float:
+    try:
+        value = float(getattr(el, "opacity", 1) if getattr(el, "opacity", None) is not None else 1)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.0, min(1.0, value))
+
+
+def _set_canvas_alpha(c: canvas.Canvas, alpha: float) -> None:
+    if alpha >= 1:
+        return
+    for method_name in ("setFillAlpha", "setStrokeAlpha"):
+        method = getattr(c, method_name, None)
+        if callable(method):
+            try:
+                method(alpha)
+            except Exception:
+                logger.debug("ReportLab alpha method %s is unavailable", method_name)
+
+
+def _line_width_pt(el: Any) -> float:
+    raw_height = getattr(el, "height_mm", None)
+    if raw_height is None:
+        raw_height = getattr(el, "max_height_mm", None)
+    try:
+        return max(0.5, float(raw_height or 0.35) * MM_TO_PT)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _box_size_mm(el: Any, default_w: float, default_h: float) -> tuple[float, float]:
+    width = getattr(el, "width_mm", None)
+    height = getattr(el, "height_mm", None)
+    if width is None:
+        width = getattr(el, "max_width_mm", None)
+    if height is None:
+        height = getattr(el, "max_height_mm", None)
+    try:
+        width_value = max(0.1, float(width if width is not None else default_w))
+    except (TypeError, ValueError):
+        width_value = default_w
+    try:
+        height_value = max(0.1, float(height if height is not None else default_h))
+    except (TypeError, ValueError):
+        height_value = default_h
+    return width_value, height_value
 
 
 def draw_background_cover(
@@ -251,6 +344,48 @@ def _parse_element_color(el: Any) -> Any:
     return colors.black
 
 
+def _draw_styled_string(
+    c: canvas.Canvas,
+    text: str,
+    x_pt: float,
+    y_pt: float,
+    font_name: str,
+    font_size: float,
+    align: str,
+    style: TextStyleFlags,
+) -> None:
+    width = pdfmetrics.stringWidth(text, font_name, font_size)
+    if align == "center":
+        draw_x = x_pt - width / 2
+    elif align == "right":
+        draw_x = x_pt - width
+    else:
+        draw_x = x_pt
+
+    offsets = [(0.0, 0.0)]
+    if style.bold:
+        offsets.extend([(0.32, 0.0), (0.0, 0.24)])
+
+    for ox, oy in offsets:
+        if style.italic:
+            c.saveState()
+            c.translate(draw_x + ox, y_pt + oy)
+            c.skew(10, 0)
+            c.drawString(0, 0, text)
+            c.restoreState()
+        else:
+            c.drawString(draw_x + ox, y_pt + oy, text)
+
+    if style.underline:
+        underline_y = y_pt - max(1.0, font_size * 0.12)
+        c.setLineWidth(max(0.45, font_size * 0.055))
+        c.line(draw_x, underline_y, draw_x + width, underline_y)
+
+
+def _new_layout_anchor(el: Any) -> bool:
+    return str(getattr(el, "anchor", "") or "").strip().lower() == "center"
+
+
 def draw_text_elements(
     c: canvas.Canvas,
     elements: Sequence[Any],
@@ -262,42 +397,61 @@ def draw_text_elements(
     """
     Отрисовка текстовых блоков с auto-fit шрифта и поддержкой цвета.
 
-    Координаты: y_anchor_pt = page_h - y_mm * MM_TO_PT (от низа страницы).
+    Координатная модель:
+    - anchor="center" (элементы из конструктора): x_mm/y_mm — ЦЕНТР блока.
+      Frontend рендерит через CSS: left: X%; top: Y%; transform: translate(-50%, -50%).
+      PDF должен воспроизвести ту же логику.
+    - Без anchor (legacy): y_mm — верхний край текста (от верха страницы).
     """
     ml, mr, mt, mb = _margins_mm(template)
 
-    for el in sorted(elements, key=lambda x: x.y_mm):
+    for el in _ordered_visible_elements(elements):
+        if _element_type(el) not in {"text", "variable"}:
+            continue
         raw = el.text or ""
         text = apply_variables(raw, variables)
         if not str(text).strip():
             continue
 
+        is_center_anchor = _new_layout_anchor(el)
         align = getattr(el, "align", "center") or "center"
         x_mm = float(el.x_mm)
         y_mm = float(el.y_mm)
-        x_mm, y_mm = _clamp_xy_mm(x_mm, y_mm, ml, mr, mt, mb)
+
+        # Для center-anchor элементов НЕ зажимаем координаты — frontend уже это делает.
+        # Повторное зажатие смещает элементы от их реальной позиции.
+        if not is_center_anchor:
+            x_mm, y_mm = _clamp_xy_mm(x_mm, y_mm, ml, mr, mt, mb)
 
         x_pt = x_mm * MM_TO_PT
-        # (0,0) = левый нижний угол → y от низа
-        y_anchor_pt = page_h - y_mm * MM_TO_PT
 
-        max_w_mm = getattr(el, "max_width_mm", None)
+        # Ширина блока: если фронт задал явно — используем как есть,
+        # не ограничивая _default_max_width_mm (фронт сам контролирует).
+        max_w_mm = getattr(el, "width_mm", None)
+        if max_w_mm is None:
+            max_w_mm = getattr(el, "max_width_mm", None)
         if max_w_mm is None:
             max_w_mm = _default_max_width_mm(x_mm, align, ml, mr)
         else:
-            max_w_mm = min(float(max_w_mm), _default_max_width_mm(x_mm, align, ml, mr))
+            max_w_mm = float(max_w_mm)
+            if not is_center_anchor:
+                max_w_mm = min(max_w_mm, _default_max_width_mm(x_mm, align, ml, mr))
         max_w_pt = float(max_w_mm) * MM_TO_PT
 
         fs = int(el.font_size or 24)
-        max_h_mm = getattr(el, "max_height_mm", None)
+        max_h_mm = getattr(el, "height_mm", None)
+        if max_h_mm is None:
+            max_h_mm = getattr(el, "max_height_mm", None)
         if max_h_mm is None:
             max_h_mm = _max_text_height_mm(y_mm, mb, fs)
         else:
-            max_h_mm = min(float(max_h_mm), _max_text_height_mm(y_mm, mb, fs))
+            max_h_mm = float(max_h_mm)
+            if not is_center_anchor:
+                max_h_mm = min(max_h_mm, _max_text_height_mm(y_mm, mb, fs))
         max_h_pt = float(max_h_mm) * MM_TO_PT
 
         base_size = float(el.font_size or 24)
-        
+
         element_font = _get_font_for_family_and_weight(
             getattr(el, "font_family", None),
             getattr(el, "font_weight", "400"),
@@ -311,28 +465,108 @@ def draw_text_elements(
                 max_h_pt,
                 max_font_size=base_size,
                 min_font_size=6.0,
+                line_factor=float(getattr(el, "line_height", None) or 1.25),
             )
         except Exception as e:
             logger.error("auto_fit_text ошибка для элемента id=%s: %s", getattr(el, "id", "?"), e)
             size, lines = base_size, [text]
 
+        c.saveState()
         c.setFont(element_font, size)
-        # Поддержка цвета текста из элемента шаблона
         c.setFillColor(_parse_element_color(el))
-        lh = size * 1.25
-        y_top = y_anchor_pt
+        c.setStrokeColor(_parse_element_color(el))
+        _set_canvas_alpha(c, _element_opacity(el))
+        line_factor = float(getattr(el, "line_height", None) or 1.25)
+        lh = size * line_factor
+
+        if is_center_anchor:
+            # y_mm — вертикальный ЦЕНТР текстового блока (как в CSS translate(-50%,-50%)).
+            # Вычисляем фактическую высоту текстового блока после auto-fit.
+            num_lines = len(lines) if lines else 1
+            block_height_pt = num_lines * lh
+            # Центр блока в координатах ReportLab (от низа страницы)
+            center_y_pt = page_h - y_mm * MM_TO_PT
+            # Верхний край блока → первая baseline (сдвиг на ascent ≈ 0.82 * size)
+            y_top = center_y_pt + block_height_pt / 2 - size * 0.82
+        else:
+            y_top = page_h - y_mm * MM_TO_PT
+
+        style = _text_style_flags(el)
 
         for i, line in enumerate(lines):
             y_line = y_top - i * lh
-            if align == "center":
-                c.drawCentredString(x_pt, y_line, line)
-            elif align == "right":
-                c.drawRightString(x_pt, y_line, line)
-            else:
-                c.drawString(x_pt, y_line, line)
+            _draw_styled_string(c, line, x_pt, y_line, element_font, size, align, style)
+        c.restoreState()
 
     # Сбрасываем цвет на чёрный после всех элементов
     c.setFillColor(colors.black)
+
+
+def draw_line_element(c: canvas.Canvas, el: Any, page_h: float) -> None:
+    width_mm, _height_mm = _box_size_mm(el, 50.0, 0.35)
+    x_mm = float(getattr(el, "x_mm", 105.0) or 105.0)
+    y_mm = float(getattr(el, "y_mm", 148.5) or 148.5)
+    x_center = x_mm * MM_TO_PT
+    y_center = page_h - y_mm * MM_TO_PT
+    half_w = width_mm * MM_TO_PT / 2
+
+    c.saveState()
+    c.setStrokeColor(_parse_element_color(el))
+    _set_canvas_alpha(c, _element_opacity(el))
+    c.setLineWidth(_line_width_pt(el))
+    c.line(x_center - half_w, y_center, x_center + half_w, y_center)
+    c.restoreState()
+
+
+def draw_image_element(c: canvas.Canvas, el: Any, page_h: float) -> None:
+    source_url = getattr(el, "source_url", None) or getattr(el, "image_url", None) or getattr(el, "url", None)
+    path = _resolve_static_path(source_url)
+    if not path:
+        return
+
+    width_mm, height_mm = _box_size_mm(el, 40.0, 25.0)
+    x_mm = float(getattr(el, "x_mm", 105.0) or 105.0)
+    y_mm = float(getattr(el, "y_mm", 148.5) or 148.5)
+    box_w = width_mm * MM_TO_PT
+    box_h = height_mm * MM_TO_PT
+    box_x = x_mm * MM_TO_PT - box_w / 2
+    box_y = page_h - (y_mm + height_mm / 2) * MM_TO_PT
+
+    try:
+        ir = ImageReader(path)
+        iw, ih = ir.getSize()
+        if iw <= 0 or ih <= 0:
+            return
+        scale = min(box_w / iw, box_h / ih)
+        draw_w = iw * scale
+        draw_h = ih * scale
+        draw_x = box_x + (box_w - draw_w) / 2
+        draw_y = box_y + (box_h - draw_h) / 2
+
+        c.saveState()
+        _set_canvas_alpha(c, _element_opacity(el))
+        c.drawImage(ir, draw_x, draw_y, width=draw_w, height=draw_h, preserveAspectRatio=False, mask="auto")
+        c.restoreState()
+    except Exception as exc:
+        logger.error("Ошибка отрисовки изображения элемента id=%s: %s", getattr(el, "id", "?"), exc)
+
+
+def draw_canvas_elements(
+    c: canvas.Canvas,
+    elements: Sequence[Any],
+    variables: dict[str, str],
+    page_h: float,
+    font_name: str,
+    template: Any,
+) -> None:
+    for el in _ordered_visible_elements(elements):
+        kind = _element_type(el)
+        if kind in {"text", "variable"}:
+            draw_text_elements(c, [el], variables, page_h, font_name, template)
+        elif kind in {"image", "seal", "stamp", "signature", "facsimile"}:
+            draw_image_element(c, el, page_h)
+        elif kind == "line":
+            draw_line_element(c, el, page_h)
 
 
 def _compute_signers_anchor_y_mm(
@@ -540,7 +774,7 @@ def generate_certificate_pdf(
         else:
             logger.info("Шаблон id=%s: фон не задан, используется белый лист.", getattr(template, "id", "?"))
 
-        draw_text_elements(c, elements, variables, page_h, resolved_font_name, template)
+        draw_canvas_elements(c, elements, variables, page_h, resolved_font_name, template)
 
         if signers:
             draw_signers_block(c, template, signers, page_w, page_h)

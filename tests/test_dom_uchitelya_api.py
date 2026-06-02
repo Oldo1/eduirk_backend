@@ -394,6 +394,38 @@ def test_admin_article_crud_accepts_block_body_taxonomy_fields(client):
     assert payload["dom_uchitelya_section"] == "master-klassy"
 
 
+def test_admin_article_preserves_section_labels_for_multi_section_payload(client):
+    app = client.app
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=12, email="admin@example.test", role="admin")
+
+    created = client.post(
+        "/api/admin/news/",
+        json={
+            "title": "Section labels",
+            "slug": "section-labels",
+            "status": "published",
+            "lead": "Lead",
+            "body": "Body",
+            "publishing_scope": "imcro_only",
+            "sections": [
+                {"key": "home", "label": "Новости", "path": "Новости", "root": "home", "value": "home"},
+                {"key": "noko:gia-9", "label": "ГИА-9", "path": "НОКО / ГИА-9", "root": "noko", "value": "gia-9"},
+            ],
+        },
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["noko_section"] == "gia-9"
+    assert payload["sections"][1]["label"] == "ГИА-9"
+    assert payload["sections"][1]["path"] == "НОКО / ГИА-9"
+
+    public = client.get("/api/news/")
+    assert public.status_code == 200
+    article = next(item for item in public.json()["items"] if item["slug"] == "section-labels")
+    assert article["sections"][1]["path"] == "НОКО / ГИА-9"
+
+
 def test_admin_article_create_makes_duplicate_slug_unique(client):
     app = client.app
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=12, email="admin@example.test", role="admin")

@@ -24,6 +24,16 @@ ARTICLE_COVER_DIR = Path("static/articles/covers")
 ARTICLE_ATTACHMENT_DIR = Path("static/articles/attachments")
 ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 ALLOWED_ATTACHMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+PLACEMENT_FIELDS = {
+    "sections",
+    "duplicate_to_main",
+    "duplicate_to_events",
+    "methodika_subject",
+    "dom_uchitelya_section",
+    "noko_section",
+    "hub_kind",
+    "hub_path",
+}
 
 
 def _user_role_name(user) -> str:
@@ -72,6 +82,107 @@ def _sync_legacy_article_payload(data: dict) -> dict:
         payload["image"] = payload["cover_image_url"]
     if payload.get("image") is not None and "cover_image_url" not in payload:
         payload["cover_image_url"] = payload["image"]
+    if PLACEMENT_FIELDS.intersection(payload):
+        explicit_sections = bool(payload.get("sections"))
+        section_keys = _section_keys_from_payload(payload)
+        if section_keys:
+            payload["sections"] = (
+                _sections_from_payload(payload.get("sections"), section_keys)
+                if explicit_sections
+                else _sections_from_keys(section_keys)
+            )
+            if explicit_sections:
+                payload.update(_legacy_fields_from_section_keys(section_keys))
+    return payload
+
+
+def _section_keys_from_payload(values: dict) -> list[str]:
+    keys: list[str] = []
+    for section in values.get("sections") or []:
+        key = section if isinstance(section, str) else section.get("key")
+        if key and key not in keys:
+            keys.append(str(key))
+    if keys:
+        return keys
+    if values.get("duplicate_to_main"):
+        keys.append("home")
+    if values.get("dom_uchitelya_section"):
+        keys.append(f"domu:{values['dom_uchitelya_section']}")
+    if values.get("methodika_subject"):
+        keys.append(f"methodika_subject:{values['methodika_subject']}")
+    if values.get("hub_kind") == "methodika" and values.get("hub_path"):
+        keys.append(f"methodika_section:{values['hub_path']}")
+    if values.get("noko_section"):
+        keys.append(f"noko:{values['noko_section']}")
+    if values.get("hub_kind") and values.get("hub_kind") not in {"methodika", "events"}:
+        keys.append(f"{values['hub_kind']}:{values.get('hub_path') or 'root'}")
+    if values.get("duplicate_to_events"):
+        keys.append("events")
+    if not keys and not any(values.get(key) for key in ("methodika_subject", "dom_uchitelya_section", "noko_section", "hub_kind", "hub_path")):
+        keys.append("home")
+    return keys
+
+
+def _sections_from_keys(keys: list[str]) -> list[dict]:
+    result = []
+    for key in dict.fromkeys(keys):
+        result.append({"key": key, "label": key, "path": key})
+    return result
+
+
+def _sections_from_payload(sections: list | None, keys: list[str]) -> list[dict]:
+    by_key: dict[str, dict] = {}
+    for section in sections or []:
+        if isinstance(section, str):
+            by_key.setdefault(section, {"key": section})
+            continue
+        if isinstance(section, dict) and section.get("key"):
+            by_key.setdefault(str(section["key"]), section)
+
+    result = []
+    for key in dict.fromkeys(keys):
+        source = by_key.get(key) or {}
+        label = source.get("label") or key
+        path = source.get("path") or label
+        item = {"key": key, "label": label, "path": path}
+        for extra in ("root", "value"):
+            if source.get(extra) is not None:
+                item[extra] = source[extra]
+        result.append(item)
+    return result
+
+
+def _primary_section_key(keys: list[str]) -> str:
+    return next((key for key in keys if key not in {"home", "events"}), None) or ("home" if "home" in keys else (keys[0] if keys else "home"))
+
+
+def _legacy_fields_from_section_keys(keys: list[str]) -> dict:
+    primary = _primary_section_key(keys)
+    payload = {
+        "duplicate_to_main": "home" in keys,
+        "duplicate_to_events": "events" in keys,
+        "methodika_subject": None,
+        "dom_uchitelya_section": None,
+        "noko_section": None,
+        "hub_kind": None,
+        "hub_path": None,
+    }
+    if primary.startswith("domu:") and primary != "domu:root":
+        payload["dom_uchitelya_section"] = primary.replace("domu:", "", 1)
+    elif primary.startswith("methodika_subject:"):
+        payload["methodika_subject"] = primary.replace("methodika_subject:", "", 1)
+    elif primary.startswith("methodika_section:"):
+        payload["hub_kind"] = "methodika"
+        payload["hub_path"] = primary.replace("methodika_section:", "", 1)
+    elif primary.startswith("noko:") and primary != "noko:root":
+        payload["noko_section"] = primary.replace("noko:", "", 1)
+    elif ":" in primary:
+        hub, path = primary.split(":", 1)
+        if hub not in {"home", "events"}:
+            payload["hub_kind"] = hub
+            payload["hub_path"] = None if path == "root" else path
+    elif primary == "events":
+        payload["hub_kind"] = "events"
     return payload
 
 
@@ -152,6 +263,50 @@ def _pin_target_keys(values: dict) -> set[str]:
     return keys
 
 
+def _article_section_keys(article: Article) -> set[str]:
+    values = _extract_article_values(article)
+    sections = getattr(article, "sections", None) or []
+    keys = {str(section.get("key") if isinstance(section, dict) else section) for section in sections if section}
+    keys = {key for key in keys if key}
+    if keys:
+        return keys
+    return set(_section_keys_from_payload(values))
+
+
+def _article_matches_feed(article: Article, root: str) -> bool:
+    keys = _article_section_keys(article)
+    if root == "home":
+        return "home" in keys
+    if root == "domu":
+        return any(key.startswith("domu:") for key in keys) or "home" in keys
+    return False
+
+
+def _article_matches_events(article: Article) -> bool:
+    return "events" in _article_section_keys(article)
+
+
+def _article_matches_hub(article: Article, hub: str, section: str | None, subject: str | None) -> bool:
+    keys = _article_section_keys(article)
+    if hub == "methodika":
+        if subject:
+            return f"methodika_subject:{subject}" in keys
+        if section:
+            return f"methodika_section:{section}" in keys
+        return any(key.startswith("methodika_subject:") or key.startswith("methodika_section:") or key == "methodika:root" for key in keys)
+    if hub == "noko":
+        if section:
+            return f"noko:{section}" in keys
+        return any(key.startswith("noko:") for key in keys)
+    if section:
+        return f"{hub}:{section}" in keys
+    return any(key.startswith(f"{hub}:") for key in keys)
+
+
+def _slice_filtered_articles(items: list[Article], limit: int, offset: int) -> list[Article]:
+    return items[offset:offset + limit]
+
+
 def _extract_article_values(article: Article) -> dict:
     return {
         "status": article.status,
@@ -164,6 +319,7 @@ def _extract_article_values(article: Article) -> dict:
         "noko_section": article.noko_section,
         "hub_kind": article.hub_kind,
         "hub_path": article.hub_path,
+        "sections": article.sections or [],
     }
 
 
@@ -209,7 +365,7 @@ def _apply_main_duplication_policy(role_name: str, payload: dict, explicit_chang
         payload["duplicate_to_main"] = False
 
 
-def _query_public_news(db: Session, scopes: tuple[str, str], limit: int, offset: int):
+def _query_public_news(db: Session, scopes: tuple[str, str], limit: int, offset: int, root: str = "home"):
     now = datetime.now(timezone.utc)
     items = (
         db.query(Article)
@@ -217,22 +373,11 @@ def _query_public_news(db: Session, scopes: tuple[str, str], limit: int, offset:
             Article.status == "published",
             Article.publishing_scope.in_(scopes),
             ((Article.published_at == None) | (Article.published_at <= now)),  # noqa: E711
-            (
-                (Article.duplicate_to_main == True)  # noqa: E712
-                | (
-                    (Article.methodika_subject == None)  # noqa: E711
-                    & (Article.dom_uchitelya_section == None)  # noqa: E711
-                    & (Article.noko_section == None)  # noqa: E711
-                    & (Article.hub_kind == None)  # noqa: E711
-                )
-            ),
         )
         .order_by(Article.is_pinned.desc(), Article.published_at.desc(), Article.created_at.desc(), Article.id.desc())
-        .offset(offset)
-        .limit(limit)
         .all()
     )
-    return {"items": items}
+    return {"items": _slice_filtered_articles([article for article in items if _article_matches_feed(article, root)], limit, offset)}
 
 
 def _query_public_events(db: Session, scopes: tuple[str, str], limit: int, offset: int):
@@ -242,15 +387,12 @@ def _query_public_events(db: Session, scopes: tuple[str, str], limit: int, offse
         .filter(
             Article.status == "published",
             Article.publishing_scope.in_(scopes),
-            Article.duplicate_to_events == True,  # noqa: E712
             ((Article.published_at == None) | (Article.published_at <= now)),  # noqa: E711
         )
         .order_by(Article.is_pinned.desc(), Article.published_at.desc(), Article.created_at.desc(), Article.id.desc())
-        .offset(offset)
-        .limit(limit)
         .all()
     )
-    return {"items": items}
+    return {"items": _slice_filtered_articles([article for article in items if _article_matches_events(article)], limit, offset)}
 
 
 def _query_public_hub_news(
@@ -268,27 +410,11 @@ def _query_public_hub_news(
         Article.publishing_scope.in_(scopes),
         ((Article.published_at == None) | (Article.published_at <= now)),  # noqa: E711
     )
-    if hub == "methodika":
-        query = query.filter((Article.methodika_subject != None) | (Article.hub_kind == "methodika"))  # noqa: E711
-        if subject:
-            query = query.filter(Article.methodika_subject == subject)
-        elif section:
-            query = query.filter(Article.hub_kind == "methodika", Article.hub_path == section)
-    elif hub == "noko":
-        query = query.filter(Article.noko_section != None)  # noqa: E711
-        if section:
-            query = query.filter(Article.noko_section == section)
-    else:
-        query = query.filter(Article.hub_kind == hub)
-        if section:
-            query = query.filter(Article.hub_path == section)
     items = (
         query.order_by(Article.is_pinned.desc(), Article.published_at.desc(), Article.created_at.desc(), Article.id.desc())
-        .offset(offset)
-        .limit(limit)
         .all()
     )
-    return {"items": items}
+    return {"items": _slice_filtered_articles([article for article in items if _article_matches_hub(article, hub, section, subject)], limit, offset)}
 
 
 def _query_admin_news(db: Session, scopes: tuple[str, ...] | None = None, role_name: str | None = None, user=None):
@@ -441,7 +567,7 @@ def get_domu_news(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    return _query_public_news(db, DOMU_PUBLIC_SCOPES, limit, offset)
+    return _query_public_news(db, DOMU_PUBLIC_SCOPES, limit, offset, root="domu")
 
 
 @router.get("/api/events/", response_model=ArticleListResponse)
@@ -486,7 +612,8 @@ def create_common_admin_news(
     payload = data
     if "publishing_scope" not in data.model_fields_set:
         payload = data.model_copy(update={"publishing_scope": "imcro_only"})
-    _ensure_methodist_article_access(role_name, current_user, payload.model_dump())
+    access_payload = _sync_legacy_article_payload(payload.model_dump())
+    _ensure_methodist_article_access(role_name, current_user, access_payload)
     return _create_article(db, payload, role_name=role_name, author_id=getattr(current_user, "id", None))
 
 
@@ -502,7 +629,8 @@ def update_common_admin_news(
     article = db.get(Article, article_id)
     if article is None:
         raise HTTPException(status_code=404, detail="Article not found")
-    _ensure_methodist_article_access(role_name, current_user, data.model_dump(exclude_unset=True), article)
+    access_payload = _sync_legacy_article_payload(data.model_dump(exclude_unset=True))
+    _ensure_methodist_article_access(role_name, current_user, access_payload, article)
     return _update_article(db, article_id, data, role_name=role_name)
 
 
@@ -540,12 +668,13 @@ def create_domu_admin_news(
     current_user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if role_name == "domu_editor" and data.publishing_scope not in DOMU_EDITOR_ALLOWED_SCOPES:
+    access_payload = _sync_legacy_article_payload(data.model_dump())
+    if role_name == "domu_editor" and access_payload.get("publishing_scope") not in DOMU_EDITOR_ALLOWED_SCOPES:
         raise HTTPException(status_code=403, detail="publishing_scope is not allowed for domu_editor")
-    if role_name == "domu_editor" and not data.dom_uchitelya_section:
+    if role_name == "domu_editor" and not access_payload.get("dom_uchitelya_section"):
         raise HTTPException(status_code=400, detail="dom_uchitelya_section is required")
-    _ensure_domu_editor_article_access(role_name, current_user, data.model_dump())
-    _ensure_methodist_article_access(role_name, current_user, data.model_dump())
+    _ensure_domu_editor_article_access(role_name, current_user, access_payload)
+    _ensure_methodist_article_access(role_name, current_user, access_payload)
     return _create_article(db, data, role_name=role_name, author_id=getattr(current_user, "id", None))
 
 
@@ -564,8 +693,9 @@ def update_domu_admin_news(
         raise HTTPException(status_code=404, detail="Article not found")
     if role_name == "domu_editor" and article.publishing_scope not in DOMU_EDITOR_ALLOWED_SCOPES:
         raise HTTPException(status_code=403, detail="Article is outside Dom uchitelya scope")
-    _ensure_domu_editor_article_access(role_name, current_user, data.model_dump(exclude_unset=True), article)
-    _ensure_methodist_article_access(role_name, current_user, data.model_dump(exclude_unset=True), article)
+    access_payload = _sync_legacy_article_payload(data.model_dump(exclude_unset=True))
+    _ensure_domu_editor_article_access(role_name, current_user, access_payload, article)
+    _ensure_methodist_article_access(role_name, current_user, access_payload, article)
     return _update_article(db, article_id, data, role_name=role_name)
 
 

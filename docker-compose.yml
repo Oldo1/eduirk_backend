@@ -26,6 +26,7 @@ services:
       DB_NAME: ${DB_NAME:-mky_db}
       SECRET_KEY: ${SECRET_KEY:-change-this-secret-in-dev}
       PD_ENCRYPTION_KEY: ${PD_ENCRYPTION_KEY:-change-this-key-in-dev}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
       ENABLE_DEV_TEST_USERS: "${ENABLE_DEV_TEST_USERS:-true}"
     depends_on:
       db:

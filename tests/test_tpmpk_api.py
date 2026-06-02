@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -24,8 +25,66 @@ from api.tpmpk.schemas import (
     WorkingDayUpdate,
 )
 from database import Base, get_db
-from models import TPMPKAppointment
+from models import TPMPKAppointment, TPMPKSlotLock
 from models.tpmpk import TPMPKWorkingDay
+
+
+def _tpmpk_client_with_day():
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    selected_date = _irkutsk_today() + timedelta(days=2)
+    db = TestingSessionLocal()
+    try:
+        db.add(TPMPKWorkingDay(
+            id=1,
+            date=selected_date,
+            is_open=True,
+            open_time=time(9, 0),
+            close_time=time(10, 0),
+            lunch_start=None,
+            lunch_end=None,
+            slot_minutes=30,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    app = FastAPI()
+    app.include_router(router)
+
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    return TestClient(app, raise_server_exceptions=False), TestingSessionLocal, selected_date
+
+
+def _public_appointment_payload(lock_session_id="session-123"):
+    payload = {
+        "working_day_id": 1,
+        "start_time": "09:00:00",
+        "child_full_name": "Test Child",
+        "child_age": 7,
+        "child_registered_irkutsk": True,
+        "document_readiness": "full",
+        "parent_phone": "+71234567890",
+        "is_repeat": False,
+        "needs_psychiatrist": False,
+        "consent_pd": True,
+        "consent_special": True,
+    }
+    if lock_session_id is not None:
+        payload["lock_session_id"] = lock_session_id
+    return payload
 
 
 def test_tpmpk_schemas_are_importable():
@@ -122,42 +181,7 @@ def test_tpmpk_router_exposes_required_paths():
 
 
 def test_slot_lock_endpoint_holds_and_releases_slot():
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base.metadata.create_all(bind=engine)
-    selected_date = _irkutsk_today() + timedelta(days=2)
-    db = TestingSessionLocal()
-    try:
-        db.add(TPMPKWorkingDay(
-            id=1,
-            date=selected_date,
-            is_open=True,
-            open_time=time(9, 0),
-            close_time=time(10, 0),
-            lunch_start=None,
-            lunch_end=None,
-            slot_minutes=30,
-        ))
-        db.commit()
-    finally:
-        db.close()
-
-    app = FastAPI()
-    app.include_router(router)
-
-    def override_get_db():
-        db = TestingSessionLocal()
-        try:
-            yield db
-        finally:
-            db.close()
-
-    app.dependency_overrides[get_db] = override_get_db
-    client = TestClient(app)
+    client, TestingSessionLocal, selected_date = _tpmpk_client_with_day()
 
     payload = {
         "date": selected_date.isoformat(),
@@ -166,6 +190,16 @@ def test_slot_lock_endpoint_holds_and_releases_slot():
     }
     locked = client.post("/api/tpmpk/slot-locks/", json=payload)
     assert locked.status_code == 201
+
+    extended = client.post("/api/tpmpk/slot-locks/", json=payload)
+    assert extended.status_code == 201
+    db = TestingSessionLocal()
+    try:
+        assert db.query(TPMPKSlotLock).count() == 1
+        lock = db.query(TPMPKSlotLock).one()
+        assert lock.locked_by_session == "session-123"
+    finally:
+        db.close()
 
     conflict = client.post("/api/tpmpk/slot-locks/", json={**payload, "session_id": "session-456"})
     assert conflict.status_code == 409
@@ -182,6 +216,62 @@ def test_slot_lock_endpoint_holds_and_releases_slot():
     slots_after_release = client.get(f"/api/tpmpk/slots/?date={selected_date.isoformat()}")
     first_slot_after_release = next(item for item in slots_after_release.json() if item["start_time"].startswith("09:00"))
     assert first_slot_after_release["is_available"] is True
+
+
+def test_zapis_rejects_missing_active_lock_for_session():
+    client, _, _ = _tpmpk_client_with_day()
+
+    response = client.post("/api/tpmpk/zapis/", json=_public_appointment_payload())
+
+    assert response.status_code == 409
+    assert "слот" in response.json()["detail"].lower()
+
+
+def test_tpmpk_appointment_slot_unique_guard_blocks_second_active_record():
+    _, TestingSessionLocal, _ = _tpmpk_client_with_day()
+    db = TestingSessionLocal()
+    try:
+        first = TPMPKAppointment(
+            id=1,
+            working_day_id=1,
+            start_time=time(9, 0),
+            child_full_name=b"first child",
+            child_age=7,
+            child_registered_irkutsk=True,
+            document_readiness="full",
+            parent_phone=b"+71234567890",
+            duplicate_key="first",
+            is_repeat=False,
+            needs_psychiatrist=False,
+            consent_pd=True,
+            consent_special=True,
+            status="new",
+            source="site",
+        )
+        second = TPMPKAppointment(
+            id=2,
+            working_day_id=1,
+            start_time=time(9, 0),
+            child_full_name=b"second child",
+            child_age=8,
+            child_registered_irkutsk=True,
+            document_readiness="full",
+            parent_phone=b"+71234567891",
+            duplicate_key="second",
+            is_repeat=False,
+            needs_psychiatrist=False,
+            consent_pd=True,
+            consent_special=True,
+            status="new",
+            source="site",
+        )
+        db.add(first)
+        db.commit()
+        db.add(second)
+        with pytest.raises(IntegrityError):
+            db.commit()
+    finally:
+        db.close()
 
 
 def test_admin_schemas_cover_step_8_payloads():

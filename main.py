@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import timedelta
 
 from dotenv import load_dotenv
@@ -28,6 +29,7 @@ from auth import (
     get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from permissions import user_permissions
+from rate_limit import RateLimitMiddleware
 from schemas import UserCreate, UserResponse, Token
 from models import User, UserRole
 from api import tpmpk_router
@@ -151,10 +153,19 @@ def smart_404_suggestions(request_url: str, db: Session | None = None, limit: in
 
 
 app = FastAPI(title="ИМЦРО API", docs_url=None)
+app.add_middleware(RateLimitMiddleware)
+
+_DEFAULT_DEV_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+_cors_env = os.getenv("CORS_ORIGINS", "")
+_extra_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+_allowed_origins = list(dict.fromkeys(_DEFAULT_DEV_ORIGINS + _extra_origins))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_allowed_origins,
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):517[0-9]$",
     allow_credentials=True,
     allow_methods=["*"],
@@ -167,6 +178,14 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/docs", include_in_schema=False)
 def local_docs():
     return HTMLResponse(local_openapi_docs_html())
+
+
+@app.get("/health", include_in_schema=False)
+def health_check():
+    """Минимальный endpoint для healthcheck контейнера.
+    Не требует авторизации, не раскрывает конфигурацию.
+    """
+    return {"status": "ok"}
 
 def initialize_database() -> None:
     try:

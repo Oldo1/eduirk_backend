@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from io import BytesIO
@@ -7,6 +7,7 @@ import os
 import zipfile
 import re
 from datetime import datetime
+from urllib.parse import quote
 from database import get_db
 from models import (
     CertificateTemplate, TemplateTextElement, GeneratedCertificate,
@@ -29,7 +30,7 @@ from utils.excel_batch import (
     sanitize_zip_entry_basename,
 )
 from utils.certificate_text import extract_placeholders, merge_legacy_variables
-from utils.name_declension import prepare_certificate_variables
+from utils.name_declension import prepare_certificate_variables, prepare_certificate_variables_with_warnings
 from reportlab.lib.utils import ImageReader
 from permissions import require_certificate_manager_user
 
@@ -56,6 +57,14 @@ def _build_archive_filename(archive_name: Optional[str]) -> str:
     if not base.lower().endswith(".zip"):
         base = f"{base}.zip"
     return base
+
+
+def _attachment_content_disposition(filename: str, ascii_fallback: str = "certificates.zip") -> str:
+    encoded_filename = quote(filename, safe="")
+    return (
+        f'attachment; filename="{ascii_fallback}"; '
+        f"filename*=UTF-8''{encoded_filename}"
+    )
 
 
 def _validate_template_selector(
@@ -130,6 +139,76 @@ def _font_family_from_filename(filename: str) -> str:
     return family or "Custom font"
 
 
+def _element_sort_key(el: TemplateTextElement) -> tuple[int, float, int]:
+    z_value = getattr(el, "z_index", None)
+    if z_value is None:
+        z_value = int((getattr(el, "id", 0) or 0) * 10)
+    return int(z_value), float(getattr(el, "y_mm", 0) or 0), int(getattr(el, "id", 0) or 0)
+
+
+def _ordered_elements(elements: List[TemplateTextElement]) -> List[TemplateTextElement]:
+    return sorted(elements, key=_element_sort_key)
+
+
+def _element_from_input(template_id: int, el) -> TemplateTextElement:
+    element_type = (el.element_type or "text").strip().lower() or "text"
+    width_mm = el.width_mm if el.width_mm is not None else el.max_width_mm
+    height_mm = el.height_mm if el.height_mm is not None else el.max_height_mm
+    max_width_mm = el.max_width_mm if el.max_width_mm is not None else (width_mm if element_type in {"text", "variable"} else None)
+    max_height_mm = el.max_height_mm if el.max_height_mm is not None else (height_mm if element_type in {"text", "variable"} else None)
+    text = el.text if el.text is not None else ""
+    return TemplateTextElement(
+        template_id=template_id,
+        client_id=el.client_id,
+        element_type=element_type,
+        text=text,
+        value=el.value,
+        is_variable=bool(el.is_variable),
+        x_mm=el.x_mm,
+        y_mm=el.y_mm,
+        width_mm=width_mm,
+        height_mm=height_mm,
+        font_size=el.font_size,
+        align=el.align,
+        color=el.color,
+        font_weight=el.font_weight,
+        font_family=el.font_family,
+        italic=bool(el.italic),
+        underline=bool(el.underline),
+        line_height=el.line_height,
+        z_index=el.z_index,
+        hidden=bool(el.hidden),
+        locked=bool(el.locked),
+        opacity=el.opacity,
+        source_url=el.source_url,
+        variable_name=el.variable_name,
+        grammar_settings=el.grammar_settings,
+        signer_group_id=el.signer_group_id,
+        anchor=el.anchor,
+        max_width_mm=max_width_mm,
+        max_height_mm=max_height_mm,
+    )
+
+
+def _template_required_columns(elements: List[TemplateTextElement]) -> List[str]:
+    return _template_variables_from_elements(elements)
+
+
+def _excel_column_matches(headers: List[str], variables: List[str]) -> tuple[List[str], List[str]]:
+    header_map = {_normalized_key(header): header for header in headers}
+    matched_columns = [
+        header_map[_normalized_key(variable)]
+        for variable in variables
+        if _normalized_key(variable) in header_map
+    ]
+    missing_columns = [
+        variable
+        for variable in variables
+        if _normalized_key(variable) not in header_map
+    ]
+    return matched_columns, missing_columns
+
+
 # ====================== ЗАГРУЗКА ФАЙЛОВ ======================
 @router.post("/upload-background")
 async def upload_background(file: UploadFile = File(...)):
@@ -167,6 +246,25 @@ async def upload_facsimile(file: UploadFile = File(...)):
         buffer.write(content)
     
     return {"facsimile_url": f"/static/certificates/facsimiles/{filename}"}
+
+
+@router.post("/upload-image")
+async def upload_certificate_image(file: UploadFile = File(...)):
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Только изображения")
+
+    upload_dir = "static/certificates/images"
+    os.makedirs(upload_dir, exist_ok=True)
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_upload_name(file.filename)}"
+    file_path = os.path.join(upload_dir, filename)
+
+    content = await file.read()
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Файл слишком большой")
+    with open(file_path, "wb") as buffer:
+        buffer.write(content)
+
+    return {"image_url": f"/static/certificates/images/{filename}", "source_url": f"/static/certificates/images/{filename}"}
 
 
 @router.post("/upload-font")
@@ -294,20 +392,7 @@ def create_template_full(
 
         new_elements = []
         for el in data.elements:
-            obj = TemplateTextElement(
-                template_id=template.id,
-                text=el.text,
-                is_variable=el.is_variable,
-                x_mm=el.x_mm,
-                y_mm=el.y_mm,
-                font_size=el.font_size,
-                align=el.align,
-                color=el.color,
-                font_weight=el.font_weight,
-                font_family=el.font_family,
-                max_width_mm=el.max_width_mm,
-                max_height_mm=el.max_height_mm,
-            )
+            obj = _element_from_input(template.id, el)
             db.add(obj)
             new_elements.append(obj)
 
@@ -334,7 +419,7 @@ def create_template_full(
         for s in new_signers:
             db.refresh(s)
 
-        return {"template": template, "elements": new_elements, "signers": new_signers}
+        return {"template": template, "elements": _ordered_elements(new_elements), "signers": new_signers}
 
     except HTTPException:
         raise
@@ -359,7 +444,6 @@ def get_template_full(template_id: int, db: Session = Depends(get_db)):
     elements = (
         db.query(TemplateTextElement)
         .filter_by(template_id=template_id)
-        .order_by(TemplateTextElement.y_mm.asc())
         .all()
     )
     signers = (
@@ -368,7 +452,7 @@ def get_template_full(template_id: int, db: Session = Depends(get_db)):
         .order_by(TemplateSigner.order)
         .all()
     )
-    return {"template": template, "elements": elements, "signers": signers}
+    return {"template": template, "elements": _ordered_elements(elements), "signers": signers}
 
 
 @router.get("/templates/{template_id}/variables", response_model=TemplateVariablesResponse)
@@ -380,9 +464,9 @@ def get_template_variables(template_id: int, db: Session = Depends(get_db)):
     elements = (
         db.query(TemplateTextElement)
         .filter_by(template_id=template_id)
-        .order_by(TemplateTextElement.y_mm.asc())
         .all()
     )
+    elements = _ordered_elements(elements)
     return {"template_id": template_id, "variables": _template_variables_from_elements(elements)}
 
 
@@ -425,22 +509,19 @@ async def inspect_excel_variables(
         elements = (
             db.query(TemplateTextElement)
             .filter_by(template_id=template_id)
-            .order_by(TemplateTextElement.y_mm.asc())
             .all()
         )
+        elements = _ordered_elements(elements)
         template_variables = _template_variables_from_elements(elements)
 
-    header_map = {_normalized_key(header): header for header in excel.headers}
-    matched_columns = [
-        header_map[_normalized_key(variable)]
-        for variable in template_variables
-        if _normalized_key(variable) in header_map
-    ]
-    missing_columns = [
-        variable
-        for variable in template_variables
-        if _normalized_key(variable) not in header_map
-    ]
+    matched_columns, missing_columns = _excel_column_matches(excel.headers, template_variables)
+    processed_preview: List[dict[str, str]] = []
+    warnings: List[str] = []
+    if template_id is not None:
+        for index, row in enumerate(excel.rows[:5], start=1):
+            processed, row_warnings = prepare_certificate_variables_with_warnings(elements, row)
+            processed_preview.append(processed)
+            warnings.extend(f"Строка {index}: {warning}" for warning in row_warnings)
 
     return {
         "headers": excel.headers,
@@ -450,6 +531,8 @@ async def inspect_excel_variables(
         "template_variables": template_variables,
         "matched_columns": matched_columns,
         "missing_columns": missing_columns,
+        "warnings": warnings,
+        "processed_preview": processed_preview,
     }
 
 
@@ -494,20 +577,7 @@ def update_template_full(
         # 3. Создаём новые элементы
         new_elements = []
         for el in data.elements:
-            obj = TemplateTextElement(
-                template_id=template_id,
-                text=el.text,
-                is_variable=el.is_variable,
-                x_mm=el.x_mm,
-                y_mm=el.y_mm,
-                font_size=el.font_size,
-                align=el.align,
-                color=el.color,
-                font_weight=el.font_weight,
-                font_family=el.font_family,
-                max_width_mm=el.max_width_mm,
-                max_height_mm=el.max_height_mm,
-            )
+            obj = _element_from_input(template_id, el)
             db.add(obj)
             new_elements.append(obj)
 
@@ -535,7 +605,7 @@ def update_template_full(
         for s in new_signers:
             db.refresh(s)
 
-        return {"template": template, "elements": new_elements, "signers": new_signers}
+        return {"template": template, "elements": _ordered_elements(new_elements), "signers": new_signers}
 
     except HTTPException:
         raise
@@ -553,7 +623,7 @@ def add_text_element(template_id: int, element: TemplateTextElementCreate, db: S
     if not db.query(CertificateTemplate).filter_by(id=template_id).first():
         raise HTTPException(404, "Шаблон не найден")
     
-    el = TemplateTextElement(template_id=template_id, **element.dict())
+    el = _element_from_input(template_id, element)
     db.add(el)
     db.commit()
     db.refresh(el)
@@ -562,7 +632,7 @@ def add_text_element(template_id: int, element: TemplateTextElementCreate, db: S
 
 @router.get("/templates/{template_id}/elements", response_model=List[TemplateTextElementResponse])
 def get_template_elements(template_id: int, db: Session = Depends(get_db)):
-    return db.query(TemplateTextElement).filter_by(template_id=template_id).all()
+    return _ordered_elements(db.query(TemplateTextElement).filter_by(template_id=template_id).all())
 
 
 # ====================== ПОДПИСАНТЫ ======================
@@ -592,6 +662,7 @@ async def batch_generate_certificates(
     event_name: str = Form(""),            # оставлен для обратной совместимости
     extra_variables: Optional[str] = Form(None),  # JSON: {"Ключ": "Значение"}
     archive_name: Optional[str] = Form(None),
+    response_mode: str = Form("zip"),
     db: Session = Depends(get_db),
 ):
     """
@@ -660,13 +731,21 @@ async def batch_generate_certificates(
     elements = (
         db.query(TemplateTextElement)
         .filter_by(template_id=template.id)
-        .order_by(TemplateTextElement.y_mm.asc())
         .all()
     )
+    elements = _ordered_elements(elements)
     if not elements:
         raise HTTPException(
             status_code=400,
             detail="У выбранного шаблона нет текстовых элементов",
+        )
+
+    template_variables = _template_required_columns(elements)
+    _matched_columns, missing_columns = _excel_column_matches(excel.headers, template_variables)
+    if missing_columns:
+        raise HTTPException(
+            status_code=400,
+            detail=f"В Excel не найдены обязательные столбцы: {', '.join(missing_columns)}.",
         )
 
     signers = (
@@ -720,11 +799,26 @@ async def batch_generate_certificates(
 
     payload = zip_buffer.getvalue()
     archive_filename = _build_archive_filename(archive_name)
+    if str(response_mode or "").strip().lower() == "json":
+        output_dir = "static/certificates/generated"
+        os.makedirs(output_dir, exist_ok=True)
+        stored_filename = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.zip"
+        file_path = os.path.join(output_dir, stored_filename)
+        with open(file_path, "wb") as f:
+            f.write(payload)
+        return JSONResponse(
+            {
+                "file_url": f"/static/certificates/generated/{stored_filename}",
+                "filename": archive_filename,
+                "count": len(excel.rows),
+            }
+        )
+
     return Response(
         content=payload,
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{archive_filename}"'
+            "Content-Disposition": _attachment_content_disposition(archive_filename)
         },
     )
 
@@ -752,9 +846,9 @@ def manual_generate_certificate(
         elements = (
             db.query(TemplateTextElement)
             .filter_by(template_id=template.id)
-            .order_by(TemplateTextElement.y_mm.asc())
             .all()
         )
+        elements = _ordered_elements(elements)
         if not elements:
             raise HTTPException(status_code=400, detail="У шаблона нет текстовых элементов")
 
@@ -845,9 +939,9 @@ def generate_certificate(
         elements = (
             db.query(TemplateTextElement)
             .filter_by(template_id=template.id)
-            .order_by(TemplateTextElement.y_mm.asc())
             .all()
         )
+        elements = _ordered_elements(elements)
         if not elements:
             raise HTTPException(status_code=400, detail="У шаблона нет текстовых элементов")
 

@@ -4,7 +4,7 @@ import os
 import re
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -45,11 +45,6 @@ TRANSFERABLE_STATUSES = {"new", "confirmed"}
 DUPLICATE_APPOINTMENT_MESSAGE = (
     "Заявка на выбранную дату уже создана. Если нужно изменить запись, свяжитесь с ТПМПК."
 )
-PUBLIC_APPOINTMENT_RATE_LIMIT = 5
-PUBLIC_APPOINTMENT_RATE_WINDOW_SECONDS = 10 * 60
-_public_appointment_attempts: dict[str, list[datetime]] = {}
-
-
 def _irkutsk_now() -> datetime:
     return datetime.now(IRKUTSK_TZ)
 
@@ -100,25 +95,6 @@ def _ensure_no_duplicate_appointment(db: Session, duplicate_key: str) -> None:
     if existing:
         raise HTTPException(status_code=409, detail=DUPLICATE_APPOINTMENT_MESSAGE)
 
-
-def _rate_limit_public_appointment(request: Request, parent_phone: str) -> None:
-    now = datetime.now(timezone.utc)
-    phone_key = _normalize_duplicate_phone(parent_phone)
-    client_host = request.client.host if request.client else "unknown"
-    key = f"{phone_key or 'no-phone'}:{client_host}"
-    cutoff = now - timedelta(seconds=PUBLIC_APPOINTMENT_RATE_WINDOW_SECONDS)
-    attempts = [
-        attempted_at
-        for attempted_at in _public_appointment_attempts.get(key, [])
-        if attempted_at > cutoff
-    ]
-    if len(attempts) >= PUBLIC_APPOINTMENT_RATE_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail="Слишком много заявок подряд. Попробуйте позже или свяжитесь с ТПМПК по телефону.",
-        )
-    attempts.append(now)
-    _public_appointment_attempts[key] = attempts
 
 
 def _is_duplicate_integrity_error(exc: IntegrityError) -> bool:
@@ -482,6 +458,24 @@ def _ensure_slot_can_be_locked(
     return lock
 
 
+def _ensure_slot_lock_belongs_to_session(
+    db: Session,
+    *,
+    working_day_id: int,
+    start_time: time,
+    lock_session_id: str | None,
+) -> TPMPKSlotLock:
+    if not lock_session_id:
+        raise HTTPException(status_code=409, detail="Выберите слот заново: временная блокировка не найдена")
+
+    lock = _active_slot_lock(db, working_day_id=working_day_id, start_time=start_time)
+    if not lock:
+        raise HTTPException(status_code=409, detail="Время удержания слота истекло. Выберите слот заново")
+    if lock.locked_by_session != lock_session_id:
+        raise HTTPException(status_code=409, detail="Слот временно удерживается другим пользователем")
+    return lock
+
+
 def _ensure_days_range(db: Session, start: date, count: int = 60) -> list[TPMPKWorkingDay]:
     for index in range(count):
         _ensure_working_day(db, start + timedelta(days=index))
@@ -600,7 +594,12 @@ def create_slot_lock(data: SlotLockRequest, db: Session = Depends(get_db)):
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Слот временно удерживается другим пользователем")
+        lock = _active_slot_lock(db, working_day_id=day.id, start_time=data.start_time)
+        if lock and lock.locked_by_session == data.session_id:
+            lock.expires_at = expires_at
+            db.commit()
+        else:
+            raise HTTPException(status_code=409, detail="Слот временно удерживается другим пользователем")
 
     return SlotLockResponse(
         working_day_id=day.id,
@@ -635,14 +634,12 @@ def release_slot_lock(data: SlotLockReleaseRequest, db: Session = Depends(get_db
 )
 def create_appointment(
     data: AppointmentCreate,
-    request: Request,
     db: Session = Depends(get_db),
 ):
     _cleanup_expired_slot_locks(db)
     if not (data.consent_pd and data.consent_special):
         raise HTTPException(status_code=400, detail="Требуются оба согласия")
 
-    _rate_limit_public_appointment(request, data.parent_phone)
 
     day = db.query(TPMPKWorkingDay).filter(TPMPKWorkingDay.id == data.working_day_id).first()
     if not day:
@@ -656,9 +653,12 @@ def create_appointment(
             status_code=409,
             detail="Нельзя записаться на прошедшее время. Выберите будущий слот по иркутскому времени.",
         )
-    lock = _active_slot_lock(db, working_day_id=day.id, start_time=data.start_time)
-    if lock and lock.locked_by_session != data.lock_session_id:
-        raise HTTPException(status_code=409, detail="Слот временно удерживается другим пользователем")
+    _ensure_slot_lock_belongs_to_session(
+        db,
+        working_day_id=day.id,
+        start_time=data.start_time,
+        lock_session_id=data.lock_session_id,
+    )
 
     duplicate_key = _appointment_duplicate_key(data.child_full_name, day.date, data.parent_phone)
     _ensure_no_duplicate_appointment(db, duplicate_key)
@@ -701,10 +701,16 @@ def create_appointment(
             text(
                 """
                 DELETE FROM tpmpk_slot_lock
-                WHERE working_day_id = :working_day_id AND start_time = :start_time
+                WHERE working_day_id = :working_day_id
+                  AND start_time = :start_time
+                  AND locked_by_session = :lock_session_id
                 """
             ),
-            {"working_day_id": data.working_day_id, "start_time": data.start_time},
+            {
+                "working_day_id": data.working_day_id,
+                "start_time": data.start_time,
+                "lock_session_id": data.lock_session_id,
+            },
         )
         db.commit()
     except IntegrityError as exc:
