@@ -85,6 +85,13 @@ class TPMPKAppointment(Base):
             unique=True,
             postgresql_where=text("status <> 'cancelled'"),
         ),
+        Index(
+            "tpmpk_appointment_duplicate_active_uniq",
+            "duplicate_key",
+            unique=True,
+            postgresql_where=text("status <> 'cancelled' AND duplicate_key IS NOT NULL"),
+            sqlite_where=text("status <> 'cancelled' AND duplicate_key IS NOT NULL"),
+        ),
     )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -95,6 +102,7 @@ class TPMPKAppointment(Base):
     child_registered_irkutsk = Column(Boolean, nullable=False)
     document_readiness = Column(String(40), nullable=False)
     parent_phone = Column(LargeBinary, nullable=False)
+    duplicate_key = Column(String(64), nullable=True)
     is_repeat = Column(Boolean, nullable=True)
     needs_psychiatrist = Column(Boolean, nullable=True)
     consent_pd = Column(Boolean, nullable=False, server_default=text("TRUE"))
@@ -103,6 +111,8 @@ class TPMPKAppointment(Base):
     source = Column(String(20), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     created_by_user_id = Column(BigInteger, ForeignKey("tpmpk_user.id"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    user_email = Column(String(255), nullable=True)
 
 
 class TPMPKSlotLock(Base):

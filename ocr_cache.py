@@ -24,16 +24,24 @@ from typing import Optional
 logger = logging.getLogger("ocr_cache")
 
 CACHE_DIR = Path("./ocr_cache")
+DEFAULT_CACHE_NAMESPACE = "default"
 
 
-def _cache_path(file_bytes: bytes) -> Path:
+def _cache_path(file_bytes: bytes, namespace: str = DEFAULT_CACHE_NAMESPACE) -> Path:
     sha = hashlib.sha256(file_bytes).hexdigest()
-    return CACHE_DIR / f"{sha}.txt"
+    if not namespace or namespace == DEFAULT_CACHE_NAMESPACE:
+        return CACHE_DIR / f"{sha}.txt"
+
+    safe_namespace = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in namespace
+    )
+    return CACHE_DIR / f"{safe_namespace}_{sha}.txt"
 
 
-def get_cached(file_bytes: bytes) -> Optional[str]:
+def get_cached(file_bytes: bytes, namespace: str = DEFAULT_CACHE_NAMESPACE) -> Optional[str]:
     """Возвращает закэшированный текст или None."""
-    path = _cache_path(file_bytes)
+    path = _cache_path(file_bytes, namespace=namespace)
     if not path.exists():
         return None
     try:
@@ -45,13 +53,17 @@ def get_cached(file_bytes: bytes) -> Optional[str]:
         return None
 
 
-def save_cached(file_bytes: bytes, text: str) -> None:
+def save_cached(
+    file_bytes: bytes,
+    text: str,
+    namespace: str = DEFAULT_CACHE_NAMESPACE,
+) -> None:
     """Сохраняет текст в кэш. Ошибки записи не пробрасываем."""
     if not text or not text.strip():
         return   # пустой текст не кэшируем — повторим попытку в будущем
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path = _cache_path(file_bytes)
+        path = _cache_path(file_bytes, namespace=namespace)
         path.write_text(text, encoding="utf-8")
         logger.info(f"[cache] Saved: {path.name[:12]}…  ({len(text)} симв.)")
     except Exception as e:

@@ -81,3 +81,61 @@ def test_rag_title_match_handles_document_name_without_extension():
     doc = Document(page_content="", metadata={"title": title, "s3_key": f"private/{title}"})
 
     assert RAGSystem._matches_query_by_title(question, doc) is True
+
+
+def test_public_prompt_context_hides_s3_document_url():
+    doc = Document(
+        page_content="Текст публичного документа.",
+        metadata={
+            "title": "Положение.pdf",
+            "source": "https://storage.yandexcloud.net/bucket/public/Положение.pdf",
+            "s3_key": "public/Положение.pdf",
+            "doc_type": "pdf",
+        },
+    )
+
+    context = RAGSystem._format_docs([doc], access_scope=PUBLIC_SCOPE)
+
+    assert "Положение.pdf" in context
+    assert "storage.yandexcloud.net" not in context
+    assert "URL:" not in context
+
+
+def test_employee_prompt_context_keeps_s3_document_url():
+    doc = Document(
+        page_content="Текст документа для сотрудника.",
+        metadata={
+            "title": "Положение.pdf",
+            "source": "https://storage.yandexcloud.net/bucket/internal/Положение.pdf",
+            "s3_key": "internal/Положение.pdf",
+            "doc_type": "pdf",
+        },
+    )
+
+    context = RAGSystem._format_docs([doc], access_scope=EMPLOYEE_SCOPE)
+
+    assert "storage.yandexcloud.net" in context
+
+
+def test_public_sources_hide_s3_document_url():
+    doc = Document(
+        page_content="Текст публичного документа.",
+        metadata={
+            "title": "Положение.pdf",
+            "source": "https://storage.yandexcloud.net/bucket/public/Положение.pdf",
+            "s3_key": "public/Положение.pdf",
+            "doc_type": "pdf",
+        },
+    )
+
+    assert RAGSystem._sources_from_docs([doc], access_scope=PUBLIC_SCOPE) == []
+
+
+def test_answer_sanitizer_removes_markdown_stars():
+    answer = "- **Цель**: поддержка педагогов.\n- **Задачи**: развитие сообщества."
+
+    clean_answer = RAGSystem._sanitize_answer_text(answer)
+
+    assert "*" not in clean_answer
+    assert "- Цель: поддержка педагогов." in clean_answer
+    assert "- Задачи: развитие сообщества." in clean_answer

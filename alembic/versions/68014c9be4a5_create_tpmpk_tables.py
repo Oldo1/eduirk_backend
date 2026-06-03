@@ -31,7 +31,7 @@ def upgrade() -> None:
     sa.Column('lunch_start', sa.Time(), nullable=True),
     sa.Column('lunch_end', sa.Time(), nullable=True),
     sa.Column('slot_minutes', sa.Integer(), nullable=False),
-    sa.CheckConstraint('slot_minutes IN (30, 60)', name='tpmpk_schedule_template_slot_minutes_chk'),
+    sa.CheckConstraint('slot_minutes BETWEEN 10 AND 240 AND slot_minutes % 5 = 0', name='tpmpk_schedule_template_slot_minutes_chk'),
     sa.CheckConstraint('weekday BETWEEN 0 AND 6', name='tpmpk_schedule_template_weekday_chk'),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('weekday')
@@ -69,7 +69,7 @@ def upgrade() -> None:
     sa.Column('slot_minutes', sa.Integer(), nullable=False),
     sa.Column('note', sa.Text(), nullable=True),
     sa.Column('created_by_user_id', sa.BigInteger(), nullable=True),
-    sa.CheckConstraint('slot_minutes IN (30, 60)', name='tpmpk_working_day_slot_minutes_chk'),
+    sa.CheckConstraint('slot_minutes BETWEEN 10 AND 240 AND slot_minutes % 5 = 0', name='tpmpk_working_day_slot_minutes_chk'),
     sa.ForeignKeyConstraint(['created_by_user_id'], ['tpmpk_user.id'], ),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('date')

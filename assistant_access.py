@@ -9,9 +9,11 @@ assistant_access.py — политика доступа для публично�
 from __future__ import annotations
 
 import re
+import logging
 from pathlib import PurePosixPath
 from typing import Iterable
 from typing import Mapping
+from typing import Any
 
 from config import (
     ASSISTANT_INTERNAL_S3_KEYWORDS,
@@ -22,6 +24,7 @@ PUBLIC_SCOPE = "public"
 EMPLOYEE_SCOPE = "employee"
 PUBLIC_ACCESS = "public"
 INTERNAL_ACCESS = "internal"
+logger = logging.getLogger("assistant_access")
 
 
 def normalize_role_name(role_name: str | None) -> str:
@@ -129,6 +132,49 @@ def can_access_document(metadata: Mapping | None, access_scope: str) -> bool:
     if document_access_level(metadata) == PUBLIC_ACCESS:
         return True
     return access_scope == EMPLOYEE_SCOPE
+
+
+def ensure_access_level_metadata(vectorstore: Any) -> int:
+    """
+    Backfills explicit access_level metadata in a single Chroma collection.
+
+    Older indexes may contain public site chunks without access_level and
+    internal S3 chunks where access is inferred only from s3_key. This function
+    materializes that policy into metadata so Chroma can filter before retrieval.
+    """
+    try:
+        existing = vectorstore.get(include=["metadatas"])
+    except Exception as e:
+        logger.warning("[access] failed to read Chroma metadata for access backfill: %s", e)
+        return 0
+
+    ids_to_update: list[str] = []
+    metadatas_to_update: list[dict] = []
+    for doc_id, metadata in zip(existing.get("ids", []) or [], existing.get("metadatas", []) or []):
+        meta = dict(metadata or {})
+        access_level = document_access_level(meta)
+        if meta.get("access_level") == access_level:
+            continue
+        meta["access_level"] = access_level
+        ids_to_update.append(doc_id)
+        metadatas_to_update.append(meta)
+
+    if not ids_to_update:
+        return 0
+
+    batch_size = 500
+    try:
+        for start in range(0, len(ids_to_update), batch_size):
+            vectorstore._collection.update(
+                ids=ids_to_update[start:start + batch_size],
+                metadatas=metadatas_to_update[start:start + batch_size],
+            )
+    except Exception as e:
+        logger.warning("[access] failed to backfill access_level metadata: %s", e)
+        return 0
+
+    logger.info("[access] backfilled access_level metadata for %s chunks", len(ids_to_update))
+    return len(ids_to_update)
 
 
 def scoped_session_id(session_id: str, access_scope: str, user_id: int | None) -> str:

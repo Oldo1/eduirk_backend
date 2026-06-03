@@ -1,6 +1,6 @@
-from datetime import date, time
+from datetime import date as Date, datetime as DateTime, time
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 MIN_SLOT_MINUTES = 10
 MAX_SLOT_MINUTES = 240
@@ -10,6 +10,12 @@ SLOT_MINUTES_STEP = 5
 class AppointmentCreate(BaseModel):
     working_day_id: int = Field(..., gt=0)
     start_time: time
+    lock_session_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
     child_full_name: str = Field(..., min_length=2, max_length=255)
     child_age: int = Field(..., ge=0, le=18)
     child_registered_irkutsk: bool
@@ -26,10 +32,54 @@ class AppointmentCreate(BaseModel):
 
 class SlotResponse(BaseModel):
     working_day_id: int
-    date: date
+    date: Date
     start_time: time
     is_available: bool = True
     slot_minutes: int | None = None
+
+
+class SlotLockRequest(BaseModel):
+    working_day_id: int | None = Field(default=None, gt=0)
+    date: Date | None = None
+    start_time: time
+    session_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+
+    @model_validator(mode="after")
+    def validate_day_reference(self):
+        if self.working_day_id is None and self.date is None:
+            raise ValueError("Укажите дату или идентификатор рабочего дня")
+        return self
+
+
+class SlotLockReleaseRequest(BaseModel):
+    working_day_id: int | None = Field(default=None, gt=0)
+    date: Date | None = None
+    start_time: time
+    session_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+
+    @model_validator(mode="after")
+    def validate_day_reference(self):
+        if self.working_day_id is None and self.date is None:
+            raise ValueError("Укажите дату или идентификатор рабочего дня")
+        return self
+
+
+class SlotLockResponse(BaseModel):
+    working_day_id: int
+    date: Date
+    start_time: time
+    session_id: str
+    expires_at: DateTime
 
 
 class AppointmentResponse(BaseModel):
@@ -82,12 +132,12 @@ class ScheduleTemplateBulkUpdate(BaseModel):
 
 
 class DayTransferRequest(BaseModel):
-    target_date: date
+    target_date: Date
     allow_partial: bool = False
 
 
 class ManualAppointmentCreate(BaseModel):
-    date: date
+    date: Date
     start_time: time
     child_full_name: str = Field(..., min_length=2, max_length=255)
     child_age: int = Field(..., ge=0, le=18)
@@ -109,6 +159,9 @@ __all__ = [
     "ManualAppointmentCreate",
     "ScheduleTemplateBulkUpdate",
     "ScheduleTemplateUpdate",
+    "SlotLockReleaseRequest",
+    "SlotLockRequest",
+    "SlotLockResponse",
     "SlotResponse",
     "WorkingDayUpdate",
 ]

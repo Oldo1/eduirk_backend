@@ -14,6 +14,46 @@ from reportlab.pdfbase import pdfmetrics
 # ── Плейсхолдеры вида {ФИО}, {Дата} ──────────────────────────────────
 _PLACEHOLDER_RE = re.compile(r"\{([^}]+)\}")
 _GENDER_VARIANT_RE = re.compile(r"^(?:род|пол|gender)\s*:\s*([^|{}]+)\|([^{}]+)$", re.IGNORECASE)
+_PLAIN_GENDER_VARIANT_RE = re.compile(
+    r"(?<![A-Za-zА-Яа-яЁё{}-])([A-Za-zА-Яа-яЁё-]+)\|([A-Za-zА-Яа-яЁё-]+)(?![A-Za-zА-Яа-яЁё{}-])"
+)
+_CASE_ALIASES = {
+    "каквведено": "",
+    "asis": "",
+    "as_is": "",
+    "именительный": "nominative",
+    "им": "nominative",
+    "nomn": "nominative",
+    "nominative": "nominative",
+    "родительный": "genitive",
+    "род": "genitive",
+    "gent": "genitive",
+    "genitive": "genitive",
+    "дательный": "dative",
+    "дат": "dative",
+    "datv": "dative",
+    "dative": "dative",
+    "винительный": "accusative",
+    "вин": "accusative",
+    "accs": "accusative",
+    "accusative": "accusative",
+    "творительный": "instrumental",
+    "твор": "instrumental",
+    "ablt": "instrumental",
+    "instrumental": "instrumental",
+    "предложный": "prepositional",
+    "пр": "prepositional",
+    "loct": "prepositional",
+    "prepositional": "prepositional",
+}
+_CASE_RU = {
+    "nominative": "именительный",
+    "genitive": "родительный",
+    "dative": "дательный",
+    "accusative": "винительный",
+    "instrumental": "творительный",
+    "prepositional": "предложный",
+}
 
 
 def _norm_key(s: str) -> str:
@@ -23,6 +63,37 @@ def _norm_key(s: str) -> str:
 
 def _is_gender_variant_key(key: str) -> bool:
     return _GENDER_VARIANT_RE.match(key.strip()) is not None
+
+
+def normalize_case_name(value: str | None) -> str:
+    normalized = _norm_key(str(value or ""))
+    return _CASE_ALIASES.get(normalized, normalized)
+
+
+def split_placeholder_key(key: str) -> tuple[str, str]:
+    """Return base variable name and canonical case from `{Имя | падеж}`."""
+    raw = str(key or "").strip()
+    if "|" not in raw:
+        return raw, ""
+    name, case_name = raw.split("|", 1)
+    return name.strip(), normalize_case_name(case_name)
+
+
+def case_key_candidates(name: str, case_name: str) -> List[str]:
+    canonical = normalize_case_name(case_name)
+    if not canonical:
+        return [name]
+    ru = _CASE_RU.get(canonical, canonical)
+    return [
+        f"{name}:{canonical}",
+        f"{name}:{ru}",
+        f"{name}_{canonical}",
+        f"{name}_{ru}",
+        f"{name} | {ru}",
+        f"{name}|{ru}",
+        f"{name} | {canonical}",
+        f"{name}|{canonical}",
+    ]
 
 
 def _resolve_gender(variables: Dict[str, str]) -> str | None:
@@ -51,11 +122,12 @@ def extract_placeholders(text: str) -> List[str]:
             continue
         if _is_gender_variant_key(key):
             continue
-        normalized = _norm_key(key)
+        base_key, _case_name = split_placeholder_key(key)
+        normalized = _norm_key(base_key)
         if normalized in seen:
             continue
         seen.add(normalized)
-        found.append(key)
+        found.append(base_key)
     return found
 
 
@@ -100,12 +172,34 @@ def apply_variables(text: str, variables: Dict[str, str]) -> str:
             return female_value if gender == "female" else male_value
         if inner in exact:
             return exact[inner]
+        base_key, case_name = split_placeholder_key(inner)
+        if case_name:
+            for candidate in case_key_candidates(base_key, case_name):
+                if candidate in exact:
+                    return exact[candidate]
+                candidate_norm = _norm_key(candidate)
+                if candidate_norm in norm:
+                    return norm[candidate_norm]
+            if base_key in exact:
+                return exact[base_key]
         nk = _norm_key(inner)
         if nk in norm:
             return norm[nk]
+        if case_name:
+            base_norm = _norm_key(base_key)
+            if base_norm in norm:
+                return norm[base_norm]
         return m.group(0)
 
-    return _PLACEHOLDER_RE.sub(replace_one, text)
+    rendered = _PLACEHOLDER_RE.sub(replace_one, text)
+
+    def replace_plain_gender_variant(m: re.Match[str]) -> str:
+        gender = _resolve_gender(variables)
+        male_value = m.group(1)
+        female_value = m.group(2)
+        return female_value if gender == "female" else male_value
+
+    return _PLAIN_GENDER_VARIANT_RE.sub(replace_plain_gender_variant, rendered)
 
 
 def merge_legacy_variables(

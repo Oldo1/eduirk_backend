@@ -151,7 +151,7 @@ def crawl(
             continue
         seen.add(url)
 
-        # ── Загрузка ──────────────────────────────────────────────────────────
+        # Загрузка
         try:
             resp = session.get(url, timeout=10, allow_redirects=True)
         except requests.RequestException as e:
@@ -166,7 +166,7 @@ def crawl(
         if "text/html" not in content_type:
             continue   # пропускаем PDF, изображения и т.д.
 
-        # ── Парсинг (один раз!) ───────────────────────────────────────────────
+        # Парсинг
         soup = BeautifulSoup(resp.text, "lxml")
 
         # Извлекаем текст
@@ -179,7 +179,7 @@ def crawl(
         result[url] = {"title": title, "text": text, "breadcrumb": breadcrumb}
         logger.debug(f"[crawl] ({len(result)}) {url}")
 
-        # ── Собираем ссылки из уже распарсенного soup ─────────────────────────
+        # Собираем ссылки из уже распарсенного soup
         for a in soup.find_all("a", href=True):
             href = normalize_url(urljoin(url, a["href"]))
             if (

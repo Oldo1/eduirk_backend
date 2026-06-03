@@ -14,11 +14,34 @@ from models.tpmpk import (
 )
 
 
+def _user_display_name(user):
+    if user is None:
+        return None
+
+    full_name = getattr(user, "full_name", None) or getattr(user, "fullName", None)
+    if full_name:
+        return full_name
+
+    fio = " ".join(
+        part for part in [
+            getattr(user, "last_name", None) or getattr(user, "lastName", None),
+            getattr(user, "first_name", None) or getattr(user, "firstName", None),
+            getattr(user, "middle_name", None) or getattr(user, "middleName", None),
+        ]
+        if part
+    )
+    if fio:
+        return fio
+
+    return "Редакция ИМЦРО"
+
+
 class UserRole(Base):
     __tablename__ = "user_role"
     id = Column(Integer, primary_key=True, index=True)
     role_name = Column(String(50), unique=True, nullable=False)
     can_access_internal_docs = Column(Boolean, nullable=False, default=False, server_default=text("FALSE"))
+    permissions = Column(JSON, nullable=False, default=dict)
 
 
 class User(Base):
@@ -27,11 +50,13 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
-    username = Column(String(100), unique=True, index=True, nullable=True)
+    last_name = Column(String(100), nullable=True)
+    first_name = Column(String(100), nullable=True)
+    middle_name = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
     allowed_methodika_subjects = Column(JSON, nullable=False, default=list)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     role = relationship("UserRole")
 
     @property
@@ -53,7 +78,6 @@ class AssistantChatSession(Base):
     user_role = Column(String(100), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     user_email = Column(String, nullable=True)
-    username = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
@@ -88,6 +112,25 @@ class AssistantChatMessage(Base):
     session = relationship("AssistantChatSession", back_populates="messages")
 
 
+class AssistantRuntimeSettings(Base):
+    __tablename__ = "assistant_runtime_settings"
+
+    id = Column(Integer, primary_key=True)
+    update_interval_hours = Column(Float, nullable=False)
+    gigachat_model = Column(String(64), nullable=False)
+    question_max_length = Column(Integer, nullable=False)
+    session_ttl_seconds = Column(Integer, nullable=False)
+    history_max_messages = Column(Integer, nullable=False)
+    rate_limit_window_seconds = Column(Integer, nullable=False)
+    rate_limit_max_requests = Column(Integer, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class CertificateTemplate(Base):
     __tablename__ = "certificate_templates"
     id = Column(Integer, primary_key=True, index=True)
@@ -115,17 +158,38 @@ class TemplateTextElement(Base):
     __tablename__ = "template_text_elements"
     id = Column(Integer, primary_key=True, index=True)
     template_id = Column(Integer, ForeignKey("certificate_templates.id"), nullable=False)
-    text = Column(String(500), nullable=False)
+    client_id = Column(String(80), nullable=True)
+    element_type = Column(String(32), default="text", nullable=False)
+    text = Column(String(1000), nullable=False)
+    value = Column(String(1000), nullable=True)
     is_variable = Column(Boolean, default=False)
     x_mm = Column(Float, nullable=False)
     y_mm = Column(Float, nullable=False)
+    width_mm = Column(Float, nullable=True)
+    height_mm = Column(Float, nullable=True)
     font_size = Column(Integer, default=24)
     align = Column(String(10), default="center")
     color = Column(String(16), default="#0F172A")
     font_weight = Column(String(8), default="400")
     font_family = Column(String(120), default="DejaVu")
+    italic = Column(Boolean, default=False)
+    underline = Column(Boolean, default=False)
+    line_height = Column(Float, nullable=True)
+    z_index = Column(Integer, nullable=True)
+    hidden = Column(Boolean, default=False)
+    locked = Column(Boolean, default=False)
+    opacity = Column(Float, nullable=True)
+    source_url = Column(String(500), nullable=True)
+    variable_name = Column(String(120), nullable=True)
+    grammar_settings = Column(JSON, nullable=True)
+    signer_group_id = Column(String(80), nullable=True)
+    anchor = Column(String(20), nullable=True)
     max_width_mm = Column(Float, nullable=True)
     max_height_mm = Column(Float, nullable=True)
+
+    @property
+    def public_id(self):
+        return self.client_id or self.id
 
 
 class GeneratedCertificate(Base):
@@ -158,11 +222,18 @@ class Appointment(Base):
     __tablename__ = "appointments"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    user_email = Column(String, nullable=True)
     full_name = Column(String(200), nullable=False)
     appointment_date = Column(String(10), nullable=False)
     appointment_time = Column(String(5), nullable=False)
     comment = Column(String(500), nullable=True)
+    status = Column(String(20), nullable=False, default="new", server_default=text("'new'"))
+    source = Column(String(20), nullable=False, default="site", server_default=text("'site'"))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User")
 
 
 class ArticleStatus(Base):
@@ -216,6 +287,7 @@ class Article(Base):
     attachments = Column(JSON, nullable=False, default=list)
     categories = Column(JSON, nullable=False, default=list)
     tags = Column(JSON, nullable=False, default=list)
+    sections = Column(JSON, nullable=False, default=list)
     publishing_scope = Column(String(20), nullable=False, default="both", index=True)
     methodika_subject = Column(String(120), nullable=True, index=True)
     dom_uchitelya_section = Column(String(120), nullable=True, index=True)
@@ -231,9 +303,27 @@ class Article(Base):
 
     @property
     def author_name(self):
-        if self.author is None:
-            return None
-        return getattr(self.author, "username", None) or getattr(self.author, "email", None)
+        return _user_display_name(self.author)
+
+    @property
+    def author_full_name(self):
+        return _user_display_name(self.author)
+
+    @property
+    def author_last_name(self):
+        return getattr(self.author, "last_name", None) if self.author is not None else None
+
+    @property
+    def author_first_name(self):
+        return getattr(self.author, "first_name", None) if self.author is not None else None
+
+    @property
+    def author_middle_name(self):
+        return getattr(self.author, "middle_name", None) if self.author is not None else None
+
+    @property
+    def author_key(self):
+        return f"id-{self.author_id}" if self.author_id else None
 
 
 class ArticleCategory(Base):
@@ -254,6 +344,9 @@ __all__ = [
     "ArticleCategory",
     "ArticleStatus",
     "ArticleTag",
+    "AssistantChatMessage",
+    "AssistantChatSession",
+    "AssistantRuntimeSettings",
     "Category",
     "CertificateTemplate",
     "GeneratedCertificate",

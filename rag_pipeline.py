@@ -48,8 +48,12 @@ from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 from assistant_access import (
     EMPLOYEE_SCOPE,
+    INTERNAL_ACCESS,
+    PUBLIC_ACCESS,
     can_access_document,
     document_access_level,
+    ensure_access_level_metadata,
+    infer_s3_access_level,
 )
 
 SITE_CONTEXT_SOURCE = "__site_context__"
@@ -58,6 +62,10 @@ _RERANKER_CACHE: dict[tuple[str, int, float], "CrossEncoderReranker"] = {}
 _RERANKER_CACHE_LOCK = Lock()
 DEFAULT_GIGACHAT_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 logger = logging.getLogger("rag_pipeline")
+
+
+class KnowledgeBaseNotReadyError(RuntimeError):
+    """Raised when RAG cannot answer because the vector index is unavailable."""
 
 
 def _env_int(name: str, default: int, minimum: int | None = None) -> int:
@@ -442,13 +450,48 @@ class RAGSystem:
             persist_directory=self.cfg.persist_dir,
             embedding_function=embeddings,
         )
+        ensure_access_level_metadata(self._vectorstore)
         self._setup()
         count = self._vectorstore._collection.count()
         logger.info("[rag] index loaded. vector count: %s", count)
 
-    def set_vectorstore(self, vectorstore: Chroma) -> None:
+    def set_vectorstore(self, vectorstore) -> None:
         self._vectorstore = vectorstore
+        if not getattr(vectorstore, "_assistant_access_metadata_checked", False):
+            ensure_access_level_metadata(vectorstore)
+            setattr(vectorstore, "_assistant_access_metadata_checked", True)
         self._setup()
+
+    def _vector_count(self) -> int:
+        if self._vectorstore is None:
+            raise KnowledgeBaseNotReadyError(
+                "База знаний не готова: индекс не загружен. "
+                "Запустите обновление или полную переиндексацию базы знаний."
+            )
+        try:
+            return int(self._vectorstore._collection.count())
+        except Exception as e:
+            raise KnowledgeBaseNotReadyError(
+                "База знаний не готова: не удалось прочитать индекс. "
+                "Проверьте Chroma-хранилище и запустите переиндексацию."
+            ) from e
+
+    def _ensure_knowledge_base_ready(self) -> None:
+        if self._vectorstore is None:
+            raise KnowledgeBaseNotReadyError(
+                "База знаний не готова: индекс не загружен. "
+                "Запустите обновление или полную переиндексацию базы знаний."
+            )
+        if self._base_retriever is None:
+            raise KnowledgeBaseNotReadyError(
+                "База знаний не готова: retriever не инициализирован. "
+                "Запустите обновление или полную переиндексацию базы знаний."
+            )
+        if self._vector_count() <= 0:
+            raise KnowledgeBaseNotReadyError(
+                "База знаний не готова: индекс пуст. "
+                "Запустите обновление или полную переиндексацию базы знаний."
+            )
 
     def _setup(self) -> None:
         self._reranker = get_cached_reranker(
@@ -615,7 +658,11 @@ class RAGSystem:
             return False
 
         matched = sum(1 for token in title_tokens if token in query_norm)
-        return matched >= min(4, len(title_tokens))
+        if matched >= min(4, len(title_tokens)):
+            return True
+
+        doc_intent = any(marker in query_norm for marker in {"документ", "файл", "положение"})
+        return matched >= 3 and doc_intent
 
     @classmethod
     def _find_denied_requested_docs(cls, query: str, docs: list[Document]) -> list[Document]:
@@ -639,20 +686,105 @@ class RAGSystem:
             "Чтобы получить его содержание через ассистента, нужно авторизоваться под учётной записью сотрудника."
         )
 
+    def _internal_metadata_documents(self) -> list[Document]:
+        docs: list[Document] = []
+        try:
+            existing = self._vectorstore.get(
+                where={"access_level": "internal"},
+                include=["metadatas"],
+            )
+        except TypeError:
+            existing = self._vectorstore.get(include=["metadatas"])
+        except Exception as e:
+            logger.warning("[access] failed to read internal metadata: %s", e)
+            existing = {}
+
+        for metadata in existing.get("metadatas", []) or []:
+            meta = dict(metadata or {})
+            if document_access_level(meta) == "internal":
+                docs.append(Document(page_content="", metadata=meta))
+
+        docs.extend(self._internal_state_documents())
+        return self._unique_metadata_documents(docs)
+
+    @staticmethod
+    def _internal_state_documents() -> list[Document]:
+        try:
+            from update_state import UpdateState
+
+            state = UpdateState()
+        except Exception as e:
+            logger.warning("[access] failed to read update state for internal documents: %s", e)
+            return []
+
+        docs: list[Document] = []
+        for key in sorted(state.all_s3_keys()):
+            if infer_s3_access_level(key) != INTERNAL_ACCESS:
+                continue
+            filename = Path(key).name
+            title = Path(filename).stem.replace("_", " ").strip() or filename
+            docs.append(
+                Document(
+                    page_content="",
+                    metadata={
+                        "source": key,
+                        "title": title,
+                        "s3_key": key,
+                        "doc_type": Path(filename).suffix.lower().lstrip("."),
+                        "access_level": INTERNAL_ACCESS,
+                        "metadata_only": True,
+                    },
+                )
+            )
+        return docs
+
+    @staticmethod
+    def _unique_metadata_documents(docs: list[Document]) -> list[Document]:
+        unique: list[Document] = []
+        seen: set[str] = set()
+        for doc in docs:
+            key = (
+                doc.metadata.get("s3_key")
+                or doc.metadata.get("source")
+                or doc.metadata.get("title")
+                or doc.page_content[:80]
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(doc)
+        return unique
+
     def _retrieve_and_rerank(self, query: str, access_scope: str) -> tuple[list[Document], list[Document]]:
-        candidates = self._base_retriever.invoke(query)
+        search_kwargs = {
+            "k":           self.cfg.fetch_k,
+            "fetch_k":     self.cfg.fetch_k * 2,
+            "lambda_mult": 0.7,
+        }
+
+        if access_scope == EMPLOYEE_SCOPE:
+            candidates = self._base_retriever.invoke(query)
+        else:
+            retriever = self._vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={
+                    **search_kwargs,
+                    "filter": {"access_level": PUBLIC_ACCESS},
+                },
+            )
+            candidates = retriever.invoke(query)
+
         allowed = [
             doc for doc in candidates
             if can_access_document(doc.metadata, access_scope)
         ]
-        denied = [
-            doc for doc in candidates
-            if not can_access_document(doc.metadata, access_scope)
-        ]
+        denied = []
+        if access_scope != EMPLOYEE_SCOPE:
+            denied = self._find_denied_requested_docs(query, self._internal_metadata_documents())
         denied_count = len(candidates) - len(allowed)
         if denied_count:
             logger.info("[access] filtered internal chunks: %s", denied_count)
-        return self._reranker.rerank(query, allowed), self._find_denied_requested_docs(query, denied)
+        return self._reranker.rerank(query, allowed), denied
 
     # ── Шаг 3: форматировать чанки ───────────────────────────────────────────
 
@@ -705,7 +837,15 @@ class RAGSystem:
         return ""
 
     @staticmethod
-    def _format_docs(docs: list[Document], site_context: str = "") -> str:
+    def _hide_cloud_document_url(doc: Document, access_scope: str) -> bool:
+        return access_scope != EMPLOYEE_SCOPE and bool(doc.metadata.get("s3_key"))
+
+    @staticmethod
+    def _format_docs(
+        docs: list[Document],
+        site_context: str = "",
+        access_scope: str = "public",
+    ) -> str:
         site_parts = []
         document_parts = []
         other_parts = []
@@ -731,6 +871,7 @@ class RAGSystem:
                 src = doc.metadata.get("page_url", "")
 
             is_site_page = (not is_document) and ("mc.eduirk.ru" in src or bool(breadcrumb))
+            hide_url = RAGSystem._hide_cloud_document_url(doc, access_scope)
             access_level = document_access_level(doc.metadata)
             if access_level == "internal":
                 block_label = "ВНУТРЕННИЙ ДОКУМЕНТ ДЛЯ СОТРУДНИКА"
@@ -745,7 +886,7 @@ class RAGSystem:
             header_parts.append(block_label)
             if title:
                 header_parts.append(title)
-            if src:
+            if src and not hide_url:
                 header_parts.append(f"URL: {src}")
             if breadcrumb:
                 header_parts.append(f"Путь: {breadcrumb}")
@@ -777,7 +918,10 @@ class RAGSystem:
             if access_scope == EMPLOYEE_SCOPE else
             "Сейчас открыт публичный контур. Отвечай только по публичным страницам, "
             "ссылкам и документам. Если запрос касается внутренних документов, "
-            "предложи авторизоваться под учётной записью сотрудника.\n"
+            "предложи авторизоваться под учётной записью сотрудника. "
+            "Не указывай обычному пользователю прямые URL документов из облачного "
+            "хранилища S3/Object Storage/storage.yandexcloud.net. Можно называть "
+            "документ и раздел сайта, где он описан, но не технический адрес файла.\n"
         )
         system_content = (
             "Ты — помощник МКУ «ИМЦРО» (Муниципальное казённое учреждение "
@@ -826,7 +970,7 @@ class RAGSystem:
         site_context: str = "",
         access_scope: str = "public",
     ) -> str:
-        return self._call_gigachat(
+        answer = self._call_gigachat(
             self._answer_messages(
                 question,
                 context,
@@ -834,11 +978,20 @@ class RAGSystem:
                 access_scope=access_scope,
             )
         )
+        return self._sanitize_answer_text(answer)
 
     @staticmethod
-    def _sources_from_docs(docs: list[Document]) -> list[dict]:
+    def _sanitize_answer_text(text: str) -> str:
+        text = (text or "").replace("*", "")
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        return text
+
+    @staticmethod
+    def _sources_from_docs(docs: list[Document], access_scope: str = "public") -> list[dict]:
         seen, sources = set(), []
         for doc in docs:
+            if RAGSystem._hide_cloud_document_url(doc, access_scope):
+                continue
             url = doc.metadata.get("source", "")
             if url.startswith("__"):
                 url = doc.metadata.get("page_url", "")
@@ -875,8 +1028,7 @@ class RAGSystem:
                 "sources":            [{"title": str, "source": str}, ...]
             }
         """
-        if self._base_retriever is None:
-            raise RuntimeError("Сначала вызовите load_index() или set_vectorstore().")
+        self._ensure_knowledge_base_ready()
 
         rewritten = self._rewrite_question(question)
         top_docs, denied_requested_docs = self._retrieve_and_rerank(rewritten, access_scope)
@@ -894,7 +1046,7 @@ class RAGSystem:
             }
 
         site_context = self._site_context_from_docs(top_docs) or self._load_site_context()
-        context      = self._format_docs(top_docs, site_context=site_context)
+        context      = self._format_docs(top_docs, site_context=site_context, access_scope=access_scope)
         answer       = self._generate_answer(
             rewritten,
             context,
@@ -904,7 +1056,7 @@ class RAGSystem:
 
         self.memory.save(question, answer)
 
-        sources = self._sources_from_docs(top_docs)
+        sources = self._sources_from_docs(top_docs, access_scope=access_scope)
 
         return {
             "answer":             answer,
@@ -914,8 +1066,7 @@ class RAGSystem:
         }
 
     def ask_stream(self, question: str, access_scope: str = "public") -> Iterator[dict]:
-        if self._base_retriever is None:
-            raise RuntimeError("Сначала вызовите load_index() или set_vectorstore().")
+        self._ensure_knowledge_base_ready()
 
         yield {"type": "status", "stage": "rewrite", "message": "Уточняю вопрос"}
         rewritten = self._rewrite_question(question)
@@ -923,14 +1074,13 @@ class RAGSystem:
 
         yield {"type": "status", "stage": "retrieve", "message": "Ищу материалы в базе знаний"}
         top_docs, denied_requested_docs = self._retrieve_and_rerank(rewritten, access_scope)
-        sources = self._sources_from_docs(top_docs)
-        yield {"type": "sources", "sources": sources}
 
         self._log_retrieved_context(rewritten, access_scope, top_docs)
 
         if denied_requested_docs and access_scope != EMPLOYEE_SCOPE:
             answer = self._access_denied_answer(denied_requested_docs)
             self.memory.save(question, answer)
+            yield {"type": "sources", "sources": []}
             yield {"type": "token", "content": answer}
             yield {
                 "type": "done",
@@ -943,8 +1093,11 @@ class RAGSystem:
             }
             return
 
+        sources = self._sources_from_docs(top_docs, access_scope=access_scope)
+        yield {"type": "sources", "sources": sources}
+
         site_context = self._site_context_from_docs(top_docs) or self._load_site_context()
-        context      = self._format_docs(top_docs, site_context=site_context)
+        context      = self._format_docs(top_docs, site_context=site_context, access_scope=access_scope)
         messages     = self._answer_messages(
             rewritten,
             context,
@@ -955,8 +1108,10 @@ class RAGSystem:
         yield {"type": "status", "stage": "generate", "message": "Готовлю ответ"}
         answer_parts: list[str] = []
         for chunk in self._stream_gigachat(messages):
-            answer_parts.append(chunk)
-            yield {"type": "token", "content": chunk}
+            clean_chunk = self._sanitize_answer_text(chunk)
+            answer_parts.append(clean_chunk)
+            if clean_chunk:
+                yield {"type": "token", "content": clean_chunk}
 
         answer = "".join(answer_parts).strip()
         if not answer:

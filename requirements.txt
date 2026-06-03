@@ -15,6 +15,7 @@ alembic
 python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
+bcrypt
 
 # Pydantic
 pydantic
@@ -42,7 +43,6 @@ httpx
 requests
 beautifulsoup4
 boto3
-pypdf
 python-docx
 pymupdf
 surya-ocr

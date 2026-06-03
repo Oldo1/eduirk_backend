@@ -107,7 +107,7 @@ def list_documents(
     Returns:
         { "path/to/file.pdf": "d41d8cd98f00b204e9800998ecf8427e", ... }
     """
-    s3     = _make_client()
+    s3 = _make_client()
     result: dict[str, str] = {}
     if s3 is None:
         if raise_on_error:

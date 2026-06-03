@@ -2,14 +2,14 @@
 doc_extractor.py — извлечение текста из документов
 
 Поддерживаемые форматы:
-    .pdf   — нативный текст + OCR-fallback для страниц-сканов
+    .pdf   — распознавание всех страниц через Surya OCR
     .docx  — параграфы и таблицы через python-docx
     .doc   — конвертация в .docx через Word COM (pywin32) или mammoth,
              затем обработка как .docx
 
 Зависимости:
-    pip install pypdf python-docx
-    pip install pymupdf surya-ocr pillow     # для OCR (опционально)
+    pip install python-docx
+    pip install pymupdf surya-ocr pillow     # для OCR PDF
     pip install pywin32                       # для .doc через Word (опционально)
     pip install mammoth                       # для .doc без Word (опционально)
 """
@@ -23,11 +23,11 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from config import PDF_MIN_PAGE_CHARS
 from ocr_engine import is_ocr_available, ocr_pdf_pages
 from ocr_cache import get_cached, save_cached
 
 logger = logging.getLogger("doc_extractor")
+PDF_OCR_CACHE_NAMESPACE = "pdf-surya-v1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -35,63 +35,38 @@ logger = logging.getLogger("doc_extractor")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_pdf(pdf_bytes: bytes) -> str:
-    """
-    Извлекает текст из PDF постранично.
-    Сначала пытается нативное извлечение, затем ОДНИМ БАТЧЕМ прогоняет
-    через OCR все страницы-сканы. Батч-OCR в 2-3× быстрее поштучного
-    благодаря параллельной детекции внутри Surya.
-
-    Returns:
-        Полный текст документа или пустую строку при ошибке.
-    """
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        logger.error("[pdf] pypdf не установлен: pip install pypdf")
+    if not is_ocr_available():
+        logger.warning("[pdf] Surya OCR недоступен, PDF не будет извлечён")
         return ""
 
     try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        total  = len(reader.pages)
+        import fitz
 
-        # 1. Нативное извлечение + список страниц-кандидатов на OCR
-        native_texts: dict[int, str] = {}
-        scan_pages:   list[int]      = []
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            total = len(doc)
+        finally:
+            doc.close()
 
-        for i, page in enumerate(reader.pages):
-            raw = re.sub(r'\s+', ' ', page.extract_text() or "").strip()
-            if len(raw) >= PDF_MIN_PAGE_CHARS:
-                native_texts[i] = raw
-            else:
-                scan_pages.append(i)
+        if total <= 0:
+            logger.warning("[pdf] PDF не содержит страниц")
+            return ""
 
-        # 2. Батч-OCR для всех сканов одним вызовом
-        ocr_texts: dict[int, str] = {}
-        if scan_pages:
-            if is_ocr_available():
-                logger.info(f"[pdf] Страниц-сканов: {len(scan_pages)}/{total}, запускаю батч-OCR")
-                ocr_texts = ocr_pdf_pages(pdf_bytes, scan_pages)
-                # Оставляем только те, где удалось что-то извлечь
-                ocr_texts = {
-                    idx: txt for idx, txt in ocr_texts.items()
-                    if len(txt) >= PDF_MIN_PAGE_CHARS
-                }
-                logger.info(f"[pdf] OCR извлёк текст на {len(ocr_texts)}/{len(scan_pages)} страницах")
-            else:
-                logger.debug(f"[pdf] {len(scan_pages)} страниц-сканов, но OCR недоступен")
+        page_indices = list(range(total))
+        logger.info(f"[pdf] Запускаю Surya OCR для всех страниц PDF: {total}")
+        ocr_texts = ocr_pdf_pages(pdf_bytes, page_indices)
+        logger.info(f"[pdf] Surya OCR извлёк текст на {len(ocr_texts)}/{total} страницах")
 
-        # 3. Собираем результат в исходном порядке страниц
-        parts: list[str] = []
-        for i in range(total):
-            if i in native_texts:
-                parts.append(native_texts[i])
-            elif i in ocr_texts:
-                parts.append(ocr_texts[i])
+        parts = [
+            ocr_texts[i]
+            for i in page_indices
+            if ocr_texts.get(i)
+        ]
 
         return "\n\n".join(parts)
 
     except Exception as e:
-        logger.error(f"[pdf] Ошибка при чтении: {e}")
+        logger.error(f"[pdf] Ошибка OCR-извлечения: {e}")
         return ""
 
 
@@ -276,12 +251,13 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
     Returns:
         Извлечённый текст или пустую строку.
     """
+    ext = Path(filename).suffix.lower()
+    cache_namespace = PDF_OCR_CACHE_NAMESPACE if ext == ".pdf" else "default"
+
     # Проверяем кэш до любой тяжёлой работы
-    cached = get_cached(file_bytes)
+    cached = get_cached(file_bytes, namespace=cache_namespace)
     if cached is not None:
         return cached
-
-    ext = Path(filename).suffix.lower()
 
     if ext == ".pdf":
         text = extract_pdf(file_bytes)
@@ -295,5 +271,5 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
         text = ""
 
     # Сохраняем только непустой результат
-    save_cached(file_bytes, text)
+    save_cached(file_bytes, text, namespace=cache_namespace)
     return text

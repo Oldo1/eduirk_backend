@@ -17,7 +17,6 @@ def test_user_response_exposes_role_name_from_relationship():
     user = User(
         id=42,
         email="domu@example.test",
-        username="domu",
         is_active=True,
     )
     user.role = role

@@ -3,16 +3,13 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-root}
-      POSTGRES_DB: ${DB_NAME:-eduirk_db}
+      POSTGRES_USER: ${DB_USER:-mky_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mky_password}
+      POSTGRES_DB: ${DB_NAME:-mky_db}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      # Можно убрать, если БД не нужна снаружи
-      - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-eduirk_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-mky_user} -d ${DB_NAME:-mky_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -24,8 +21,16 @@ services:
       - .env
     environment:
       # Внутри docker-сети БД доступна по имени сервиса, а не localhost
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-mky_user}:${DB_PASSWORD:-mky_password}@db:5432/${DB_NAME:-mky_db}
+      DB_USER: ${DB_USER:-mky_user}
+      DB_PASSWORD: ${DB_PASSWORD:-mky_password}
       DB_HOST: db
       DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-mky_db}
+      SECRET_KEY: ${SECRET_KEY:-change-this-secret-in-dev}
+      PD_ENCRYPTION_KEY: ${PD_ENCRYPTION_KEY:-change-this-key-in-dev}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      ENABLE_DEV_TEST_USERS: "${ENABLE_DEV_TEST_USERS:-true}"
       HF_HOME: /cache/huggingface
       HF_HUB_CACHE: /cache/huggingface/hub
       HF_HUB_DISABLE_XET: "1"
@@ -39,6 +44,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn main:app --host 0.0.0.0 --port 8000"
     ports:
       # Снаружи API доступен на http://localhost:8000
       - "8000:8000"
@@ -48,6 +56,8 @@ services:
       - ./chroma_gigachat:/app/chroma_gigachat
       - ./ocr_cache:/app/ocr_cache
       - ./s3_extracted:/app/s3_extracted
+      - ./static/articles/covers:/app/static/articles/covers
+      - ./static/articles/attachments:/app/static/articles/attachments
       - ./static/certificates/backgrounds:/app/static/certificates/backgrounds
       - ./static/certificates/facsimiles:/app/static/certificates/facsimiles
       - ./static/certificates/generated:/app/static/certificates/generated
@@ -57,4 +67,5 @@ services:
 
 volumes:
   pgdata:
+    name: eduirk_backend_mky_pgdata
   hf_cache:

@@ -16,6 +16,47 @@ def ensure_postgresql_extensions(engine: Engine) -> None:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
 
 
+def ensure_user_name_columns(engine: Engine) -> None:
+    dialect = engine.dialect.name
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            for column in ("last_name", "first_name", "middle_name"):
+                if not _pg_column_exists(conn, "users", column):
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} VARCHAR(100)"))
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            columns = _sqlite_columns(conn, "users")
+            for column in ("last_name", "first_name", "middle_name"):
+                if column not in columns:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} TEXT"))
+
+
+def ensure_user_registration_date_column(engine: Engine) -> None:
+    dialect = engine.dialect.name
+
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            table_exists = conn.execute(text("SELECT to_regclass('public.users')")).scalar()
+            if not table_exists:
+                return
+            if not _pg_column_exists(conn, "users", "created_at"):
+                conn.execute(text("ALTER TABLE users ADD COLUMN created_at TIMESTAMP WITH TIME ZONE"))
+            conn.execute(text("UPDATE users SET created_at = now() WHERE created_at IS NULL"))
+            conn.execute(text("ALTER TABLE users ALTER COLUMN created_at SET DEFAULT now()"))
+            conn.execute(text("ALTER TABLE users ALTER COLUMN created_at SET NOT NULL"))
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
+            }
+            if "users" not in tables:
+                return
+            if "created_at" not in _sqlite_columns(conn, "users"):
+                conn.execute(text("ALTER TABLE users ADD COLUMN created_at TIMESTAMP"))
+            conn.execute(text("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+
+
 def _pg_column_exists(conn, table: str, column: str) -> bool:
     r = conn.execute(
         text(
@@ -32,6 +73,41 @@ def _pg_column_exists(conn, table: str, column: str) -> bool:
 def _sqlite_columns(conn, table: str) -> set[str]:
     rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
     return {r[1] for r in rows}
+
+
+USERNAME_TABLES = (
+    "users",
+    "appointments",
+    "tpmpk_appointment",
+    "assistant_chat_session",
+)
+
+
+def remove_username_columns(engine: Engine) -> None:
+    dialect = engine.dialect.name
+
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            for table in USERNAME_TABLES:
+                table_exists = conn.execute(
+                    text("SELECT to_regclass(:table_name)"),
+                    {"table_name": f"public.{table}"},
+                ).scalar()
+                if table_exists and _pg_column_exists(conn, table, "username"):
+                    conn.execute(text(f'ALTER TABLE "{table}" DROP COLUMN "username"'))
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
+            }
+            for table in USERNAME_TABLES:
+                if table not in tables:
+                    continue
+                if table == "users":
+                    conn.execute(text("DROP INDEX IF EXISTS ix_users_username"))
+                if "username" in _sqlite_columns(conn, table):
+                    conn.execute(text(f'ALTER TABLE "{table}" DROP COLUMN "username"'))
 
 
 INTERNAL_DOCS_DEFAULT_ROLE_NAMES = {
@@ -95,12 +171,75 @@ def ensure_user_role_permission_columns(engine: Engine) -> None:
             _backfill_internal_docs_roles(conn)
 
 
+def ensure_appointment_user_columns(engine: Engine) -> None:
+    dialect = engine.dialect.name
+
+    appointment_columns_pg = [
+        ("user_id", "INTEGER"),
+        ("user_email", "VARCHAR"),
+        ("status", "VARCHAR(20) DEFAULT 'new' NOT NULL"),
+        ("source", "VARCHAR(20) DEFAULT 'site' NOT NULL"),
+        ("updated_at", "TIMESTAMP WITH TIME ZONE DEFAULT now()"),
+    ]
+    tpmpk_columns_pg = [
+        ("user_id", "INTEGER"),
+        ("user_email", "VARCHAR(255)"),
+    ]
+    appointment_columns_sqlite = [
+        ("user_id", "INTEGER"),
+        ("user_email", "TEXT"),
+        ("status", "TEXT DEFAULT 'new' NOT NULL"),
+        ("source", "TEXT DEFAULT 'site' NOT NULL"),
+        ("updated_at", "TIMESTAMP"),
+    ]
+    tpmpk_columns_sqlite = [
+        ("user_id", "INTEGER"),
+        ("user_email", "TEXT"),
+    ]
+
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            if conn.execute(text("SELECT to_regclass('public.appointments')")).scalar():
+                for col, coltype in appointment_columns_pg:
+                    if not _pg_column_exists(conn, "appointments", col):
+                        conn.execute(text(f"ALTER TABLE appointments ADD COLUMN {col} {coltype}"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS appointments_user_id_idx ON appointments(user_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS appointments_status_idx ON appointments(status)"))
+
+            if conn.execute(text("SELECT to_regclass('public.tpmpk_appointment')")).scalar():
+                for col, coltype in tpmpk_columns_pg:
+                    if not _pg_column_exists(conn, "tpmpk_appointment", col):
+                        conn.execute(text(f"ALTER TABLE tpmpk_appointment ADD COLUMN {col} {coltype}"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS tpmpk_appointment_user_id_idx ON tpmpk_appointment(user_id)"))
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
+            }
+            if "appointments" in tables:
+                columns = _sqlite_columns(conn, "appointments")
+                for col, coltype in appointment_columns_sqlite:
+                    if col not in columns:
+                        conn.execute(text(f"ALTER TABLE appointments ADD COLUMN {col} {coltype}"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS appointments_user_id_idx ON appointments(user_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS appointments_status_idx ON appointments(status)"))
+
+            if "tpmpk_appointment" in tables:
+                columns = _sqlite_columns(conn, "tpmpk_appointment")
+                for col, coltype in tpmpk_columns_sqlite:
+                    if col not in columns:
+                        conn.execute(text(f"ALTER TABLE tpmpk_appointment ADD COLUMN {col} {coltype}"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS tpmpk_appointment_user_id_idx ON tpmpk_appointment(user_id)"))
+
+
 def ensure_certificate_layout_columns(engine: Engine) -> None:
     dialect = engine.dialect.name
 
     alters_pg: list[tuple[str, str, str]] = [
         ("users", "is_active", "BOOLEAN DEFAULT TRUE NOT NULL"),
         ("users", "allowed_methodika_subjects", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
+        ("user_role", "permissions", "JSONB DEFAULT '{}'::jsonb NOT NULL"),
         ("certificate_templates", "signers_block_x_mm", "DOUBLE PRECISION DEFAULT 105"),
         ("certificate_templates", "signers_row_height_mm", "DOUBLE PRECISION DEFAULT 32"),
         ("certificate_templates", "signers_band_width_mm", "DOUBLE PRECISION DEFAULT 168"),
@@ -119,6 +258,23 @@ def ensure_certificate_layout_columns(engine: Engine) -> None:
         ("template_text_elements", "color", "VARCHAR(16) DEFAULT '#0F172A'"),
         ("template_text_elements", "font_weight", "VARCHAR(8) DEFAULT '400'"),
         ("template_text_elements", "font_family", "VARCHAR(120) DEFAULT 'DejaVu'"),
+        ("template_text_elements", "client_id", "VARCHAR(80)"),
+        ("template_text_elements", "element_type", "VARCHAR(32) DEFAULT 'text' NOT NULL"),
+        ("template_text_elements", "value", "VARCHAR(1000)"),
+        ("template_text_elements", "width_mm", "DOUBLE PRECISION"),
+        ("template_text_elements", "height_mm", "DOUBLE PRECISION"),
+        ("template_text_elements", "italic", "BOOLEAN DEFAULT FALSE"),
+        ("template_text_elements", "underline", "BOOLEAN DEFAULT FALSE"),
+        ("template_text_elements", "line_height", "DOUBLE PRECISION"),
+        ("template_text_elements", "z_index", "INTEGER"),
+        ("template_text_elements", "hidden", "BOOLEAN DEFAULT FALSE"),
+        ("template_text_elements", "locked", "BOOLEAN DEFAULT FALSE"),
+        ("template_text_elements", "opacity", "DOUBLE PRECISION"),
+        ("template_text_elements", "source_url", "VARCHAR(500)"),
+        ("template_text_elements", "variable_name", "VARCHAR(120)"),
+        ("template_text_elements", "grammar_settings", "JSONB"),
+        ("template_text_elements", "signer_group_id", "VARCHAR(80)"),
+        ("template_text_elements", "anchor", "VARCHAR(20)"),
         ("template_signers", "offset_y_mm", "DOUBLE PRECISION DEFAULT 0"),
         ("template_signers", "facsimile_offset_x_mm", "DOUBLE PRECISION DEFAULT 0"),
         ("template_signers", "facsimile_offset_y_mm", "DOUBLE PRECISION DEFAULT 0"),
@@ -128,6 +284,7 @@ def ensure_certificate_layout_columns(engine: Engine) -> None:
     alters_sqlite: list[tuple[str, str, str]] = [
         ("users", "is_active", "BOOLEAN DEFAULT 1 NOT NULL"),
         ("users", "allowed_methodika_subjects", "TEXT DEFAULT '[]' NOT NULL"),
+        ("user_role", "permissions", "TEXT DEFAULT '{}' NOT NULL"),
         ("certificate_templates", "signers_block_x_mm", "REAL DEFAULT 105"),
         ("certificate_templates", "signers_row_height_mm", "REAL DEFAULT 32"),
         ("certificate_templates", "signers_band_width_mm", "REAL DEFAULT 168"),
@@ -146,6 +303,23 @@ def ensure_certificate_layout_columns(engine: Engine) -> None:
         ("template_text_elements", "color", "TEXT DEFAULT '#0F172A'"),
         ("template_text_elements", "font_weight", "TEXT DEFAULT '400'"),
         ("template_text_elements", "font_family", "TEXT DEFAULT 'DejaVu'"),
+        ("template_text_elements", "client_id", "TEXT"),
+        ("template_text_elements", "element_type", "TEXT DEFAULT 'text' NOT NULL"),
+        ("template_text_elements", "value", "TEXT"),
+        ("template_text_elements", "width_mm", "REAL"),
+        ("template_text_elements", "height_mm", "REAL"),
+        ("template_text_elements", "italic", "BOOLEAN DEFAULT 0"),
+        ("template_text_elements", "underline", "BOOLEAN DEFAULT 0"),
+        ("template_text_elements", "line_height", "REAL"),
+        ("template_text_elements", "z_index", "INTEGER"),
+        ("template_text_elements", "hidden", "BOOLEAN DEFAULT 0"),
+        ("template_text_elements", "locked", "BOOLEAN DEFAULT 0"),
+        ("template_text_elements", "opacity", "REAL"),
+        ("template_text_elements", "source_url", "TEXT"),
+        ("template_text_elements", "variable_name", "TEXT"),
+        ("template_text_elements", "grammar_settings", "TEXT"),
+        ("template_text_elements", "signer_group_id", "TEXT"),
+        ("template_text_elements", "anchor", "TEXT"),
         ("template_signers", "offset_y_mm", "REAL DEFAULT 0"),
         ("template_signers", "facsimile_offset_x_mm", "REAL DEFAULT 0"),
         ("template_signers", "facsimile_offset_y_mm", "REAL DEFAULT 0"),
@@ -203,6 +377,7 @@ def ensure_article_editor_columns(engine: Engine) -> None:
         ("attachments", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
         ("categories", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
         ("tags", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
+        ("sections", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
         ("publishing_scope", "VARCHAR(20) DEFAULT 'both' NOT NULL"),
         ("methodika_subject", "VARCHAR(120)"),
         ("dom_uchitelya_section", "VARCHAR(120)"),
@@ -225,6 +400,7 @@ def ensure_article_editor_columns(engine: Engine) -> None:
         ("attachments", "TEXT DEFAULT '[]' NOT NULL"),
         ("categories", "TEXT DEFAULT '[]' NOT NULL"),
         ("tags", "TEXT DEFAULT '[]' NOT NULL"),
+        ("sections", "TEXT DEFAULT '[]' NOT NULL"),
         ("publishing_scope", "TEXT DEFAULT 'both' NOT NULL"),
         ("methodika_subject", "TEXT"),
         ("dom_uchitelya_section", "TEXT"),
@@ -268,5 +444,36 @@ def ensure_tpmpk_slot_minutes_range(engine: Engine) -> None:
                 text(
                     f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
                     "CHECK (slot_minutes BETWEEN 10 AND 240 AND slot_minutes % 5 = 0)"
+                )
+            )
+
+
+def ensure_tpmpk_duplicate_guard(engine: Engine) -> None:
+    dialect = engine.dialect.name
+
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            if not _pg_column_exists(conn, "tpmpk_appointment", "duplicate_key"):
+                conn.execute(text("ALTER TABLE tpmpk_appointment ADD COLUMN duplicate_key VARCHAR(64)"))
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS tpmpk_appointment_duplicate_active_uniq
+                    ON tpmpk_appointment (duplicate_key)
+                    WHERE status <> 'cancelled' AND duplicate_key IS NOT NULL
+                    """
+                )
+            )
+    elif dialect == "sqlite":
+        with engine.begin() as conn:
+            if "duplicate_key" not in _sqlite_columns(conn, "tpmpk_appointment"):
+                conn.execute(text("ALTER TABLE tpmpk_appointment ADD COLUMN duplicate_key TEXT"))
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS tpmpk_appointment_duplicate_active_uniq
+                    ON tpmpk_appointment (duplicate_key)
+                    WHERE status <> 'cancelled' AND duplicate_key IS NOT NULL
+                    """
                 )
             )

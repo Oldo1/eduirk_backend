@@ -2,8 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
 
+from auth import get_current_user, get_optional_current_user
 from database import get_db
-from models import Appointment
+from models import Appointment, User
 from schemas import AppointmentCreate, AppointmentResponse
 
 router = APIRouter(prefix="/appointments", tags=["appointments"])
@@ -11,18 +12,44 @@ router = APIRouter(prefix="/appointments", tags=["appointments"])
 
 # ====================== СОЗДАНИЕ ЗАПИСИ ======================
 @router.post("/", response_model=AppointmentResponse, status_code=status.HTTP_201_CREATED)
-def create_appointment(data: AppointmentCreate, db: Session = Depends(get_db)):
+def create_appointment(
+    data: AppointmentCreate,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_current_user),
+):
     """Создать новую запись на приём"""
     appointment = Appointment(
+        user_id=current_user.id if current_user else None,
+        user_email=current_user.email if current_user else None,
         full_name=data.full_name,
         appointment_date=data.appointment_date,
         appointment_time=data.appointment_time,
         comment=data.comment,
+        status="new",
+        source="site",
     )
     db.add(appointment)
     db.commit()
     db.refresh(appointment)
     return appointment
+
+
+@router.get("/my", response_model=List[AppointmentResponse])
+def get_my_appointments(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Получить свои записи на приём"""
+    return (
+        db.query(Appointment)
+        .filter(Appointment.user_id == current_user.id)
+        .order_by(
+            Appointment.appointment_date.desc(),
+            Appointment.appointment_time.desc(),
+            Appointment.created_at.desc(),
+        )
+        .all()
+    )
 
 
 # ====================== ПОЛУЧЕНИЕ ВСЕХ ЗАПИСЕЙ ======================

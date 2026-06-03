@@ -1,12 +1,29 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Path as ApiPath
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from typing import Any
 from auth import get_current_user, get_optional_current_user
 from database import SessionLocal, get_db
-from models import AssistantChatMessage, AssistantChatSession, User, UserRole
+from models import (
+    Appointment,
+    AssistantChatMessage,
+    AssistantChatSession,
+    TPMPKAppointment,
+    TPMPKWorkingDay,
+    User,
+    UserRole,
+)
 from assistant_access import access_scope_for_role, scoped_session_id
+from assistant_settings import (
+    AVAILABLE_GIGACHAT_MODELS,
+    AssistantSettings,
+    get_assistant_settings,
+    load_assistant_settings,
+    register_settings_listener,
+    update_assistant_settings,
+)
 from datetime import datetime, timezone
 from threading import Lock
 from time import monotonic
@@ -19,19 +36,47 @@ import uuid
 logger = logging.getLogger("assistant")
 
 router = APIRouter(prefix="/assistant", tags=["assistant"])
-ASSISTANT_HISTORY_MAX_MESSAGES = int(os.getenv("ASSISTANT_HISTORY_MAX_MESSAGES", "400"))
-ASSISTANT_QUESTION_MAX_LENGTH = max(1, int(os.getenv("ASSISTANT_QUESTION_MAX_LENGTH", "4000")))
+ASSISTANT_QUESTION_HARD_MAX_LENGTH = 100_000
 ASSISTANT_SESSION_ID_MAX_LENGTH = max(1, int(os.getenv("ASSISTANT_SESSION_ID_MAX_LENGTH", "120")))
 ASSISTANT_HISTORY_LIMIT_MAX = max(1, int(os.getenv("ASSISTANT_HISTORY_LIMIT_MAX", "200")))
 ASSISTANT_HISTORY_DEFAULT_LIMIT = min(100, ASSISTANT_HISTORY_LIMIT_MAX)
-ASSISTANT_SESSION_TTL_SECONDS = int(os.getenv("ASSISTANT_SESSION_TTL_SECONDS", str(3 * 60 * 60)))
 ASSISTANT_SESSION_CLEANUP_INTERVAL_SECONDS = int(os.getenv("ASSISTANT_SESSION_CLEANUP_INTERVAL_SECONDS", "300"))
 ASSISTANT_MAX_SESSIONS = int(os.getenv("ASSISTANT_MAX_SESSIONS", "200"))
-ASSISTANT_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("ASSISTANT_RATE_LIMIT_WINDOW_SECONDS", "60"))
-ASSISTANT_RATE_LIMIT_MAX_REQUESTS = int(os.getenv("ASSISTANT_RATE_LIMIT_MAX_REQUESTS", "12"))
 ASSISTANT_RATE_LIMIT_MAX_ENTRIES = int(os.getenv("ASSISTANT_RATE_LIMIT_MAX_ENTRIES", "1000"))
 WARMUP_SESSION_ID = "__warmup__"
+ASSISTANT_MISSING_CREDENTIALS_MESSAGE = (
+    "Ассистент не настроен: отсутствует ключ GigaChat. "
+    "Обратитесь к администратору."
+)
+ASSISTANT_INVALID_CREDENTIALS_MESSAGE = (
+    "Ассистент не настроен: ключ GigaChat отсутствует или некорректен. "
+    "Обратитесь к администратору."
+)
+ASSISTANT_STARTING_MESSAGE = (
+    "Ассистент ещё запускается и прогревает базу знаний. "
+    "Попробуйте ещё раз через несколько минут."
+)
+KNOWLEDGE_BASE_INDEX_MISSING_MESSAGE = (
+    "База знаний не готова: индекс не найден. "
+    "Запустите обновление или полную переиндексацию базы знаний."
+)
+KNOWLEDGE_BASE_EMPTY_MESSAGE = (
+    "База знаний не готова: индекс пуст. "
+    "Запустите обновление или полную переиндексацию базы знаний."
+)
+KNOWLEDGE_BASE_INDEX_ERROR_MESSAGE = (
+    "База знаний не готова: не удалось прочитать индекс. "
+    "Проверьте Chroma-хранилище и запустите переиндексацию."
+)
 SESSION_ID_RE = re.compile(r"^[0-9A-Za-zА-Яа-яЁё._:@-]+$")
+APPOINTMENT_QUESTION_RE = re.compile(
+    r"(запис|при[её]м|слот|заявк)",
+    re.IGNORECASE,
+)
+PERSONAL_APPOINTMENT_RE = re.compile(
+    r"(моя|мо[йею]|у\s+меня|меня|я\s+запис|последн|ближайш|следующ|когда)",
+    re.IGNORECASE,
+)
 _status_lock = Lock()
 _warmup_started_at: str | None = None
 _warmup_completed_at: str | None = None
@@ -54,7 +99,7 @@ _max_request_duration_seconds: float | None = None
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=ASSISTANT_QUESTION_MAX_LENGTH)
+    question: str = Field(..., min_length=1, max_length=ASSISTANT_QUESTION_HARD_MAX_LENGTH)
     session_id: str = Field("default", min_length=1, max_length=ASSISTANT_SESSION_ID_MAX_LENGTH)
 
 
@@ -64,6 +109,10 @@ class AssistantStatusResponse(BaseModel):
     vectorstore_ready:   bool
     reranker_ready:      bool
     embeddings_ready:    bool
+    knowledge_base_ready: bool
+    knowledge_base_status: str
+    knowledge_base_message: str | None = None
+    assistant_message:   str | None = None
     vector_count:        int | None = None
     sessions:            int
     warmup_started_at:   str | None = None
@@ -97,6 +146,36 @@ class AssistantAnswerQualityRequest(BaseModel):
     comment: str | None = Field(None, max_length=1000)
     tags: list[str] = Field(default_factory=list, max_length=10)
 
+
+class AssistantSettingsUpdateRequest(BaseModel):
+    update_interval_hours: float = Field(..., gt=0, le=24 * 30)
+    gigachat_model: str
+    question_max_length: int = Field(..., ge=1, le=ASSISTANT_QUESTION_HARD_MAX_LENGTH)
+    session_ttl_seconds: int = Field(..., ge=0, le=365 * 24 * 60 * 60)
+    history_max_messages: int = Field(..., ge=0, le=100_000)
+    rate_limit_window_seconds: int = Field(..., ge=0, le=24 * 60 * 60)
+    rate_limit_max_requests: int = Field(..., ge=0, le=100_000)
+
+    @field_validator("gigachat_model")
+    @classmethod
+    def _validate_gigachat_model(cls, value: str) -> str:
+        clean_value = value.strip()
+        if clean_value not in AVAILABLE_GIGACHAT_MODELS:
+            raise ValueError("Выберите поддерживаемую модель GigaChat.")
+        return clean_value
+
+
+class AssistantSettingsResponse(AssistantSettingsUpdateRequest):
+    available_gigachat_models: list[str]
+    updated_at: datetime | None = None
+
+
+class AssistantNotReadyError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 
 class LazyRAGConfig:
@@ -107,22 +186,54 @@ class LazyRAGConfig:
         if self._value is None:
             from rag_pipeline import RAGConfig
 
+            settings = get_assistant_settings()
             self._value = RAGConfig(
                 scope=os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
-                model=os.getenv("GIGACHAT_MODEL", "GigaChat"),
+                model=settings.gigachat_model,
                 persist_dir="./chroma_gigachat",
-                collection_name="eduirk",
+                collection_name=os.getenv("CHROMA_COLLECTION_NAME", "eduirk"),
                 top_k=5,
                 fetch_k=30,
                 memory_turns=5,
             )
         return self._value
 
+    def reset(self) -> None:
+        self._value = None
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self.get(), name)
 
 
 cfg = LazyRAGConfig()
+
+
+def _missing_gigachat_credentials_message() -> str | None:
+    if not os.getenv("GIGACHAT_CREDENTIALS", "").strip():
+        return ASSISTANT_MISSING_CREDENTIALS_MESSAGE
+    return None
+
+
+def _is_gigachat_credentials_error(exc: Exception) -> bool:
+    text = str(exc)
+    return isinstance(exc, ValueError) and (
+        "[ключ]" in text or "GIGACHAT_CREDENTIALS" in text
+    )
+
+
+def assistant_startup_error_message(exc: Exception) -> str:
+    if isinstance(exc, AssistantNotReadyError):
+        return exc.message
+    if _is_gigachat_credentials_error(exc):
+        return ASSISTANT_INVALID_CREDENTIALS_MESSAGE
+    if exc.__class__.__name__ == "KnowledgeBaseNotReadyError":
+        return str(exc)
+    return "Ошибка прогрева ассистента. Подробности в логах backend."
+
+
+def _index_storage_exists() -> bool:
+    persist_dir = os.path.abspath(cfg.persist_dir)
+    return os.path.isfile(os.path.join(persist_dir, "chroma.sqlite3"))
 
 _EMBEDDINGS: Any | None = None
 _embeddings_ready = False
@@ -242,7 +353,8 @@ def _touch_session_unlocked(session_id: str, now: float | None = None) -> None:
 def cleanup_idle_sessions(force: bool = False) -> int:
     global _last_session_cleanup_at, _evicted_sessions_total
 
-    if ASSISTANT_SESSION_TTL_SECONDS <= 0 and ASSISTANT_MAX_SESSIONS <= 0:
+    session_ttl_seconds = get_assistant_settings().session_ttl_seconds
+    if session_ttl_seconds <= 0 and ASSISTANT_MAX_SESSIONS <= 0:
         return 0
 
     now = monotonic()
@@ -263,8 +375,8 @@ def cleanup_idle_sessions(force: bool = False) -> int:
         expired = [
             session_id
             for session_id in user_session_ids
-            if ASSISTANT_SESSION_TTL_SECONDS > 0
-            and now - _session_accessed_at.get(session_id, now) >= ASSISTANT_SESSION_TTL_SECONDS
+            if session_ttl_seconds > 0
+            and now - _session_accessed_at.get(session_id, now) >= session_ttl_seconds
         ]
 
         overflow: list[str] = []
@@ -285,8 +397,8 @@ def cleanup_idle_sessions(force: bool = False) -> int:
                     continue
                 last_access = _session_accessed_at.get(session_id, now)
                 expired_now = (
-                    ASSISTANT_SESSION_TTL_SECONDS > 0
-                    and now - last_access >= ASSISTANT_SESSION_TTL_SECONDS
+                    session_ttl_seconds > 0
+                    and now - last_access >= session_ttl_seconds
                 )
                 overflow_now = session_id in overflow
                 if not expired_now and not overflow_now:
@@ -308,7 +420,8 @@ def cleanup_idle_sessions(force: bool = False) -> int:
 
 
 def _rate_limit_enabled() -> bool:
-    return ASSISTANT_RATE_LIMIT_WINDOW_SECONDS > 0 and ASSISTANT_RATE_LIMIT_MAX_REQUESTS > 0
+    settings = get_assistant_settings()
+    return settings.rate_limit_window_seconds > 0 and settings.rate_limit_max_requests > 0
 
 
 def _rate_limit_key(request: Request, user: User | None) -> str:
@@ -318,12 +431,13 @@ def _rate_limit_key(request: Request, user: User | None) -> str:
     return f"anonymous:{host}"
 
 
-def _cleanup_rate_limit_buckets_unlocked(now: float) -> None:
-    if not _rate_limit_enabled():
+def _cleanup_rate_limit_buckets_unlocked(now: float, settings: AssistantSettings | None = None) -> None:
+    settings = settings or get_assistant_settings()
+    if settings.rate_limit_window_seconds <= 0 or settings.rate_limit_max_requests <= 0:
         _rate_limit_buckets.clear()
         return
 
-    cutoff = now - ASSISTANT_RATE_LIMIT_WINDOW_SECONDS
+    cutoff = now - settings.rate_limit_window_seconds
     for key, bucket in list(_rate_limit_buckets.items()):
         active = [ts for ts in bucket if ts > cutoff]
         if active:
@@ -347,16 +461,17 @@ def _cleanup_rate_limit_buckets_unlocked(now: float) -> None:
 def _check_assistant_rate_limit(request: Request, user: User | None) -> None:
     global _rate_limit_rejections
 
-    if not _rate_limit_enabled():
+    settings = get_assistant_settings()
+    if settings.rate_limit_window_seconds <= 0 or settings.rate_limit_max_requests <= 0:
         return
 
     now = monotonic()
     key = _rate_limit_key(request, user)
-    cutoff = now - ASSISTANT_RATE_LIMIT_WINDOW_SECONDS
+    cutoff = now - settings.rate_limit_window_seconds
     with _rate_limit_lock:
         bucket = [ts for ts in _rate_limit_buckets.get(key, []) if ts > cutoff]
-        if len(bucket) >= ASSISTANT_RATE_LIMIT_MAX_REQUESTS:
-            retry_after = max(1, int(bucket[0] + ASSISTANT_RATE_LIMIT_WINDOW_SECONDS - now) + 1)
+        if len(bucket) >= settings.rate_limit_max_requests:
+            retry_after = max(1, int(bucket[0] + settings.rate_limit_window_seconds - now) + 1)
             _rate_limit_buckets[key] = bucket
             _rate_limit_rejections += 1
             raise HTTPException(
@@ -366,7 +481,7 @@ def _check_assistant_rate_limit(request: Request, user: User | None) -> None:
             )
         bucket.append(now)
         _rate_limit_buckets[key] = bucket
-        _cleanup_rate_limit_buckets_unlocked(now)
+        _cleanup_rate_limit_buckets_unlocked(now, settings)
 
 
 def _rate_limit_stats() -> tuple[int, int]:
@@ -434,12 +549,14 @@ def get_vectorstore() -> Any:
         with _vectorstore_lock:
             if _vectorstore is None:
                 from langchain_chroma import Chroma
+                from assistant_access import ensure_access_level_metadata
 
                 _vectorstore = Chroma(
                     collection_name=cfg.collection_name,
                     persist_directory=cfg.persist_dir,
                     embedding_function=EMBEDDINGS,
                 )
+                ensure_access_level_metadata(_vectorstore)
                 logger.info(
                     f"[assistant] Vectorstore инициализирован. "
                     f"Векторов: {_vectorstore._collection.count()}"
@@ -449,11 +566,23 @@ def get_vectorstore() -> Any:
 
 def init_rag() -> None:
     """Вызывается при старте приложения из lifespan."""
-    vs = get_vectorstore()
+    credentials_message = _missing_gigachat_credentials_message()
+    if credentials_message:
+        raise AssistantNotReadyError("configuration_error", credentials_message)
+    if not _index_storage_exists():
+        raise AssistantNotReadyError("knowledge_base_not_ready", KNOWLEDGE_BASE_INDEX_MISSING_MESSAGE)
+
+    get_vectorstore()
+    vector_count = _safe_vector_count()
+    if vector_count is None:
+        raise AssistantNotReadyError("knowledge_base_not_ready", KNOWLEDGE_BASE_INDEX_ERROR_MESSAGE)
+    if vector_count <= 0:
+        raise AssistantNotReadyError("knowledge_base_not_ready", KNOWLEDGE_BASE_EMPTY_MESSAGE)
+
     # Прогреваем RAG и reranker на старте, чтобы первый пользовательский
     # запрос не ждал загрузку модели и не срывался на frontend timeout.
     get_rag(WARMUP_SESSION_ID)
-    logger.info(f"[assistant] RAG готов. Векторов в базе: {vs._collection.count()}")
+    logger.info(f"[assistant] RAG готов. Векторов в базе: {vector_count}")
 
 
 def _make_rag(session_id: str) -> Any:
@@ -507,11 +636,296 @@ def _safe_vector_count() -> int | None:
         return None
 
 
+def _knowledge_base_state(vector_count: int | None) -> tuple[bool, str, str | None]:
+    if _vectorstore is None:
+        if not _index_storage_exists():
+            return False, "index_missing", KNOWLEDGE_BASE_INDEX_MISSING_MESSAGE
+        return False, "not_loaded", ASSISTANT_STARTING_MESSAGE
+    if vector_count is None:
+        return False, "index_error", KNOWLEDGE_BASE_INDEX_ERROR_MESSAGE
+    if vector_count <= 0:
+        return False, "empty", KNOWLEDGE_BASE_EMPTY_MESSAGE
+    return True, "ready", None
+
+
+def _assistant_not_ready_reason(status: AssistantStatusResponse) -> tuple[str, str] | None:
+    if status.ready:
+        return None
+    if status.assistant_message:
+        return status.status, status.assistant_message
+    return status.status, ASSISTANT_STARTING_MESSAGE
+
+
+def _stream_error_payload(exc: Exception) -> tuple[str, str]:
+    if exc.__class__.__name__ == "KnowledgeBaseNotReadyError":
+        return "knowledge_base_not_ready", str(exc)
+    if isinstance(exc, AssistantNotReadyError):
+        return exc.code, exc.message
+    if _is_gigachat_credentials_error(exc):
+        return "configuration_error", ASSISTANT_INVALID_CREDENTIALS_MESSAGE
+    return "assistant_error", "Не удалось получить ответ ассистента. Попробуйте позже."
+
+
+def _looks_like_personal_appointment_question(question: str) -> bool:
+    text = (question or "").strip().lower().replace("ё", "е")
+    return bool(
+        APPOINTMENT_QUESTION_RE.search(text)
+        and PERSONAL_APPOINTMENT_RE.search(text)
+    )
+
+
+def _format_date_ru(value: Any) -> str:
+    if value is None:
+        return "дата не указана"
+    if isinstance(value, str):
+        try:
+            parsed = datetime.strptime(value[:10], "%Y-%m-%d")
+            return parsed.strftime("%d.%m.%Y")
+        except ValueError:
+            return value
+    if hasattr(value, "strftime"):
+        return value.strftime("%d.%m.%Y")
+    return str(value)
+
+
+def _format_time_ru(value: Any) -> str:
+    if value is None:
+        return "время не указано"
+    if isinstance(value, str):
+        return value[:5]
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M")
+    return str(value)
+
+
+def _appointment_status_label(status: str | None) -> str:
+    return {
+        "new": "новая",
+        "confirmed": "подтверждена",
+        "cancelled": "отменена",
+        "done": "завершена",
+        "archive": "в архиве",
+    }.get((status or "").lower(), status or "не указан")
+
+
+def _appointment_sort_key(item: dict) -> tuple[str, str, str]:
+    return (
+        str(item.get("date") or ""),
+        str(item.get("time") or ""),
+        str(item.get("created_at") or ""),
+    )
+
+
+def _legacy_user_appointment_filters(model: Any, user: User) -> list[Any]:
+    filters = []
+    if getattr(user, "email", None):
+        filters.append(model.user_email == user.email)
+    return filters
+
+
+def _can_view_unbound_appointments(user: User) -> bool:
+    role_name = (getattr(getattr(user, "role", None), "role_name", "") or "").lower()
+    return bool(
+        getattr(user, "can_access_internal_docs", False)
+        or role_name in {"admin", "administrator", "админ", "администратор", "employee", "staff", "сотрудник"}
+    )
+
+
+def _appointment_item_answer_prefix(item: dict) -> str:
+    if item.get("unbound"):
+        return "К вашей учётной записи запись не привязана. Последняя непривязанная запись"
+    return "Ваша последняя найденная запись"
+
+
+def _user_appointment_items(db: Session, user: User, include_unbound: bool = False) -> list[dict]:
+    items: list[dict] = []
+
+    appointment_filters = [Appointment.user_id == user.id]
+    appointment_filters.extend(_legacy_user_appointment_filters(Appointment, user))
+    for row in (
+        db.query(Appointment)
+        .filter(
+            or_(*appointment_filters),
+            Appointment.status != "cancelled",
+        )
+        .order_by(
+            Appointment.appointment_date.desc(),
+            Appointment.appointment_time.desc(),
+            Appointment.created_at.desc(),
+        )
+        .limit(10)
+        .all()
+    ):
+        items.append({
+            "kind": "запись на приём",
+            "date": row.appointment_date,
+            "time": row.appointment_time,
+            "status": row.status,
+            "comment": row.comment,
+            "created_at": row.created_at,
+            "unbound": False,
+        })
+
+    tpmpk_filters = [TPMPKAppointment.user_id == user.id]
+    tpmpk_filters.extend(_legacy_user_appointment_filters(TPMPKAppointment, user))
+    for appointment, day in (
+        db.query(TPMPKAppointment, TPMPKWorkingDay)
+        .join(TPMPKWorkingDay, TPMPKWorkingDay.id == TPMPKAppointment.working_day_id)
+        .filter(
+            or_(*tpmpk_filters),
+            TPMPKAppointment.status != "cancelled",
+        )
+        .order_by(
+            TPMPKWorkingDay.date.desc(),
+            TPMPKAppointment.start_time.desc(),
+            TPMPKAppointment.created_at.desc(),
+        )
+        .limit(10)
+        .all()
+    ):
+        items.append({
+            "kind": "запись ТПМПК",
+            "date": day.date,
+            "time": appointment.start_time,
+            "status": appointment.status,
+            "comment": None,
+            "created_at": appointment.created_at,
+            "unbound": False,
+        })
+
+    if include_unbound and not items:
+        for row in (
+            db.query(Appointment)
+            .filter(
+                Appointment.user_id.is_(None),
+                Appointment.status != "cancelled",
+            )
+            .order_by(
+                Appointment.appointment_date.desc(),
+                Appointment.appointment_time.desc(),
+                Appointment.created_at.desc(),
+            )
+            .limit(10)
+            .all()
+        ):
+            items.append({
+                "kind": "запись на приём",
+                "date": row.appointment_date,
+                "time": row.appointment_time,
+                "status": row.status,
+                "comment": row.comment,
+                "created_at": row.created_at,
+                "unbound": True,
+            })
+
+        for appointment, day in (
+            db.query(TPMPKAppointment, TPMPKWorkingDay)
+            .join(TPMPKWorkingDay, TPMPKWorkingDay.id == TPMPKAppointment.working_day_id)
+            .filter(
+                TPMPKAppointment.user_id.is_(None),
+                TPMPKAppointment.status != "cancelled",
+            )
+            .order_by(
+                TPMPKWorkingDay.date.desc(),
+                TPMPKAppointment.start_time.desc(),
+                TPMPKAppointment.created_at.desc(),
+            )
+            .limit(10)
+            .all()
+        ):
+            items.append({
+                "kind": "непривязанная запись ТПМПК",
+                "date": day.date,
+                "time": appointment.start_time,
+                "status": appointment.status,
+                "comment": None,
+                "created_at": appointment.created_at,
+                "unbound": True,
+            })
+
+    return sorted(items, key=_appointment_sort_key, reverse=True)
+
+
+def _appointment_answer_result(
+    db: Session,
+    user: User | None,
+    question: str,
+) -> dict | None:
+    if not _looks_like_personal_appointment_question(question):
+        return None
+
+    if user is None:
+        return {
+            "answer": (
+                "Чтобы посмотреть вашу запись, нужно авторизоваться. "
+                "После входа я смогу назвать дату, время и статус записей, "
+                "которые привязаны к вашей учётной записи."
+            ),
+            "rewritten_question": question,
+            "sources": [],
+            "access_scope": "personal",
+            "intent": "appointment_lookup",
+        }
+
+    try:
+        items = _user_appointment_items(
+            db,
+            user,
+            include_unbound=_can_view_unbound_appointments(user),
+        )
+    except Exception:
+        logger.exception("[assistant] Failed to read user appointments")
+        return {
+            "answer": (
+                "Сейчас не удалось получить данные о ваших записях. "
+                "Попробуйте позже или обратитесь в учреждение для уточнения."
+            ),
+            "rewritten_question": question,
+            "sources": [],
+            "access_scope": "personal",
+            "intent": "appointment_lookup",
+        }
+
+    if not items:
+        return {
+            "answer": (
+                "У вашей учётной записи пока нет сохранённых записей. "
+                "Если запись оформлялась до авторизации или без входа в аккаунт, "
+                "она может быть не привязана к профилю. Для уточнения обратитесь в учреждение."
+            ),
+            "rewritten_question": question,
+            "sources": [],
+            "access_scope": "personal",
+            "intent": "appointment_lookup",
+        }
+
+    item = items[0]
+    answer = (
+        f"{_appointment_item_answer_prefix(item)}: {_format_date_ru(item['date'])} "
+        f"в {_format_time_ru(item['time'])}. "
+        f"Тип: {item['kind']}. "
+        f"Статус: {_appointment_status_label(item.get('status'))}."
+    )
+    if item.get("comment"):
+        answer += f" Комментарий: {item['comment']}."
+
+    return {
+        "answer": answer,
+        "rewritten_question": question,
+        "sources": [],
+        "access_scope": "personal",
+        "intent": "appointment_lookup",
+    }
+
+
 def get_assistant_status() -> AssistantStatusResponse:
     cleanup_idle_sessions()
+    settings = get_assistant_settings()
     vectorstore_ready = _vectorstore is not None
     reranker_ready = _is_reranker_ready()
     vector_count = _safe_vector_count()
+    knowledge_base_ready, knowledge_base_status, knowledge_base_message = _knowledge_base_state(vector_count)
+    credentials_message = _missing_gigachat_credentials_message()
     rate_limit_active_buckets, rate_limit_rejections = _rate_limit_stats()
     request_metrics = _request_metrics_snapshot()
     with _status_lock:
@@ -525,19 +939,31 @@ def get_assistant_status() -> AssistantStatusResponse:
 
     ready = bool(
         vectorstore_ready
+        and knowledge_base_ready
         and reranker_ready
         and embeddings_ready
         and warmup_completed_at
         and not last_error
+        and not credentials_message
     )
-    if last_error:
+    if credentials_message:
+        status = "configuration_error"
+        assistant_message = credentials_message
+    elif knowledge_base_status in {"index_missing", "empty", "index_error"}:
+        status = "knowledge_base_not_ready"
+        assistant_message = knowledge_base_message
+    elif last_error:
         status = "error"
+        assistant_message = last_error
     elif ready:
         status = "ready"
+        assistant_message = None
     elif warmup_started_at:
         status = "warming_up"
+        assistant_message = ASSISTANT_STARTING_MESSAGE
     else:
         status = "starting"
+        assistant_message = ASSISTANT_STARTING_MESSAGE
 
     return AssistantStatusResponse(
         status=status,
@@ -545,6 +971,10 @@ def get_assistant_status() -> AssistantStatusResponse:
         vectorstore_ready=vectorstore_ready,
         reranker_ready=reranker_ready,
         embeddings_ready=embeddings_ready,
+        knowledge_base_ready=knowledge_base_ready,
+        knowledge_base_status=knowledge_base_status,
+        knowledge_base_message=knowledge_base_message,
+        assistant_message=assistant_message,
         vector_count=vector_count,
         sessions=_sessions_count(),
         warmup_started_at=warmup_started_at,
@@ -552,16 +982,16 @@ def get_assistant_status() -> AssistantStatusResponse:
         last_error=last_error,
         last_request_error=last_request_error,
         last_request_error_at=last_request_error_at,
-        session_ttl_seconds=ASSISTANT_SESSION_TTL_SECONDS,
+        session_ttl_seconds=settings.session_ttl_seconds,
         max_sessions=ASSISTANT_MAX_SESSIONS,
         evicted_sessions=evicted_sessions,
-        question_max_length=ASSISTANT_QUESTION_MAX_LENGTH,
+        question_max_length=settings.question_max_length,
         session_id_max_length=ASSISTANT_SESSION_ID_MAX_LENGTH,
         history_limit_max=ASSISTANT_HISTORY_LIMIT_MAX,
         gigachat_timeout_seconds=cfg.request_timeout,
         gigachat_max_retries=cfg.max_retries,
-        rate_limit_window_seconds=ASSISTANT_RATE_LIMIT_WINDOW_SECONDS,
-        rate_limit_max_requests=ASSISTANT_RATE_LIMIT_MAX_REQUESTS,
+        rate_limit_window_seconds=settings.rate_limit_window_seconds,
+        rate_limit_max_requests=settings.rate_limit_max_requests,
         rate_limit_active_buckets=rate_limit_active_buckets,
         rate_limit_rejections=rate_limit_rejections,
         **request_metrics,
@@ -597,11 +1027,10 @@ def _session_context(db: Session, user: User | None, session_id: str) -> tuple[s
 
 def _user_history_payload(user: User | None) -> dict:
     if user is None:
-        return {"id": None, "email": None, "username": None}
+        return {"id": None, "email": None}
     return {
         "id": user.id,
         "email": user.email,
-        "username": user.username,
     }
 
 
@@ -613,8 +1042,9 @@ def _validated_question(question: str) -> str:
     clean_question = (question or "").strip()
     if not clean_question:
         _validation_error("Вопрос не должен быть пустым.")
-    if len(clean_question) > ASSISTANT_QUESTION_MAX_LENGTH:
-        _validation_error(f"Вопрос слишком длинный. Максимум: {ASSISTANT_QUESTION_MAX_LENGTH} символов.")
+    question_max_length = get_assistant_settings().question_max_length
+    if len(clean_question) > question_max_length:
+        _validation_error(f"Вопрос слишком длинный. Максимум: {question_max_length} символов.")
     return clean_question
 
 
@@ -658,7 +1088,6 @@ def _sync_history_session(
             user_role=user_role,
             user_id=user.id if user else None,
             user_email=user.email if user else None,
-            username=user.username if user else None,
             created_at=now,
             updated_at=now,
         )
@@ -671,7 +1100,6 @@ def _sync_history_session(
     session.user_role = user_role
     session.user_id = user.id if user else None
     session.user_email = user.email if user else None
-    session.username = user.username if user else None
     session.updated_at = now
     db.flush()
     return session
@@ -681,7 +1109,6 @@ def _db_user_history_payload(session: AssistantChatSession) -> dict:
     return {
         "id": session.user_id,
         "email": session.user_email,
-        "username": session.username,
     }
 
 
@@ -812,7 +1239,6 @@ def _manual_quality_payload(
         "rated_by": {
             "id": current_user.id,
             "email": current_user.email,
-            "username": current_user.username,
             "role": user_role,
         },
     }
@@ -893,11 +1319,12 @@ def _append_history_turn(
             ]
         )
         db.flush()
-        if ASSISTANT_HISTORY_MAX_MESSAGES > 0:
+        history_max_messages = get_assistant_settings().history_max_messages
+        if history_max_messages > 0:
             message_count = db.query(AssistantChatMessage).filter(
                 AssistantChatMessage.assistant_session_id == session.id
             ).count()
-            overflow = message_count - ASSISTANT_HISTORY_MAX_MESSAGES
+            overflow = message_count - history_max_messages
             if overflow > 0:
                 old_ids = [
                     row.id
@@ -977,11 +1404,86 @@ def reload_all_sessions(stats: dict | None = None) -> None:
         )
 
 
+def _settings_payload(settings: AssistantSettings) -> AssistantSettingsResponse:
+    return AssistantSettingsResponse(
+        **settings.__dict__,
+        available_gigachat_models=list(AVAILABLE_GIGACHAT_MODELS),
+    )
+
+
+def _settings_role_name(user: User) -> str:
+    role = getattr(user, "role", None)
+    if isinstance(role, str):
+        return role.lower()
+    return (getattr(role, "role_name", None) or "").lower()
+
+
+def _require_settings_admin(current_user: User = Depends(get_current_user)) -> User:
+    if _settings_role_name(current_user) not in {"admin", "methodist"}:
+        raise HTTPException(status_code=403, detail="Недостаточно прав для изменения настроек ассистента.")
+    return current_user
+
+
+def _drop_active_user_sessions() -> int:
+    with _sessions_lock:
+        session_ids = [
+            session_id
+            for session_id in _sessions
+            if session_id != WARMUP_SESSION_ID
+        ]
+        for session_id in session_ids:
+            _sessions.pop(session_id, None)
+            _session_accessed_at.pop(session_id, None)
+    return len(session_ids)
+
+
+def _apply_assistant_settings(previous: AssistantSettings, current: AssistantSettings) -> None:
+    if previous.gigachat_model != current.gigachat_model:
+        cfg.reset()
+        dropped_sessions = _drop_active_user_sessions()
+        logger.info(
+            "[assistant-settings] GigaChat model changed to %s; dropped %s active sessions",
+            current.gigachat_model,
+            dropped_sessions,
+        )
+
+    if (
+        previous.rate_limit_window_seconds != current.rate_limit_window_seconds
+        or previous.rate_limit_max_requests != current.rate_limit_max_requests
+    ):
+        with _rate_limit_lock:
+            _rate_limit_buckets.clear()
+
+    if previous.session_ttl_seconds != current.session_ttl_seconds:
+        cleanup_idle_sessions(force=True)
+
+
+register_settings_listener(_apply_assistant_settings)
+
+
 # ── Эндпоинты ─────────────────────────────────────────────────────────────────
 
 @router.get("/status", response_model=AssistantStatusResponse)
 def status():
     return get_assistant_status()
+
+
+@router.get("/settings", response_model=AssistantSettingsResponse)
+def get_settings(
+    db: Session = Depends(get_db),
+    _: User = Depends(_require_settings_admin),
+):
+    return _settings_payload(load_assistant_settings(db))
+
+
+@router.put("/settings", response_model=AssistantSettingsResponse)
+def put_settings(
+    body: AssistantSettingsUpdateRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(_require_settings_admin),
+):
+    settings = update_assistant_settings(db, **body.model_dump())
+    return _settings_payload(settings)
 
 
 @router.get("/quality")
@@ -1092,6 +1594,32 @@ def ask_stream(
         history_db = SessionLocal()
         try:
             yield _sse("status", {"stage": "queued", "message": "Запрос принят"})
+            direct_result = _appointment_answer_result(history_db, current_user, question)
+            if direct_result is not None:
+                _append_history_turn(
+                    history_db,
+                    session_key=session_key,
+                    session_id=clean_session_id,
+                    user=current_user,
+                    user_role=role_name,
+                    access_scope=access_scope,
+                    question=question,
+                    result=direct_result,
+                )
+                set_assistant_last_request_error(None)
+                successful = True
+                yield _sse("token", {"content": direct_result["answer"]})
+                yield _sse("done", {**direct_result, "user_role": role_name})
+                return
+
+            not_ready = _assistant_not_ready_reason(get_assistant_status())
+            if not_ready is not None:
+                code, message = not_ready
+                set_assistant_last_request_error(message)
+                yield _sse("status", {"stage": "not_ready", "message": message})
+                yield _sse("error", {"code": code, "detail": message})
+                return
+
             with _get_session_lock(session_key):
                 rag = _get_or_create_rag_locked(session_key)
                 for event in rag.ask_stream(question, access_scope=access_scope):
@@ -1124,11 +1652,13 @@ def ask_stream(
                             "stage": event.get("stage", event_type),
                             "message": event.get("message", ""),
                         })
-        except Exception:
-            set_assistant_last_request_error("Ошибка при потоковой обработке вопроса. Подробности в логах backend.")
+        except Exception as exc:
+            code, message = _stream_error_payload(exc)
+            set_assistant_last_request_error(message)
             logger.exception("[assistant] Failed to stream answer")
             yield _sse("error", {
-                "detail": "Не удалось получить ответ ассистента. Попробуйте позже.",
+                "code": code,
+                "detail": message,
             })
         finally:
             history_db.close()

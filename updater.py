@@ -24,6 +24,7 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import Callable, Optional
 
 from langchain_chroma import Chroma
@@ -44,7 +45,7 @@ from site_crawler import crawl as crawl_site
 from s3_loader import list_documents as list_s3_documents
 from s3_loader import download_file, public_url
 from doc_extractor import extract_text
-from assistant_access import find_s3_folder_conflicts, infer_s3_access_level
+from assistant_access import PUBLIC_ACCESS, find_s3_folder_conflicts, infer_s3_access_level
 
 logger = logging.getLogger("updater")
 
@@ -68,7 +69,7 @@ def _make_chunks(
         chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
-    meta = {"source": source, "title": title, **(extra_meta or {})}
+    meta = {"source": source, "title": title, "access_level": PUBLIC_ACCESS, **(extra_meta or {})}
     return splitter.split_documents([Document(page_content=text, metadata=meta)])
 
 
@@ -427,7 +428,6 @@ def _update_from_site(
     removed_urls:  list[str]   = []
     indexed_page_urls = _get_indexed_metadata_values(vectorstore, "source")
 
-    # Определяем что изменилось
     for url, page in crawled.items():
         text_hash = UpdateState.compute_hash(page["text"])
         old_hash  = state.get_page_hash(url)
@@ -481,6 +481,7 @@ def _update_from_site(
                 metadata={
                     "source": SITE_CONTEXT_SOURCE,
                     "title": "Краткий контекст сайта",
+                    "access_level": PUBLIC_ACCESS,
                     "is_site_context": True,
                 },
             )
@@ -515,6 +516,7 @@ def _update_from_site(
             metadata={
                 "source":    nav_source,
                 "title":     page["title"],
+                "access_level": PUBLIC_ACCESS,
                 "page_url":  url,
                 "breadcrumb": breadcrumb,
             },
@@ -572,7 +574,7 @@ def _update_from_s3(
     }
 
     if progress_cb: progress_cb("s3_list", 0, 0, "Запрашиваю список S3…")
-    s3_current = list_s3_documents(raise_on_error=True)   # key → etag (без скачивания)
+    s3_current = list_s3_documents(raise_on_error=True)
     total = len(s3_current)
     if progress_cb: progress_cb("s3_list", total, total, f"Всего файлов в бакете: {total}")
     indexed_s3_keys = _get_indexed_metadata_values(vectorstore, "s3_key")
@@ -676,7 +678,7 @@ def _update_from_s3(
         doc_url  = public_url(key)
         doc_type = Path(key).suffix.lower().lstrip(".")
         access_level = infer_s3_access_level(key)
-        chunks   = _make_chunks(
+        chunks = _make_chunks(
             source=doc_url,
             title=filename,
             text=text,
@@ -708,10 +710,16 @@ def _update_from_s3(
                 "Краткий контекст сайта (приоритетнее текста документа):",
                 site_context,
             ])
-        header_lines.extend([
-            "",
-            f"Содержание (начало): {text.strip()[:1400]}",
-        ])
+        if access_level == PUBLIC_ACCESS:
+            header_lines.extend([
+                "",
+                f"Содержание (начало): {text.strip()[:1400]}",
+            ])
+        else:
+            header_lines.extend([
+                "",
+                "Содержание документа скрыто для публичного контура.",
+            ])
         header_doc = Document(
             page_content="\n".join(header_lines),
             metadata={
@@ -837,8 +845,6 @@ def incremental_update(
             logger.info(f"[update] Удалено чанков: {len(unique_ids)}")
 
         if all_new_chunks:
-            # Батчим: Chroma падает на больших вставках (лимит ~5000 на батч,
-            # плюс embeddings считаются синхронно — лучше мелкими порциями)
             BATCH = 500
             total_chunks = len(all_new_chunks)
             total_added  = 0
@@ -909,12 +915,20 @@ class RAGScheduler:
         self._last_run:   Optional[datetime]     = None
         self._last_stats: Optional[dict]         = None
 
+    async def _sleep_interval(self) -> None:
+        started_at = monotonic()
+        while True:
+            remaining = self._interval - (monotonic() - started_at)
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 1.0))
+
     async def _loop(self) -> None:
         if not self._run_on_start:
             logger.info(
                 f"[scheduler] Первое обновление через {self._interval / 3600:.0f} ч."
             )
-            await asyncio.sleep(self._interval)
+            await self._sleep_interval()
 
         while True:
             try:
@@ -938,7 +952,7 @@ class RAGScheduler:
             except Exception as e:
                 logger.error(f"[scheduler] Ошибка: {e}", exc_info=True)
 
-            await asyncio.sleep(self._interval)
+            await self._sleep_interval()
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -951,6 +965,10 @@ class RAGScheduler:
         if self._task:
             self._task.cancel()
             logger.info("[scheduler] Задача отменена")
+
+    def set_interval_hours(self, interval_hours: float) -> None:
+        self._interval = max(0.01, interval_hours) * 3600
+        logger.info("[scheduler] Новый интервал: %.2f ч.", self._interval / 3600)
 
     def status(self) -> dict:
         next_run = None

@@ -17,10 +17,42 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _table_exists(bind, table_name: str) -> bool:
+    return sa.inspect(bind).has_table(table_name)
+
+
+def _ensure_auth_tables(bind) -> None:
+    if not _table_exists(bind, "user_role"):
+        op.create_table(
+            "user_role",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("role_name", sa.String(length=50), nullable=False),
+            sa.PrimaryKeyConstraint("id"),
+            sa.UniqueConstraint("role_name"),
+        )
+        op.create_index(op.f("ix_user_role_id"), "user_role", ["id"], unique=False)
+
+    if not _table_exists(bind, "users"):
+        op.create_table(
+            "users",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("email", sa.String(), nullable=False),
+            sa.Column("password_hash", sa.String(), nullable=False),
+            sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
+            sa.Column("role_id", sa.Integer(), nullable=True),
+            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=True),
+            sa.ForeignKeyConstraint(["role_id"], ["user_role.id"]),
+            sa.PrimaryKeyConstraint("id"),
+            sa.UniqueConstraint("email"),
+        )
+        op.create_index(op.f("ix_users_email"), "users", ["email"], unique=True)
+        op.create_index(op.f("ix_users_id"), "users", ["id"], unique=False)
+
+
 def upgrade() -> None:
     bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if "article" not in inspector.get_table_names():
+    _ensure_auth_tables(bind)
+    if not _table_exists(bind, "article"):
         op.create_table(
             "article",
             sa.Column("id", sa.Integer(), nullable=False),
@@ -67,4 +99,5 @@ def downgrade() -> None:
         op.drop_index(op.f("ix_article_slug"), table_name="article")
         op.drop_index(op.f("ix_article_id"), table_name="article")
         op.drop_table("article")
-    op.execute("DELETE FROM user_role WHERE role_name = 'domu_editor'")
+    if "user_role" in inspector.get_table_names():
+        op.execute("DELETE FROM user_role WHERE role_name = 'domu_editor'")

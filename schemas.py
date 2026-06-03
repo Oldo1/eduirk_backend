@@ -1,32 +1,111 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 
 
 # ====================== Аутентификация ======================
 class UserCreate(BaseModel):
     email: EmailStr
-    username: str = Field(..., min_length=2, max_length=100)
-    password: str = Field(..., min_length=1)
+    last_name: Optional[str] = Field(None, max_length=100)
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    password: str
+
+
+class UserAdminCreate(BaseModel):
+    email: EmailStr
+    last_name: Optional[str] = Field(None, max_length=100)
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    password: str = Field(..., min_length=6)
+    role: Optional[str] = Field("user", max_length=50)
+    is_active: bool = True
+    allowed_methodika_subjects: List[str] = Field(default_factory=list)
+
+    @field_validator("role")
+    @classmethod
+    def _normalize_role(cls, value: str | None) -> str:
+        return str(value or "user").strip().lower() or "user"
+
+
+class UserAdminUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    last_name: Optional[str] = Field(None, max_length=100)
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    password: Optional[str] = Field(None, min_length=6)
+    role: Optional[str] = Field(None, max_length=50)
+    is_active: Optional[bool] = None
+    allowed_methodika_subjects: Optional[List[str]] = None
+
+    @field_validator("role")
+    @classmethod
+    def _normalize_role(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return str(value or "").strip().lower() or None
+
+
+class RoleResponse(BaseModel):
+    id: int
+    role_name: str
+    permissions: Dict[str, str] = Field(default_factory=dict)
+
+    model_config = {"from_attributes": True}
+
+
+class RolePermissionsUpdate(BaseModel):
+    permissions: Dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("permissions")
+    @classmethod
+    def _validate_permissions(cls, value: Dict[str, str]) -> Dict[str, str]:
+        allowed_modules = {
+            "articles",
+            "certificates",
+            "certificate_templates",
+            "users_roles",
+            "tpmpk",
+            "audit_log",
+            "portal_settings",
+        }
+        allowed_levels = {"none", "view", "edit"}
+        invalid_modules = set(value) - allowed_modules
+        if invalid_modules:
+            raise ValueError(f"unknown permission modules: {', '.join(sorted(invalid_modules))}")
+
+        normalized: Dict[str, str] = {}
+        for module_key, level in value.items():
+            normalized_level = str(level or "none").strip().lower()
+            if normalized_level not in allowed_levels:
+                raise ValueError("permission level must be none, view, or edit")
+            normalized[module_key] = normalized_level
+        return normalized
 
 
 class UserResponse(BaseModel):
     id: int
     email: str
-    username: Optional[str] = None
+    last_name: Optional[str] = None
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    created_at: Optional[datetime] = None
     is_active: bool
-    role: Optional[str] = None
+    role: str = "user"
     can_access_internal_docs: bool = False
+    permissions: Dict[str, str] = Field(default_factory=dict)
     allowed_methodika_subjects: List[str] = Field(default_factory=list)
 
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, value):
         if value is None:
-            return None
+            return "user"
         if isinstance(value, str):
             return value
-        return getattr(value, "role_name", None)
+        return getattr(value, "role_name", "user")
 
     @field_validator("allowed_methodika_subjects", mode="before")
     @classmethod
@@ -46,7 +125,7 @@ class Token(BaseModel):
     refresh_token: Optional[str] = None
     token_type: str = "bearer"
     role: Optional[str] = None
-    user: Optional["UserResponse"] = None
+    user: Optional[UserResponse] = None
 
 
 class RefreshTokenRequest(BaseModel):
@@ -57,7 +136,29 @@ class TokenData(BaseModel):
     email: str | None = None
 
 
-# ====================== ШАБЛОНЫ ======================
+class AppointmentCreate(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=200)
+    appointment_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    appointment_time: str = Field(..., pattern=r"^\d{2}:\d{2}$")
+    comment: Optional[str] = Field(None, max_length=500)
+
+
+class AppointmentResponse(BaseModel):
+    id: int
+    user_id: Optional[int] = None
+    user_email: Optional[str] = None
+    full_name: str
+    appointment_date: str
+    appointment_time: str
+    comment: Optional[str]
+    status: str = "new"
+    source: str = "site"
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
 PUBLISHING_SCOPES = {"imcro_only", "dom_uchitelya_only", "both"}
 ARTICLE_STATUSES = {"draft", "published", "archive"}
 
@@ -78,6 +179,7 @@ class ArticleBase(BaseModel):
     attachments: List[Dict] = Field(default_factory=list)
     categories: List = Field(default_factory=list)
     tags: List = Field(default_factory=list)
+    sections: List[Dict] = Field(default_factory=list)
     publishing_scope: str = "both"
     methodika_subject: Optional[str] = Field(None, max_length=120)
     dom_uchitelya_section: Optional[str] = Field(None, max_length=120)
@@ -141,6 +243,7 @@ class ArticleUpdate(BaseModel):
     attachments: Optional[List[Dict]] = None
     categories: Optional[List] = None
     tags: Optional[List] = None
+    sections: Optional[List[Dict]] = None
     publishing_scope: Optional[str] = None
     methodika_subject: Optional[str] = Field(None, max_length=120)
     dom_uchitelya_section: Optional[str] = Field(None, max_length=120)
@@ -178,6 +281,11 @@ class ArticleResponse(ArticleBase):
     id: int
     author_id: Optional[int]
     author_name: Optional[str] = None
+    author_full_name: Optional[str] = None
+    author_last_name: Optional[str] = None
+    author_first_name: Optional[str] = None
+    author_middle_name: Optional[str] = None
+    author_key: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -189,6 +297,7 @@ class ArticleListResponse(BaseModel):
     items: List[ArticleResponse]
 
 
+# ====================== ШАБЛОНЫ ======================
 class CertificateTemplateCreate(BaseModel):
     name: str = Field(..., max_length=200)
     background_url: Optional[str] = None
@@ -233,49 +342,78 @@ class CertificateTemplateResponse(BaseModel):
 
 # ====================== ЭЛЕМЕНТЫ ТЕКСТА ======================
 class TemplateTextElementCreate(BaseModel):
-    text: str
+    client_id: Optional[str] = Field(None, alias="id", max_length=80)
+    element_type: str = Field("text", alias="type", max_length=32)
+    text: str = ""
+    value: Optional[str] = None
     is_variable: bool = False
     x_mm: float
     y_mm: float
+    width_mm: Optional[float] = Field(None, alias="width", ge=0, le=400)
+    height_mm: Optional[float] = Field(None, alias="height", ge=0, le=400)
     font_size: int = 24
     align: str = "center"
     color: str = Field("#0F172A", max_length=16)
     font_weight: str = Field("400", max_length=8)
     font_family: str = Field("DejaVu", max_length=120)
+    italic: bool = False
+    underline: bool = False
+    line_height: Optional[float] = Field(None, ge=0.5, le=4)
+    z_index: Optional[int] = None
+    hidden: bool = False
+    locked: bool = False
+    opacity: Optional[float] = Field(None, ge=0, le=1)
+    source_url: Optional[str] = Field(None, max_length=500)
+    variable_name: Optional[str] = Field(None, alias="variableName", max_length=120)
+    grammar_settings: Optional[Dict[str, Any]] = None
+    signer_group_id: Optional[str] = Field(None, alias="signerGroupId", max_length=80)
+    anchor: Optional[str] = Field(None, max_length=20)
     max_width_mm: Optional[float] = Field(None, ge=5, le=210)
     max_height_mm: Optional[float] = Field(None, ge=5, le=280)
 
+    @field_validator("client_id", mode="before")
+    @classmethod
+    def _coerce_client_id(cls, value):
+        if value is None or value == "":
+            return None
+        return str(value)
+
+    model_config = {"populate_by_name": True}
+
 
 class TemplateTextElementResponse(BaseModel):
-    id: int
+    id: str | int = Field(validation_alias="public_id")
+    db_id: Optional[int] = Field(None, validation_alias="id")
+    client_id: Optional[str] = None
+    element_type: str = Field("text", alias="type")
     text: str
+    value: Optional[str] = None
     is_variable: bool
     x_mm: float
     y_mm: float
+    width_mm: Optional[float] = Field(None, alias="width")
+    height_mm: Optional[float] = Field(None, alias="height")
     font_size: int
     align: str
     color: str
     font_weight: str
     font_family: str
+    italic: bool = False
+    underline: bool = False
+    line_height: Optional[float] = None
+    z_index: Optional[int] = None
+    hidden: bool = False
+    locked: bool = False
+    opacity: Optional[float] = None
+    source_url: Optional[str] = None
+    variable_name: Optional[str] = Field(None, alias="variableName")
+    grammar_settings: Optional[Dict[str, Any]] = None
+    signer_group_id: Optional[str] = Field(None, alias="signerGroupId")
+    anchor: Optional[str] = None
     max_width_mm: Optional[float]
     max_height_mm: Optional[float]
 
-    model_config = {"from_attributes": True}
-
-
-class TemplateVariablesResponse(BaseModel):
-    template_id: int
-    variables: List[str]
-
-
-class ExcelInspectResponse(BaseModel):
-    headers: List[str]
-    row_count: int
-    fio_column: Optional[str]
-    preview_rows: List[Dict[str, str]]
-    template_variables: List[str]
-    matched_columns: List[str]
-    missing_columns: List[str]
+    model_config = {"from_attributes": True, "populate_by_name": True}
 
 
 # ====================== ГЕНЕРАЦИЯ ======================
@@ -320,48 +458,63 @@ class GeneratedCertificateResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# ====================== ПОДПИСАНТЫ ======================
-class TemplateSignerCreate(BaseModel):
-    order: int = 1
-    position: str
-    full_name: str
-    facsimile_url: Optional[str] = None
-    offset_y_mm: float = Field(0.0, ge=-120, le=160, description="Доп. сдвиг строки вниз, мм")
-    facsimile_offset_x_mm: float = Field(0.0, ge=-80, le=80, description="Сдвиг факсимиле вправо, мм")
-    facsimile_offset_y_mm: float = Field(0.0, ge=-80, le=80, description="Сдвиг факсимиле вниз по листу, мм")
-    facsimile_scale: float = Field(1.0, ge=0.2, le=3.0, description="Множитель размера вписанного изображения")
-
-
-class TemplateSignerResponse(BaseModel):
-    id: int
+class TemplateVariablesResponse(BaseModel):
     template_id: int
-    order: int
-    position: str
-    full_name: str
-    facsimile_url: Optional[str]
-    offset_y_mm: float
-    facsimile_offset_x_mm: float
-    facsimile_offset_y_mm: float
-    facsimile_scale: float
-    created_at: datetime
+    variables: List[str]
 
-    model_config = {"from_attributes": True}
+
+class ExcelInspectResponse(BaseModel):
+    headers: List[str]
+    row_count: int
+    fio_column: Optional[str]
+    preview_rows: List[Dict[str, str]]
+    template_variables: List[str]
+    matched_columns: List[str]
+    missing_columns: List[str]
+    warnings: List[str] = Field(default_factory=list)
+    processed_preview: List[Dict[str, str]] = Field(default_factory=list)
 
 
 # ====================== АТОМАРНОЕ ОБНОВЛЕНИЕ ШАБЛОНА ======================
 class TemplateTextElementInput(BaseModel):
     """Элемент текста для атомарного обновления шаблона."""
-    text: str
+    client_id: Optional[str] = Field(None, alias="id", max_length=80)
+    element_type: str = Field("text", alias="type", max_length=32)
+    text: str = ""
+    value: Optional[str] = None
     is_variable: bool = False
     x_mm: float
     y_mm: float
+    width_mm: Optional[float] = Field(None, alias="width", ge=0, le=400)
+    height_mm: Optional[float] = Field(None, alias="height", ge=0, le=400)
     font_size: int = 24
     align: str = "center"
     color: str = "#0F172A"
     font_weight: str = "400"
     font_family: str = Field("DejaVu", max_length=120)
+    italic: bool = False
+    underline: bool = False
+    line_height: Optional[float] = Field(None, ge=0.5, le=4)
+    z_index: Optional[int] = None
+    hidden: bool = False
+    locked: bool = False
+    opacity: Optional[float] = Field(None, ge=0, le=1)
+    source_url: Optional[str] = Field(None, max_length=500)
+    variable_name: Optional[str] = Field(None, alias="variableName", max_length=120)
+    grammar_settings: Optional[Dict[str, Any]] = None
+    signer_group_id: Optional[str] = Field(None, alias="signerGroupId", max_length=80)
+    anchor: Optional[str] = Field(None, max_length=20)
     max_width_mm: Optional[float] = Field(None, ge=0, le=300)
     max_height_mm: Optional[float] = Field(None, ge=0, le=400)
+
+    @field_validator("client_id", mode="before")
+    @classmethod
+    def _coerce_client_id(cls, value):
+        if value is None or value == "":
+            return None
+        return str(value)
+
+    model_config = {"populate_by_name": True}
 
 
 class TemplateSignerInput(BaseModel):
@@ -446,20 +599,29 @@ class ManualCertificateRequest(BaseModel):
         return self
 
 
-# ====================== ЗАПИСЬ НА ПРИЁМ ======================
-class AppointmentCreate(BaseModel):
-    full_name: str = Field(..., min_length=2, max_length=200, description="ФИО пациента")
-    appointment_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="Дата приёма YYYY-MM-DD")
-    appointment_time: str = Field(..., pattern=r"^\d{2}:\d{2}$", description="Время приёма HH:MM")
-    comment: Optional[str] = Field(None, max_length=500)
-
-
-class AppointmentResponse(BaseModel):
-    id: int
+# ====================== ПОДПИСАНТЫ ======================
+class TemplateSignerCreate(BaseModel):
+    order: int = 1
+    position: str
     full_name: str
-    appointment_date: str
-    appointment_time: str
-    comment: Optional[str]
+    facsimile_url: Optional[str] = None
+    offset_y_mm: float = Field(0.0, ge=-120, le=160, description="Доп. сдвиг строки вниз, мм")
+    facsimile_offset_x_mm: float = Field(0.0, ge=-80, le=80, description="Сдвиг факсимиле вправо, мм")
+    facsimile_offset_y_mm: float = Field(0.0, ge=-80, le=80, description="Сдвиг факсимиле вниз по листу, мм")
+    facsimile_scale: float = Field(1.0, ge=0.2, le=3.0, description="Множитель размера вписанного изображения")
+
+
+class TemplateSignerResponse(BaseModel):
+    id: int
+    template_id: int
+    order: int
+    position: str
+    full_name: str
+    facsimile_url: Optional[str]
+    offset_y_mm: float
+    facsimile_offset_x_mm: float
+    facsimile_offset_y_mm: float
+    facsimile_scale: float
     created_at: datetime
 
     model_config = {"from_attributes": True}
