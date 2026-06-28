@@ -61,7 +61,6 @@ def _ensure_article_lookup_tables(inspector: sa.Inspector) -> None:
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint("name"),
         )
-        op.create_index(op.f("ix_article_status_id"), "article_status", ["id"], unique=False)
         tables.add("article_status")
 
     if "category" not in tables:
@@ -72,7 +71,6 @@ def _ensure_article_lookup_tables(inspector: sa.Inspector) -> None:
             sa.Column("slug", sa.String(length=200), nullable=False),
             sa.PrimaryKeyConstraint("id"),
         )
-        op.create_index(op.f("ix_category_id"), "category", ["id"], unique=False)
         tables.add("category")
 
     if "tag" not in tables:
@@ -83,7 +81,6 @@ def _ensure_article_lookup_tables(inspector: sa.Inspector) -> None:
             sa.Column("slug", sa.String(length=200), nullable=False),
             sa.PrimaryKeyConstraint("id"),
         )
-        op.create_index(op.f("ix_tag_id"), "tag", ["id"], unique=False)
 
 
 def _create_article_table() -> None:
