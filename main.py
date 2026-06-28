@@ -59,9 +59,10 @@ logger = logging.getLogger("main")
 
 
 def _cors_origins_from_env() -> list[str]:
-    raw_origins = os.getenv(
-        "CORS_ALLOWED_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000",
+    raw_origins = (
+        os.getenv("CORS_ALLOWED_ORIGINS")
+        or os.getenv("CORS_ORIGINS")
+        or "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000"
     )
     return [origin.strip().rstrip("/") for origin in raw_origins.split(",") if origin.strip()]
 
@@ -145,6 +146,11 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/docs", include_in_schema=False)
 def local_docs():
     return HTMLResponse(local_openapi_docs_html())
+
+
+@app.get("/health", include_in_schema=False)
+def health_check():
+    return {"status": "ok"}
 
 ensure_postgresql_extensions(engine)
 Base.metadata.create_all(bind=engine)

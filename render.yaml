@@ -1,0 +1,57 @@
+services:
+  - type: web
+    name: imcro-backend
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PD_ENCRYPTION_KEY
+        generateValue: true
+      - key: ENABLE_DEV_TEST_USERS
+        value: "false"
+      - key: RATE_LIMIT_ENABLED
+        value: "true"
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: DB_MAX_OVERFLOW
+        value: "5"
+      - key: DB_POOL_TIMEOUT_SECONDS
+        value: "30"
+      - key: DB_POOL_RECYCLE_SECONDS
+        value: "1800"
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: SITE_START_URL
+        value: https://mc.eduirk.ru/
+      - key: SITE_MAX_PAGES
+        value: "2000"
+      - key: SITE_CRAWL_DELAY
+        value: "0.5"
+      - key: SITE_CACHE_FILE
+        value: /app/chroma_gigachat/site_pages_cache.json
+      - key: CHROMA_COLLECTION_NAME
+        value: eduirk
+      - key: UPDATE_INTERVAL_HOURS
+        value: "24"
+      - key: GIGACHAT_CREDENTIALS
+        sync: false
+      - key: GIGACHAT_SCOPE
+        value: GIGACHAT_API_PERS
+      - key: GIGACHAT_MODEL
+        value: GigaChat
+      - key: YC_KEY_ID
+        sync: false
+      - key: YC_SECRET_KEY
+        sync: false
+      - key: YC_BUCKET
+        value: eduirk
+      - key: YC_PREFIX
+        value: ""
