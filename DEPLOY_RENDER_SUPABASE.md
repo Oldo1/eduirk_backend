@@ -60,6 +60,8 @@ https://<render-service>.onrender.com/health
 
 Docker-образ перед запуском `uvicorn` выполняет `python -m alembic upgrade head`, поэтому свежая Supabase-база получит миграции автоматически.
 
+Если в логах Render есть ошибка `connection to server at "localhost", port 5432 failed`, значит в сервисе не задан `DATABASE_URL` или Render не прочитал `render.yaml`. Открой **Service -> Environment** и добавь `DATABASE_URL` вручную со строкой Supabase и `?sslmode=require`.
+
 ## 4. Создать админа на production
 
 В Render открой shell backend-сервиса и выполни:
