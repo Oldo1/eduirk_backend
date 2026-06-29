@@ -415,11 +415,12 @@ def _token_response(db: Session, user: User) -> Token:
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == user_data.email).first():
         raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
-    if db.query(User).filter(User.username == user_data.username).first():
+    username = user_data.username.strip() if user_data.username else None
+    if username and db.query(User).filter(User.username == username).first():
         raise HTTPException(status_code=400, detail="Логин уже занят")
     user = User(
         email=user_data.email,
-        username=user_data.username,
+        username=username,
         password_hash=hash_password(user_data.password),
     )
     db.add(user)
