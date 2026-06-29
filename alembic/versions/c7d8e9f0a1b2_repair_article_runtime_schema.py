@@ -25,6 +25,13 @@ def _has_index(inspector: sa.Inspector, table_name: str, index_name: str) -> boo
     return index_name in {index["name"] for index in inspector.get_indexes(table_name)}
 
 
+def _has_index_in_schema(inspector: sa.Inspector, index_name: str) -> bool:
+    for table_name in inspector.get_table_names():
+        if _has_index(inspector, table_name, index_name):
+            return True
+    return False
+
+
 def _has_fk(
     inspector: sa.Inspector,
     table_name: str,
@@ -46,7 +53,7 @@ def _create_index_if_missing(
     columns: list[str],
     unique: bool = False,
 ) -> None:
-    if not _has_index(inspector, table_name, index_name):
+    if not _has_index(inspector, table_name, index_name) and not _has_index_in_schema(inspector, index_name):
         op.create_index(index_name, table_name, columns, unique=unique)
 
 
@@ -197,7 +204,7 @@ def _ensure_article_indexes(bind) -> None:
         op.f("ix_article_id"): ["id"],
         op.f("ix_article_slug"): ["slug"],
         op.f("ix_article_status"): ["status"],
-        op.f("ix_article_status_id"): ["status_id"],
+        op.f("ix_article_status_ref_id"): ["status_id"],
         op.f("ix_article_publishing_scope"): ["publishing_scope"],
         op.f("ix_article_is_pinned"): ["is_pinned"],
         op.f("ix_article_duplicate_to_main"): ["duplicate_to_main"],
@@ -348,7 +355,7 @@ def downgrade() -> None:
             op.f("ix_article_duplicate_to_events"),
             op.f("ix_article_duplicate_to_main"),
             op.f("ix_article_is_pinned"),
-            op.f("ix_article_status_id"),
+            op.f("ix_article_status_ref_id"),
         ):
             if _has_index(inspector, "article", index_name):
                 op.drop_index(index_name, table_name="article")
