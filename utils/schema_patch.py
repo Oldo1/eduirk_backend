@@ -34,6 +34,31 @@ def _sqlite_columns(conn, table: str) -> set[str]:
     return {r[1] for r in rows}
 
 
+def remove_username_columns(engine: Engine) -> None:
+    username_tables = ("users", "assistant_chat_session")
+
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS ix_users_username"))
+            for table_name in username_tables:
+                table_exists = conn.execute(
+                    text("SELECT to_regclass(:table_name)"),
+                    {"table_name": f"public.{table_name}"},
+                ).scalar()
+                if table_exists and _pg_column_exists(conn, table_name, "username"):
+                    conn.execute(text(f'ALTER TABLE "{table_name}" DROP COLUMN "username"'))
+    elif engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS ix_users_username"))
+            for table_name in username_tables:
+                tables = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name=:name"),
+                    {"name": table_name},
+                ).fetchall()
+                if tables and "username" in _sqlite_columns(conn, table_name):
+                    conn.execute(text(f'ALTER TABLE "{table_name}" DROP COLUMN "username"'))
+
+
 INTERNAL_DOCS_DEFAULT_ROLE_NAMES = {
     "admin",
     "administrator",

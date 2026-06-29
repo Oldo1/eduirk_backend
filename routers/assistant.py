@@ -597,11 +597,10 @@ def _session_context(db: Session, user: User | None, session_id: str) -> tuple[s
 
 def _user_history_payload(user: User | None) -> dict:
     if user is None:
-        return {"id": None, "email": None, "username": None}
+        return {"id": None, "email": None}
     return {
         "id": user.id,
         "email": user.email,
-        "username": user.username,
     }
 
 
@@ -658,7 +657,6 @@ def _sync_history_session(
             user_role=user_role,
             user_id=user.id if user else None,
             user_email=user.email if user else None,
-            username=user.username if user else None,
             created_at=now,
             updated_at=now,
         )
@@ -671,7 +669,6 @@ def _sync_history_session(
     session.user_role = user_role
     session.user_id = user.id if user else None
     session.user_email = user.email if user else None
-    session.username = user.username if user else None
     session.updated_at = now
     db.flush()
     return session
@@ -681,7 +678,6 @@ def _db_user_history_payload(session: AssistantChatSession) -> dict:
     return {
         "id": session.user_id,
         "email": session.user_email,
-        "username": session.username,
     }
 
 
@@ -812,7 +808,6 @@ def _manual_quality_payload(
         "rated_by": {
             "id": current_user.id,
             "email": current_user.email,
-            "username": current_user.username,
             "role": user_role,
         },
     }

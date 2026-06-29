@@ -27,7 +27,6 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
-    username = Column(String(100), unique=True, index=True, nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
     allowed_methodika_subjects = Column(JSON, nullable=False, default=list)
@@ -53,7 +52,6 @@ class AssistantChatSession(Base):
     user_role = Column(String(100), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     user_email = Column(String, nullable=True)
-    username = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
@@ -233,7 +231,7 @@ class Article(Base):
     def author_name(self):
         if self.author is None:
             return None
-        return getattr(self.author, "username", None) or getattr(self.author, "email", None)
+        return getattr(self.author, "email", None)
 
 
 class ArticleCategory(Base):

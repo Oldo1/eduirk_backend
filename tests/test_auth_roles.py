@@ -9,7 +9,13 @@ from auth import (
     create_refresh_token,
 )
 from models import User, UserRole
-from schemas import UserResponse
+from schemas import UserCreate, UserResponse
+
+
+def test_public_user_schemas_do_not_expose_username():
+    assert "username" not in UserCreate.model_json_schema()["properties"]
+    assert "username" not in UserResponse.model_json_schema()["properties"]
+    assert "username" not in User.__table__.columns
 
 
 def test_user_response_exposes_role_name_from_relationship():
@@ -17,7 +23,6 @@ def test_user_response_exposes_role_name_from_relationship():
     user = User(
         id=42,
         email="domu@example.test",
-        username="domu",
         is_active=True,
     )
     user.role = role

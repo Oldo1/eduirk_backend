@@ -40,7 +40,6 @@ def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
     new_user = User(
         email=user_data.email,
         password_hash=user_data.password,   # В реальном проекте здесь должен быть hash_password()
-        username=user_data.email.split('@')[0],  # временно
         is_active=True
     )
     db.add(new_user)
@@ -63,7 +62,6 @@ def update_user(
 
     user.email = user_data.email
     user.password_hash = user_data.password  # В будущем — хэширование
-    user.username = user_data.email.split('@')[0]
 
     db.commit()
     db.refresh(user)

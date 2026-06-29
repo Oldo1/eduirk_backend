@@ -45,6 +45,7 @@ from utils.schema_patch import (
     ensure_tpmpk_bot_question_columns,
     ensure_tpmpk_slot_minutes_range,
     ensure_user_role_permission_columns,
+    remove_username_columns,
 )
 from utils.local_docs import local_openapi_docs_html
 
@@ -154,6 +155,7 @@ def health_check():
 
 ensure_postgresql_extensions(engine)
 Base.metadata.create_all(bind=engine)
+remove_username_columns(engine)
 ensure_certificate_layout_columns(engine)
 ensure_article_editor_columns(engine)
 ensure_tpmpk_bot_question_columns(engine)
@@ -386,7 +388,6 @@ def _user_response(db: Session, user: User) -> UserResponse:
     return UserResponse(
         id=user.id,
         email=user.email,
-        username=user.username,
         is_active=user.is_active,
         role=role.role_name if role else None,
         can_access_internal_docs=bool(
@@ -415,12 +416,8 @@ def _token_response(db: Session, user: User) -> Token:
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == user_data.email).first():
         raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
-    username = user_data.username.strip() if user_data.username else None
-    if username and db.query(User).filter(User.username == username).first():
-        raise HTTPException(status_code=400, detail="Логин уже занят")
     user = User(
         email=user_data.email,
-        username=username,
         password_hash=hash_password(user_data.password),
     )
     db.add(user)
@@ -435,11 +432,7 @@ def login(
     db: Session = Depends(get_db),
 ):
     identifier = form_data.username
-    user = (
-        db.query(User)
-        .filter((User.email == identifier) | (User.username == identifier))
-        .first()
-    )
+    user = db.query(User).filter(User.email == identifier).first()
     if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
             status_code=401,

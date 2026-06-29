@@ -6,14 +6,12 @@ from typing import Optional, List, Dict
 # ====================== Аутентификация ======================
 class UserCreate(BaseModel):
     email: EmailStr
-    username: Optional[str] = Field(None, min_length=2, max_length=100)
     password: str = Field(..., min_length=1)
 
 
 class UserResponse(BaseModel):
     id: int
     email: str
-    username: Optional[str] = None
     is_active: bool
     role: Optional[str] = None
     can_access_internal_docs: bool = False
