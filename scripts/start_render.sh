@@ -11,4 +11,6 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 
 python -m alembic upgrade head
+export RUN_STARTUP_SCHEMA_PATCHES="${RUN_STARTUP_SCHEMA_PATCHES:-0}"
+export ENABLE_RAG_WARMUP="${ENABLE_RAG_WARMUP:-0}"
 exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"

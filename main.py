@@ -59,6 +59,11 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+def _env_flag(name: str, default: str = "1") -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value not in {"", "0", "false", "no", "off"}
+
+
 def _cors_origins_from_env() -> list[str]:
     raw_origins = (
         os.getenv("CORS_ALLOWED_ORIGINS")
@@ -75,8 +80,11 @@ _rag_startup_task: asyncio.Task | None = None
 def _prepare_rag_startup() -> tuple[type, Any]:
     from updater import RAGScheduler
 
-    init_rag()
-    warmup_embeddings()
+    if _env_flag("ENABLE_RAG_WARMUP", "1"):
+        init_rag()
+        warmup_embeddings()
+    else:
+        logger.info("[main] Assistant RAG warmup skipped by ENABLE_RAG_WARMUP=0")
     return RAGScheduler, get_vectorstore()
 
 
@@ -113,7 +121,10 @@ async def lifespan(app: FastAPI):
     global _scheduler, _rag_startup_task
 
     # Start assistant warmup without blocking the API.
-    _rag_startup_task = asyncio.create_task(_init_rag_and_scheduler_bg())
+    if _env_flag("ENABLE_ASSISTANT_STARTUP", "1"):
+        _rag_startup_task = asyncio.create_task(_init_rag_and_scheduler_bg())
+    else:
+        logger.info("[main] Assistant startup skipped by ENABLE_ASSISTANT_STARTUP=0")
 
     yield
 
@@ -153,14 +164,23 @@ def local_docs():
 def health_check():
     return {"status": "ok"}
 
-ensure_postgresql_extensions(engine)
-Base.metadata.create_all(bind=engine)
-remove_username_columns(engine)
-ensure_certificate_layout_columns(engine)
-ensure_article_editor_columns(engine)
-ensure_tpmpk_bot_question_columns(engine)
-ensure_tpmpk_slot_minutes_range(engine)
-ensure_user_role_permission_columns(engine)
+
+def run_startup_schema_patches() -> None:
+    if not _env_flag("RUN_STARTUP_SCHEMA_PATCHES", "1"):
+        logger.info("[main] Startup schema patch checks skipped by RUN_STARTUP_SCHEMA_PATCHES=0")
+        return
+
+    ensure_postgresql_extensions(engine)
+    Base.metadata.create_all(bind=engine)
+    remove_username_columns(engine)
+    ensure_certificate_layout_columns(engine)
+    ensure_article_editor_columns(engine)
+    ensure_tpmpk_bot_question_columns(engine)
+    ensure_tpmpk_slot_minutes_range(engine)
+    ensure_user_role_permission_columns(engine)
+
+
+run_startup_schema_patches()
 
 app.include_router(assistant_router)
 app.include_router(certificates_router)
