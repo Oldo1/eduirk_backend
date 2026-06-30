@@ -11,6 +11,13 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 
 python -m alembic upgrade head
+if [ "${AUTO_CREATE_ADMIN:-1}" != "0" ]; then
+  if [ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
+    CREATE_ADMIN_SCHEMA_SETUP="${CREATE_ADMIN_SCHEMA_SETUP:-0}" python create_admin.py
+  else
+    echo "Admin auto-create skipped: ADMIN_EMAIL or ADMIN_PASSWORD is not set."
+  fi
+fi
 export RUN_STARTUP_SCHEMA_PATCHES="${RUN_STARTUP_SCHEMA_PATCHES:-0}"
 export ENABLE_ASSISTANT_STARTUP="${ENABLE_ASSISTANT_STARTUP:-0}"
 export ENABLE_RAG_WARMUP="${ENABLE_RAG_WARMUP:-0}"

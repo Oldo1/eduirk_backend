@@ -15,6 +15,13 @@ from models import User, UserRole
 LOGIN = str(os.getenv("ADMIN_EMAIL", "admin@example.local") or "admin@example.local").strip().lower()
 PASSWORD = os.getenv("ADMIN_PASSWORD")
 ROLE = str(os.getenv("ADMIN_ROLE", "admin") or "admin").strip().lower() or "admin"
+CREATE_ADMIN_SCHEMA_SETUP = str(os.getenv("CREATE_ADMIN_SCHEMA_SETUP", "1")).strip().lower() not in {
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 def resolve_admin_password() -> str:
@@ -45,36 +52,37 @@ def migrate_users_table() -> None:
     with engine.begin() as conn:
         if "hashed_password" in cols and "password_hash" not in cols:
             conn.execute(text("ALTER TABLE users RENAME COLUMN hashed_password TO password_hash"))
-        if "username" not in cols:
-            conn.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(100)"))
         if "role_id" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN role_id INTEGER REFERENCES user_role(id)"))
         if "created_at" not in cols:
             conn.execute(text(
                 "ALTER TABLE users ADD COLUMN created_at TIMESTAMP WITH TIME ZONE DEFAULT now()"
             ))
-        existing_indexes = {ix["name"] for ix in insp.get_indexes("users")}
-        if "ix_users_username" not in existing_indexes:
-            conn.execute(text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username ON users (username)"
-            ))
 
 
 def main() -> None:
     password = resolve_admin_password()
 
-    Base.metadata.create_all(bind=engine)
-    migrate_users_table()
+    if CREATE_ADMIN_SCHEMA_SETUP:
+        Base.metadata.create_all(bind=engine)
+        migrate_users_table()
     db = SessionLocal()
     try:
         role = db.query(UserRole).filter_by(role_name=ROLE).first()
         if not role:
-            role = UserRole(role_name=ROLE)
+            role = UserRole(
+                role_name=ROLE,
+                can_access_internal_docs=ROLE in {"admin", "administrator"},
+            )
             db.add(role)
             db.commit()
             db.refresh(role)
             print(f"Created role: {role.role_name} (id={role.id})")
         else:
+            if ROLE in {"admin", "administrator"}:
+                role.can_access_internal_docs = True
+                db.commit()
+                db.refresh(role)
             print(f"Role already exists: {role.role_name} (id={role.id})")
 
         user = db.query(User).filter_by(email=LOGIN).first()
@@ -82,7 +90,6 @@ def main() -> None:
             user.password_hash = hash_password(password)
             user.role_id = role.id
             user.is_active = True
-            user.username = LOGIN
             db.commit()
             db.refresh(user)
             print(f"Updated user: {user.email} (id={user.id}, role_id={user.role_id})")
@@ -90,7 +97,6 @@ def main() -> None:
             user = User(
                 email=LOGIN,
                 password_hash=hash_password(password),
-                username=LOGIN,
                 is_active=True,
                 role_id=role.id,
             )
