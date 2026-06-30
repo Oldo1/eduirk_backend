@@ -26,7 +26,10 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode(), hashed.encode())
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 def _create_token(data: dict, token_type: str, expires_delta: timedelta) -> str:
     to_encode = data.copy()
