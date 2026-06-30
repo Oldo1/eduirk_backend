@@ -38,6 +38,9 @@ def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
         )
 
     new_user = User(
+        last_name=user_data.last_name,
+        first_name=user_data.first_name,
+        middle_name=user_data.middle_name,
         email=user_data.email,
         password_hash=user_data.password,   # В реальном проекте здесь должен быть hash_password()
         is_active=True
@@ -61,6 +64,9 @@ def update_user(
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
     user.email = user_data.email
+    user.last_name = user_data.last_name
+    user.first_name = user_data.first_name
+    user.middle_name = user_data.middle_name
     user.password_hash = user_data.password  # В будущем — хэширование
 
     db.commit()

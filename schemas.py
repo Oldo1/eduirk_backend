@@ -6,12 +6,18 @@ from typing import Optional, List, Dict
 # ====================== Аутентификация ======================
 class UserCreate(BaseModel):
     email: EmailStr
+    last_name: Optional[str] = Field(None, max_length=100)
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
     password: str = Field(..., min_length=1)
 
 
 class UserResponse(BaseModel):
     id: int
     email: str
+    last_name: Optional[str] = None
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
     is_active: bool
     role: Optional[str] = None
     can_access_internal_docs: bool = False
@@ -176,6 +182,11 @@ class ArticleResponse(ArticleBase):
     id: int
     author_id: Optional[int]
     author_name: Optional[str] = None
+    author_full_name: Optional[str] = None
+    author_last_name: Optional[str] = None
+    author_first_name: Optional[str] = None
+    author_middle_name: Optional[str] = None
+    author_key: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

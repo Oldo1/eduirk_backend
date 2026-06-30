@@ -85,6 +85,36 @@ def _status_id(db: Session, name: str) -> int:
     return obj.id
 
 
+def _author_fio(author: User | None) -> str | None:
+    if author is None:
+        return None
+    fio = " ".join(
+        part.strip()
+        for part in (
+            getattr(author, "last_name", None),
+            getattr(author, "first_name", None),
+            getattr(author, "middle_name", None),
+        )
+        if part and part.strip()
+    )
+    return fio or getattr(author, "email", None)
+
+
+def _author_payload(author: User | None) -> dict | None:
+    if author is None:
+        return None
+    full_name = _author_fio(author)
+    return {
+        "id": author.id,
+        "email": author.email,
+        "name": full_name,
+        "full_name": full_name,
+        "last_name": getattr(author, "last_name", None),
+        "first_name": getattr(author, "first_name", None),
+        "middle_name": getattr(author, "middle_name", None),
+    }
+
+
 def _serialize(article: Article, db: Session) -> dict:
     status = db.query(ArticleStatus).filter(ArticleStatus.id == article.status_id).first()
     cats   = (
@@ -100,6 +130,7 @@ def _serialize(article: Article, db: Session) -> dict:
           .all()
     )
     author = db.query(User).filter(User.id == article.author_id).first()
+    author_name = _author_fio(author)
     return {
         "id":           article.id,
         "title":        article.title,
@@ -110,7 +141,13 @@ def _serialize(article: Article, db: Session) -> dict:
         "created_at":   article.created_at.isoformat() if article.created_at else None,
         "updated_at":   article.updated_at.isoformat() if article.updated_at else None,
         "status":       {"id": status.id, "name": status.name} if status else None,
-        "author":       {"id": author.id, "email": author.email} if author else None,
+        "author":       _author_payload(author),
+        "author_name":  author_name,
+        "author_full_name": author_name,
+        "author_last_name": getattr(author, "last_name", None) if author else None,
+        "author_first_name": getattr(author, "first_name", None) if author else None,
+        "author_middle_name": getattr(author, "middle_name", None) if author else None,
+        "author_key":   f"id-{article.author_id}" if article.author_id else None,
         "categories":   [{"id": c.id, "name": c.name, "slug": c.slug} for c in cats],
         "tags":         [{"id": t.id, "name": t.name, "slug": t.slug} for t in tags],
         "category_ids": [c.id for c in cats],

@@ -15,6 +15,9 @@ from models import User, UserRole
 LOGIN = str(os.getenv("ADMIN_EMAIL", "admin@example.local") or "admin@example.local").strip().lower()
 PASSWORD = os.getenv("ADMIN_PASSWORD")
 ROLE = str(os.getenv("ADMIN_ROLE", "admin") or "admin").strip().lower() or "admin"
+LAST_NAME = os.getenv("ADMIN_LAST_NAME", "Администратор")
+FIRST_NAME = os.getenv("ADMIN_FIRST_NAME", "ИМЦРО")
+MIDDLE_NAME = os.getenv("ADMIN_MIDDLE_NAME", "")
 CREATE_ADMIN_SCHEMA_SETUP = str(os.getenv("CREATE_ADMIN_SCHEMA_SETUP", "1")).strip().lower() not in {
     "",
     "0",
@@ -52,6 +55,12 @@ def migrate_users_table() -> None:
     with engine.begin() as conn:
         if "hashed_password" in cols and "password_hash" not in cols:
             conn.execute(text("ALTER TABLE users RENAME COLUMN hashed_password TO password_hash"))
+        if "last_name" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN last_name VARCHAR(100)"))
+        if "first_name" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN first_name VARCHAR(100)"))
+        if "middle_name" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN middle_name VARCHAR(100)"))
         if "role_id" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN role_id INTEGER REFERENCES user_role(id)"))
         if "created_at" not in cols:
@@ -90,6 +99,9 @@ def main() -> None:
             user.password_hash = hash_password(password)
             user.role_id = role.id
             user.is_active = True
+            user.last_name = LAST_NAME
+            user.first_name = FIRST_NAME
+            user.middle_name = MIDDLE_NAME
             db.commit()
             db.refresh(user)
             print(f"Updated user: {user.email} (id={user.id}, role_id={user.role_id})")
@@ -97,6 +109,9 @@ def main() -> None:
             user = User(
                 email=LOGIN,
                 password_hash=hash_password(password),
+                last_name=LAST_NAME,
+                first_name=FIRST_NAME,
+                middle_name=MIDDLE_NAME,
                 is_active=True,
                 role_id=role.id,
             )

@@ -408,6 +408,9 @@ def _user_response(db: Session, user: User) -> UserResponse:
     return UserResponse(
         id=user.id,
         email=user.email,
+        last_name=getattr(user, "last_name", None),
+        first_name=getattr(user, "first_name", None),
+        middle_name=getattr(user, "middle_name", None),
         is_active=user.is_active,
         role=role.role_name if role else None,
         can_access_internal_docs=bool(
@@ -438,6 +441,9 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
     user = User(
         email=user_data.email,
+        last_name=user_data.last_name,
+        first_name=user_data.first_name,
+        middle_name=user_data.middle_name,
         password_hash=hash_password(user_data.password),
     )
     db.add(user)

@@ -14,6 +14,25 @@ from models.tpmpk import (
 )
 
 
+def _user_display_name(user) -> str | None:
+    if user is None:
+        return None
+
+    fio = " ".join(
+        str(part).strip()
+        for part in (
+            getattr(user, "last_name", None),
+            getattr(user, "first_name", None),
+            getattr(user, "middle_name", None),
+        )
+        if str(part or "").strip()
+    )
+    if fio:
+        return fio
+
+    return getattr(user, "email", None)
+
+
 class UserRole(Base):
     __tablename__ = "user_role"
     id = Column(Integer, primary_key=True, index=True)
@@ -27,6 +46,9 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
+    last_name = Column(String(100), nullable=True)
+    first_name = Column(String(100), nullable=True)
+    middle_name = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     role_id = Column(Integer, ForeignKey("user_role.id"), nullable=True)
     allowed_methodika_subjects = Column(JSON, nullable=False, default=list)
@@ -229,9 +251,27 @@ class Article(Base):
 
     @property
     def author_name(self):
-        if self.author is None:
-            return None
-        return getattr(self.author, "email", None)
+        return _user_display_name(self.author)
+
+    @property
+    def author_full_name(self):
+        return _user_display_name(self.author)
+
+    @property
+    def author_last_name(self):
+        return getattr(self.author, "last_name", None) if self.author is not None else None
+
+    @property
+    def author_first_name(self):
+        return getattr(self.author, "first_name", None) if self.author is not None else None
+
+    @property
+    def author_middle_name(self):
+        return getattr(self.author, "middle_name", None) if self.author is not None else None
+
+    @property
+    def author_key(self):
+        return f"id-{self.author_id}" if self.author_id else None
 
 
 class ArticleCategory(Base):
