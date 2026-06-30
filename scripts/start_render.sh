@@ -1,6 +1,19 @@
 #!/bin/sh
 set -eu
 
+load_env_file() {
+  env_file="$1"
+  if [ -f "$env_file" ]; then
+    echo "Loading environment from $env_file"
+    set -a
+    . "$env_file"
+    set +a
+  fi
+}
+
+load_env_file "/etc/secrets/.env"
+load_env_file ".env"
+
 if [ -z "${DATABASE_URL:-}" ]; then
   if [ -z "${DB_HOST:-}" ] || [ "${DB_HOST}" = "localhost" ] || [ "${DB_HOST}" = "127.0.0.1" ]; then
     echo "ERROR: DATABASE_URL is not set."
@@ -13,9 +26,10 @@ fi
 python -m alembic upgrade head
 if [ "${AUTO_CREATE_ADMIN:-1}" != "0" ]; then
   if [ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
+    echo "Admin auto-create: ADMIN_EMAIL=${ADMIN_EMAIL}, ADMIN_PASSWORD is set."
     CREATE_ADMIN_SCHEMA_SETUP="${CREATE_ADMIN_SCHEMA_SETUP:-0}" python create_admin.py
   else
-    echo "Admin auto-create skipped: ADMIN_EMAIL or ADMIN_PASSWORD is not set."
+    echo "Admin auto-create skipped: ADMIN_EMAIL or ADMIN_PASSWORD is not set after loading env files."
   fi
 fi
 export RUN_STARTUP_SCHEMA_PATCHES="${RUN_STARTUP_SCHEMA_PATCHES:-0}"
