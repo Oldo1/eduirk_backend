@@ -10,6 +10,18 @@ class UserCreate(BaseModel):
     first_name: Optional[str] = Field(None, max_length=100)
     middle_name: Optional[str] = Field(None, max_length=100)
     password: str = Field(..., min_length=1)
+    role: Optional[str] = Field("user", max_length=50)
+    is_active: bool = True
+
+
+class UserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    last_name: Optional[str] = Field(None, max_length=100)
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    password: Optional[str] = Field(None, min_length=1)
+    role: Optional[str] = Field(None, max_length=50)
+    is_active: Optional[bool] = None
 
 
 class UserResponse(BaseModel):

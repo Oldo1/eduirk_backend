@@ -2,11 +2,20 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
 
+from auth import hash_password
 from database import get_db
 from models import User, UserRole
-from schemas import UserCreate, UserResponse
+from schemas import UserCreate, UserResponse, UserUpdate
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+def _normalize_role_name(role_name: str | None) -> str:
+    return str(role_name or "user").strip().lower() or "user"
+
+
+def _role_by_name(db: Session, role_name: str | None) -> UserRole | None:
+    normalized = _normalize_role_name(role_name)
+    return db.query(UserRole).filter(UserRole.role_name == normalized).first()
 
 
 # ====================== ПОЛУЧЕНИЕ ПОЛЬЗОВАТЕЛЕЙ ======================
@@ -15,6 +24,19 @@ def get_all_users(db: Session = Depends(get_db)):
     """Получить список всех пользователей"""
     users = db.query(User).all()
     return users
+
+
+@router.get("/roles/")
+def get_all_roles(db: Session = Depends(get_db)):
+    roles = db.query(UserRole).order_by(UserRole.role_name.asc()).all()
+    return [
+        {
+            "id": role.id,
+            "role_name": role.role_name,
+            "permissions": getattr(role, "permissions", {}) or {},
+        }
+        for role in roles
+    ]
 
 
 @router.get("/{user_id}", response_model=UserResponse)
@@ -37,13 +59,18 @@ def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
             detail="Пользователь с таким email уже существует"
         )
 
+    role = _role_by_name(db, user_data.role)
+    if not role:
+        raise HTTPException(status_code=400, detail="Role not found")
+
     new_user = User(
         last_name=user_data.last_name,
         first_name=user_data.first_name,
         middle_name=user_data.middle_name,
         email=user_data.email,
-        password_hash=user_data.password,   # В реальном проекте здесь должен быть hash_password()
-        is_active=True
+        password_hash=hash_password(user_data.password),
+        is_active=user_data.is_active,
+        role_id=role.id,
     )
     db.add(new_user)
     db.commit()
@@ -55,7 +82,7 @@ def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
 @router.put("/{user_id}", response_model=UserResponse)
 def update_user(
     user_id: int,
-    user_data: UserCreate,
+    user_data: UserUpdate,
     db: Session = Depends(get_db)
 ):
     """Обновить данные пользователя"""
@@ -63,11 +90,24 @@ def update_user(
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
-    user.email = user_data.email
-    user.last_name = user_data.last_name
-    user.first_name = user_data.first_name
-    user.middle_name = user_data.middle_name
-    user.password_hash = user_data.password  # В будущем — хэширование
+    payload = user_data.model_dump(exclude_unset=True)
+    if "email" in payload:
+        user.email = payload["email"]
+    if "last_name" in payload:
+        user.last_name = payload["last_name"]
+    if "first_name" in payload:
+        user.first_name = payload["first_name"]
+    if "middle_name" in payload:
+        user.middle_name = payload["middle_name"]
+    if payload.get("password"):
+        user.password_hash = hash_password(payload["password"])
+    if "is_active" in payload:
+        user.is_active = payload["is_active"]
+    if "role" in payload:
+        role = _role_by_name(db, payload["role"])
+        if not role:
+            raise HTTPException(status_code=400, detail="Role not found")
+        user.role_id = role.id
 
     db.commit()
     db.refresh(user)
